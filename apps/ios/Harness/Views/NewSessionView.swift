@@ -362,7 +362,7 @@ struct NewSessionView: View {
             }
             ComposerShell(
                 draft: $draft,
-                placeholder: "Do anything…",
+                placeholder: isChat ? "Ask anything…" : "Do anything…",
                 sendEnabled: deviceId != nil,
                 showStop: false,
                 busy: busy,

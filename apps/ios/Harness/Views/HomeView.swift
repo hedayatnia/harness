@@ -876,7 +876,10 @@ func relativeTime(_ ms: Int64) -> String {
 @MainActor
 func projectLocation(chat: Chat, model: AppModel) -> Text {
     let device = model.deviceName(chat.deviceId)
-    guard let spaceId = chat.spaceId else { return Text("No project @ \(device)") }
+    // A plain chat names itself; other sessions without a project say so.
+    guard let spaceId = chat.spaceId else {
+        return Text(chat.config?.isChatMode == true ? "Chat @ \(device)" : "No project @ \(device)")
+    }
     let project = model.space(for: chat)?.displayName
         ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
         ?? "?"

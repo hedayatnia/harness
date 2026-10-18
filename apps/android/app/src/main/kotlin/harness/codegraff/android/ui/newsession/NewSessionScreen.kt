@@ -262,7 +262,7 @@ fun NewSessionScreen(
         }
         ComposerShell(
             draft = draft, onDraftChange = { draft = it },
-            placeholder = "Do anything…", sendEnabled = deviceId != null, showStop = false,
+            placeholder = if (isChat) "Ask anything…" else "Do anything…", sendEnabled = deviceId != null, showStop = false,
             alwaysExpanded = true, onSend = ::send,
             modifier = Modifier.padding(bottom = 8.dp),
             attachments = attachments,

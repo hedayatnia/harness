@@ -336,6 +336,16 @@ struct ComposerView: View {
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // Chat mode: the API-cost note for Auto (smart), on its own line
+            // so the chip row never squeezes it.
+            if isChat, let note = ChatMode.note(for: currentModel.id) {
+                Text(note)
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.textMuted)
+                    .padding(.horizontal, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("chat-mode-note")
+            }
             // Pre-send honesty (composer.rs degraded notice, post-#170 copy):
             // one quiet caption line, never a warning box — the send still
             // works, it just queues.
@@ -402,13 +412,6 @@ struct ComposerView: View {
                 }
                 ComposerChip(label: currentModel.label, badgeHarness: harness) {
                     showModelPicker = true
-                }
-                if isChat, let note = ChatMode.note(for: currentModel.id) {
-                    Text(note)
-                        .font(Theme.sans(11))
-                        .foregroundStyle(Theme.textMuted)
-                        .lineLimit(1)
-                        .accessibilityIdentifier("chat-mode-note")
                 }
                 if let currentReasoning {
                     ComposerChip(label: HarnessCatalog.reasoningLabel(currentReasoning)) {

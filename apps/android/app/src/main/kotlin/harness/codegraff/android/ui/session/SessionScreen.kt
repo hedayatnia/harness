@@ -392,6 +392,13 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
                 contentAlignment = Alignment.CenterStart,
             ) { Text(if (dead) "Copy edit and stop editing" else "Stop editing", style = sans(12f), color = Theme.palette.textMuted) }
         }
+        // Chat mode: the API-cost note for Auto (smart), on its own line so the chip row never squeezes it.
+        if (isChat) ChatMode.note(currentModel.id)?.let { note ->
+            Text(
+                note, style = sans(11f), color = Theme.palette.textMuted,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).testTag("chat-mode-note"),
+            )
+        }
         // Pre-send honesty: one quiet caption, never a warning box. The send still works; it just queues.
         if (model.chatDeliveryDegraded(chat)) {
             val connectivity by model.connectivity.collectAsState()
@@ -429,9 +436,6 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
             state.changeRequest(chat)?.let { PullRequestBadge(it, surface = PullRequestBadgeSurface.Composer) }
             chat.branch?.trim()?.takeIf { it.isNotEmpty() }?.let { BranchContextChip(it) }
             ComposerChip(currentModel.label, badgeHarness = harness) { showModelPicker = true }
-            if (isChat) ChatMode.note(currentModel.id)?.let { note ->
-                Text(note, style = sans(11f), color = Theme.palette.textMuted, maxLines = 1, modifier = Modifier.testTag("chat-mode-note"))
-            }
             currentReasoning?.let { ComposerChip(HarnessCatalog.reasoningLabel(it)) { showTraitPicker = true } }
             currentModel.options.forEach { option ->
                 ComposerChip(HarnessCatalog.selectedChoice(option, chat.config?.modelOptions?.get(option.id)).label) { optionPicker = option }
