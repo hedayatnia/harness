@@ -290,8 +290,12 @@ struct ComposerView: View {
 
     private var harness: String { chat.config?.harness ?? "claude-code" }
 
+    private var isChat: Bool { chat.config?.isChatMode == true }
+
     private var models: [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+        // A chat offers the three auto tiers and nothing else.
+        if isChat { return ChatMode.models(from: catalogs[harness] ?? []) }
+        return catalogs[harness] ?? HarnessCatalog.models(for: harness)
     }
 
     private var currentModel: ModelInfo {
@@ -399,6 +403,13 @@ struct ComposerView: View {
                 ComposerChip(label: currentModel.label, badgeHarness: harness) {
                     showModelPicker = true
                 }
+                if isChat, let note = ChatMode.note(for: currentModel.id) {
+                    Text(note)
+                        .font(Theme.sans(11))
+                        .foregroundStyle(Theme.textMuted)
+                        .lineLimit(1)
+                        .accessibilityIdentifier("chat-mode-note")
+                }
                 if let currentReasoning {
                     ComposerChip(label: HarnessCatalog.reasoningLabel(currentReasoning)) {
                         showTraitPicker = true
@@ -429,7 +440,7 @@ struct ComposerView: View {
                     set: { writeConfig(model: chat.config?.model, reasoning: $0) }
                 ),
                 lockedHarness: true,
-                catalogs: catalogs
+                catalogs: isChat ? [harness: models] : catalogs
             )
         }
         .sheet(isPresented: $showTraitPicker) {

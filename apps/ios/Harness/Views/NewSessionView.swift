@@ -17,6 +17,8 @@ struct NewSessionView: View {
     @AppStorage("newSessionHarness") private var harness = "claude-code"
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
+    /// Chat mode keeps its own pick, so it never changes the coding defaults.
+    @AppStorage("newChatModel") private var storedChatModel = ""
 
     @State private var draft: String
     @State private var selectedHostId: String?
@@ -58,6 +60,9 @@ struct NewSessionView: View {
         if case .projectless = destination, let selectedHostId {
             return .projectless(deviceId: selectedHostId)
         }
+        if case .chat = destination, let selectedHostId {
+            return .chat(deviceId: selectedHostId)
+        }
         return destination
     }
 
@@ -71,6 +76,7 @@ struct NewSessionView: View {
         switch effectiveDestination {
         case .project: return space?.displayName ?? "Project unavailable"
         case .projectless: return "No project"
+        case .chat: return "Chat"
         }
     }
 
@@ -78,12 +84,29 @@ struct NewSessionView: View {
         liveHarnesses ?? HarnessCatalog.harnesses
     }
 
+    private var isChat: Bool { destination.isChat }
+
+    /// Projectless sessions and chats both pick their host device here.
+    private var isProjectlessLike: Bool {
+        switch destination {
+        case .projectless, .chat: return true
+        case .project: return false
+        }
+    }
+
+    /// The agent this draft runs on: graff in chat mode, else the picked one.
+    private var runHarness: String { isChat ? ChatMode.harness : harness }
+
     private var models: [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+        if isChat { return ChatMode.models(from: catalogs[ChatMode.harness] ?? []) }
+        return catalogs[harness] ?? HarnessCatalog.models(for: harness)
     }
 
     private var selectedModel: ModelInfo {
-        HarnessCatalog.resolveExisting(modelId: storedModel, in: models)
+        if isChat {
+            return models.first { $0.id == storedChatModel } ?? models[0]
+        }
+        return HarnessCatalog.resolveExisting(modelId: storedModel, in: models)
             ?? models.first
             ?? HarnessCatalog.defaultModel(for: harness)
     }
@@ -119,7 +142,7 @@ struct NewSessionView: View {
                     HarnessMark()
                         .frame(width: 84, height: 84)
                         .opacity(0.22)
-                    Text("What are we building?")
+                    Text(isChat ? "What's on your mind?" : "What are we building?")
                         .font(Theme.sans(15))
                         .foregroundStyle(Theme.textFaint)
                 }
@@ -131,7 +154,7 @@ struct NewSessionView: View {
                 hostNotice(notice, deviceId: deviceId)
             }
 
-            if case .projectless = destination {
+            if isProjectlessLike {
                 Button {
                     focused = false
                     showHostPicker = true
@@ -143,6 +166,14 @@ struct NewSessionView: View {
                 .accessibilityIdentifier("session-host")
                 .disabled(busy)
                 .padding(.bottom, 8)
+            }
+
+            if isChat, let note = ChatMode.note(for: selectedModel.id) {
+                Text(note)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+                    .accessibilityIdentifier("chat-mode-note")
+                    .padding(.bottom, 6)
             }
 
             // Where-it-runs scope row (checkout + base ref), left-aligned
@@ -266,13 +297,22 @@ struct NewSessionView: View {
             catalogLive = online
         }
         .sheet(isPresented: $showPicker) {
-            ModelPickerSheet(harness: $harness, modelId: Binding(
-                get: { selectedModel.id },
-                set: { storedModel = $0 }
-            ), reasoning: Binding(
-                get: { reasoning },
-                set: { storedReasoning = $0 ?? "" }
-            ), harnesses: harnesses, catalogs: catalogs)
+            if isChat {
+                // A chat offers the three auto tiers and nothing else.
+                ModelPickerSheet(harness: .constant(ChatMode.harness), modelId: Binding(
+                    get: { selectedModel.id },
+                    set: { storedChatModel = $0 }
+                ), reasoning: .constant(nil), lockedHarness: true,
+                   catalogs: [ChatMode.harness: models])
+            } else {
+                ModelPickerSheet(harness: $harness, modelId: Binding(
+                    get: { selectedModel.id },
+                    set: { storedModel = $0 }
+                ), reasoning: Binding(
+                    get: { reasoning },
+                    set: { storedReasoning = $0 ?? "" }
+                ), harnesses: harnesses, catalogs: catalogs)
+            }
         }
         .sheet(isPresented: $showTraitPicker) {
             TraitPickerSheet(reasoning: Binding(
@@ -339,7 +379,7 @@ struct NewSessionView: View {
             ) {
                 // Model + trait chips, split like the desktop's footer pickers
                 // (they ride right of the shell's attach button).
-                ComposerChip(label: selectedModel.label, badgeHarness: harness) {
+                ComposerChip(label: selectedModel.label, badgeHarness: runHarness) {
                     focused = false
                     showPicker = true
                 }
@@ -505,9 +545,9 @@ struct NewSessionView: View {
         let space = space
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         busy = true
-        let config = ChatConfig(harness: harness, model: selectedModel.id,
+        let config = ChatConfig(harness: runHarness, model: selectedModel.id,
                                 reasoning: reasoning, modelOptions: resolvedModelOptions,
-                                sandbox: "workspace-write")
+                                sandbox: "workspace-write", chatMode: isChat ? true : nil)
         Task { @MainActor in
             var cwd: String?
             let branch = space == nil ? nil : selectedRef

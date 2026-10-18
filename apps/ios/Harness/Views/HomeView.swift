@@ -21,6 +21,8 @@ struct HomeView: View {
     @State private var path: [Route] = []
     @State private var showNewSpace = false
     @State private var showProjectlessDevices = false
+    /// The host picker opened for a plain chat rather than a projectless session.
+    @State private var hostPickerForChat = false
     @State private var showNewSessionPicker = false
     /// What the "+" picker chose; acted on once it has closed.
     @State private var pendingNewSession: NewSessionTarget?
@@ -385,7 +387,12 @@ struct HomeView: View {
             pendingNewSession = nil
             switch target {
             case .space(let id): open(.newSession(spaceId: id))
-            case .projectless: showProjectlessDevices = true
+            case .projectless:
+                hostPickerForChat = false
+                showProjectlessDevices = true
+            case .chat:
+                hostPickerForChat = true
+                showProjectlessDevices = true
             case .newSpace: showNewSpace = true
             }
         }) {
@@ -401,7 +408,7 @@ struct HomeView: View {
         .sheet(isPresented: $showProjectlessDevices) {
             SessionHostPickerSheet { deviceId in
                 spaceFilter = ""
-                open(.newSession(.projectless(deviceId: deviceId)))
+                open(.newSession(hostPickerForChat ? .chat(deviceId: deviceId) : .projectless(deviceId: deviceId)))
             }
         }
         .task(id: model.overviewChats.map(\.id).joined()) {

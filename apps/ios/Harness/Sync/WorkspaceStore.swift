@@ -457,7 +457,8 @@ final class WorkspaceStore {
                                         model: c["model"]?.stringValue,
                                         reasoning: c["reasoning"]?.stringValue,
                                         modelOptions: c["modelOptions"]?.objectValue ?? [:],
-                                        sandbox: c["sandbox"]?.stringValue)
+                                        sandbox: c["sandbox"]?.stringValue,
+                                        chatMode: c["chatMode"]?.boolValue)
             }
             return Chat(id: f["id"]?.stringValue ?? row.id, deviceId: deviceId,
                         title: f["title"]?.stringValue,
