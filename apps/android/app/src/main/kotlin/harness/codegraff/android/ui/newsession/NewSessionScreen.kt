@@ -40,6 +40,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
@@ -53,6 +54,7 @@ import harness.codegraff.android.WorkspaceState
 import harness.codegraff.android.demo.DemoDataset
 import harness.codegraff.android.model.CheckoutKind
 import harness.codegraff.android.model.ChatConfig
+import harness.codegraff.android.model.ChatMode
 import harness.codegraff.android.model.HarnessCatalog
 import harness.codegraff.android.model.NewSessionDestination
 import harness.codegraff.android.theme.opacity
@@ -96,6 +98,9 @@ fun NewSessionScreen(
     val harnessPref = rememberPref("newSessionHarness", "claude-code")
     val modelPref = rememberPref("newSessionModel", "")
     val reasoningPref = rememberPref("newSessionReasoning", "")
+    // Chat mode keeps its own pick, so it never changes the coding defaults.
+    val chatModelPref = rememberPref("newChatModel", "")
+    val isChat = destination is NewSessionDestination.PlainChat
 
     var draft by rememberSaveable { mutableStateOf("") }
     var selectedHostId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -110,17 +115,21 @@ fun NewSessionScreen(
     var selectedRef by rememberSaveable { mutableStateOf<String?>(null) }
     var checkoutKind by rememberSaveable { mutableStateOf(CheckoutKind.Local) }
 
-    val effective = if (destination is NewSessionDestination.Projectless && selectedHostId != null) {
-        NewSessionDestination.Projectless(selectedHostId!!)
-    } else destination
+    val effective = when {
+        destination is NewSessionDestination.Projectless && selectedHostId != null -> NewSessionDestination.Projectless(selectedHostId!!)
+        destination is NewSessionDestination.PlainChat && selectedHostId != null -> NewSessionDestination.PlainChat(selectedHostId!!)
+        else -> destination
+    }
     val space = (effective as? NewSessionDestination.Project)?.let { d -> state.spaces.firstOrNull { it.id == d.spaceId } }
     val deviceId = when (effective) {
         is NewSessionDestination.Project -> space?.deviceId
         is NewSessionDestination.Projectless -> effective.deviceId
+        is NewSessionDestination.PlainChat -> effective.deviceId
     }
     val contextLabel = when (effective) {
         is NewSessionDestination.Project -> space?.displayName ?: "Project unavailable"
         is NewSessionDestination.Projectless -> "No project"
+        is NewSessionDestination.PlainChat -> "Chat"
     }
     // The project's branches, from the computer it lives on.
     val refs by produceState(emptyList<RepoRef>(), space?.id, space?.path, space?.gitDetected) {
@@ -129,13 +138,17 @@ fun NewSessionScreen(
     if (selectedRef == null && refs.isNotEmpty()) selectedRef = (refs.firstOrNull { it.current } ?: refs.first()).name
     val selectedRefRow = refs.firstOrNull { it.name == selectedRef }
 
-    val harness = harnessPref.value
+    // A chat runs on graff whatever the coding default is.
+    val harness = if (isChat) ChatMode.HARNESS else harnessPref.value
     // The catalog source is the computer that will run the session; the static catalog stands in until it answers.
     val harnesses by produceState(HarnessCatalog.harnesses, deviceId) { value = deviceId?.let { model.listHarnesses(it) } ?: HarnessCatalog.harnesses }
-    val models by produceState(HarnessCatalog.models(harness), deviceId, harness) {
+    val catalog by produceState(HarnessCatalog.models(harness), deviceId, harness) {
         value = deviceId?.let { model.listModels(it, harness) } ?: HarnessCatalog.models(harness)
     }
-    val selectedModel = HarnessCatalog.resolveExisting(modelPref.value, models) ?: models.firstOrNull() ?: HarnessCatalog.defaultModel(harness)
+    // A chat offers the three auto tiers and nothing else.
+    val models = if (isChat) ChatMode.models(catalog) else catalog
+    val selectedModel = if (isChat) models.firstOrNull { it.id == chatModelPref.value } ?: models.first()
+    else HarnessCatalog.resolveExisting(modelPref.value, models) ?: models.firstOrNull() ?: HarnessCatalog.defaultModel(harness)
     val reasoning = if (selectedModel.reasoningLevels.isEmpty()) null
     else reasoningPref.value.takeIf { it in selectedModel.reasoningLevels } ?: HarnessCatalog.defaultReasoning(selectedModel)
 
@@ -153,7 +166,7 @@ fun NewSessionScreen(
             val choice = HarnessCatalog.selectedChoice(option, optionSelections[option.id])
             if (choice.id != option.defaultChoice) option.id to choice.id else null
         }.toMap()
-        val config = ChatConfig(harness, selectedModel.id, reasoning, options, "workspace-write")
+        val config = ChatConfig(harness, selectedModel.id, reasoning, options, "workspace-write", chatMode = isChat)
         val chatId = if (space != null) {
             // A New-worktree plan rides the queued run as a spec the HOST materializes, so an offline send never blocks.
             val cwd = if (checkoutKind == CheckoutKind.NewWorktree) space.path else selectedRefRow?.worktreePath
@@ -177,7 +190,7 @@ fun NewSessionScreen(
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(24.dp)) {
                 Box(Modifier.alpha(0.22f)) { HarnessMark(84.dp) }
-                Text("What are we building?", style = sans(15f), color = p.textFaint)
+                Text(if (isChat) "What's on your mind?" else "What are we building?", style = sans(15f), color = p.textFaint)
             }
             // Header: back + "New session" over the device it will run on.
             Row(
@@ -195,7 +208,7 @@ fun NewSessionScreen(
             }
         }
 
-        if (effective is NewSessionDestination.Projectless) {
+        if (effective is NewSessionDestination.Projectless || effective is NewSessionDestination.PlainChat) {
             Box(
                 Modifier.fillMaxWidth().padding(bottom = 8.dp),
                 contentAlignment = Alignment.Center,
@@ -241,6 +254,12 @@ fun NewSessionScreen(
                     .background(p.warning.opacity(0.1f), RoundedCornerShape(12.dp)).padding(horizontal = 14.dp, vertical = 8.dp),
             )
         }
+        if (isChat) ChatMode.note(selectedModel.id)?.let { note ->
+            Text(
+                note, style = sans(12f), color = p.textMuted,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 6.dp).testTag("chat-mode-note"),
+            )
+        }
         ComposerShell(
             draft = draft, onDraftChange = { draft = it },
             placeholder = "Do anything…", sendEnabled = deviceId != null, showStop = false,
@@ -260,12 +279,21 @@ fun NewSessionScreen(
     }
 
     if (showPicker) {
-        ModelPickerSheet(
-            harness = harness, modelId = selectedModel.id, reasoning = reasoning, lockedHarness = false,
-            harnesses = harnesses, catalogs = mapOf(harness to models),
-            onPick = { h, picked, r -> harnessPref.set(h); modelPref.set(picked.id); reasoningPref.set(r ?: "") },
-            onDismiss = { showPicker = false },
-        )
+        if (isChat) {
+            ModelPickerSheet(
+                harness = harness, modelId = selectedModel.id, reasoning = null, lockedHarness = true,
+                harnesses = harnesses, catalogs = mapOf(harness to models),
+                onPick = { _, picked, _ -> chatModelPref.set(picked.id) },
+                onDismiss = { showPicker = false },
+            )
+        } else {
+            ModelPickerSheet(
+                harness = harness, modelId = selectedModel.id, reasoning = reasoning, lockedHarness = false,
+                harnesses = harnesses, catalogs = mapOf(harness to models),
+                onPick = { h, picked, r -> harnessPref.set(h); modelPref.set(picked.id); reasoningPref.set(r ?: "") },
+                onDismiss = { showPicker = false },
+            )
+        }
     }
     if (showTraitPicker) TraitPickerSheet(reasoning, selectedModel.reasoningLevels, { reasoningPref.set(it) }) { showTraitPicker = false }
     optionPicker?.let { option ->

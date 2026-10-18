@@ -1,6 +1,7 @@
 package harness.codegraff.android.ui.session
 
 import androidx.compose.runtime.produceState
+import harness.codegraff.android.model.ChatMode
 import harness.codegraff.android.model.Connection
 import harness.codegraff.android.model.ConnectivityRules
 import harness.codegraff.android.model.ConnectivityUi
@@ -53,6 +54,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
@@ -266,7 +268,10 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
 
     val harness = chat.config?.harness ?: "claude-code"
     // The catalog of the computer that runs this session; the static one until it answers.
-    val models by produceState(HarnessCatalog.models(harness), chat.deviceId, harness) { value = model.listModels(chat.deviceId, harness) }
+    val catalog by produceState(HarnessCatalog.models(harness), chat.deviceId, harness) { value = model.listModels(chat.deviceId, harness) }
+    // A chat offers the three auto tiers and nothing else.
+    val isChat = chat.config?.chatMode == true
+    val models = if (isChat) ChatMode.models(catalog) else catalog
     val currentModel = HarnessCatalog.resolve(chat.config?.model, models, harness)
     val currentReasoning = if (currentModel.reasoningLevels.isEmpty()) null
     else chat.config?.reasoning?.takeIf { it in currentModel.reasoningLevels } ?: HarnessCatalog.defaultReasoning(currentModel)
@@ -424,6 +429,9 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
             state.changeRequest(chat)?.let { PullRequestBadge(it, surface = PullRequestBadgeSurface.Composer) }
             chat.branch?.trim()?.takeIf { it.isNotEmpty() }?.let { BranchContextChip(it) }
             ComposerChip(currentModel.label, badgeHarness = harness) { showModelPicker = true }
+            if (isChat) ChatMode.note(currentModel.id)?.let { note ->
+                Text(note, style = sans(11f), color = Theme.palette.textMuted, maxLines = 1, modifier = Modifier.testTag("chat-mode-note"))
+            }
             currentReasoning?.let { ComposerChip(HarnessCatalog.reasoningLabel(it)) { showTraitPicker = true } }
             currentModel.options.forEach { option ->
                 ComposerChip(HarnessCatalog.selectedChoice(option, chat.config?.modelOptions?.get(option.id)).label) { optionPicker = option }

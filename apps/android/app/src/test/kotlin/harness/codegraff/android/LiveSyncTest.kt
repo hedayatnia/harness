@@ -115,7 +115,7 @@ private class FakeCore : MobileCoreInterface {
 
 private fun chatRecord(id: String, lastMessageAt: Long? = null, seen: Long? = null) = ChatRecord(
     id = id, deviceId = "mac", title = "Title $id", archived = false, cwd = "/r", branch = "main", checkoutId = null,
-    config = ChatConfigRecord("graff", "m1", "high", mapOf("speed" to "fast"), null), lastMessagePreview = "hi",
+    config = ChatConfigRecord("graff", "m1", "high", mapOf("speed" to "fast"), null, false), lastMessagePreview = "hi",
     lastMessageAt = lastMessageAt, createdAt = 1, spaceId = "s1", lastSeenAt = seen, roomGen = 2, lastPromptAt = null,
 )
 
