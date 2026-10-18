@@ -158,6 +158,10 @@ pub struct ChatConfig {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
+    /// A plain chat rather than a coding session: no project, graff on the
+    /// hosted auto models only (Auto low / high / smart).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chat_mode: bool,
 }
 
 /// Immutable-at-run-start repository context owned by one conversation.

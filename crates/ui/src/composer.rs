@@ -10567,6 +10567,11 @@ impl Render for Composer {
             let plan = (session_chrome_opacity > 0.0
                 && self.pickers.read(cx).uses_chatgpt_plan(cx))
             .then(|| crate::chatgpt_plan::using_plan_chip(&theme));
+            // Chat mode: say so while the selected model may bill API rates.
+            let chat_note = (session_chrome_opacity > 0.0)
+                .then(|| self.pickers.read(cx).chat_mode_note(cx))
+                .flatten()
+                .map(|note| crate::chat_mode::note_chip(note, &theme));
             container.child(
                 div()
                     .w_full()
@@ -10608,6 +10613,14 @@ impl Render for Composer {
                                         .children(footer.flatten()),
                                 )
                                 .children(plan.map(|chip| {
+                                    div()
+                                        .flex_shrink(1.0)
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .pr(px(10.0))
+                                        .child(chip)
+                                }))
+                                .children(chat_note.map(|chip| {
                                     div()
                                         .flex_shrink(1.0)
                                         .min_w_0()

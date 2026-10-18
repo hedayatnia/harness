@@ -528,6 +528,7 @@ fn chat_row(session: &ExternalSession, chat_id: &str, msgs: &[Msg], device_id: &
             reasoning: None,
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            chat_mode: false,
         }),
         last_message_preview: last_reply,
         last_message_at: Some(at(last_at)),

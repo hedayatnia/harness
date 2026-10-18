@@ -1692,6 +1692,7 @@ impl Inner {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: config.sandbox,
+                chat_mode: false,
             };
             if let Err(err) = ws.set_chat_config(chat_id, &config) {
                 tracing::warn!(chat = %chat_id, error = %err, "imported chat graff config write failed");
@@ -3619,6 +3620,7 @@ mod tests {
             reasoning: Some(ReasoningLevel::High),
             model_options: serde_json::Map::new(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            chat_mode: false,
         };
         workspace
             .create_chat("picker", None, Some("test-device"), Some(original), None)
