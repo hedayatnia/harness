@@ -12,6 +12,40 @@ use harness_proto::{AgentLoginPoll, AgentLoginStart, AgentLoginStatus, ReauthPro
 const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl Shell {
+    /// An error card's "Log in" (the run was refused because the agent is
+    /// signed out or out of usage): Settings → Accounts on the computer the
+    /// chat runs on, with that agent's sign-in started where Accounts has one.
+    /// Routed by the chat's own agent and host, never by the error text.
+    pub(super) fn sign_in_for_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let route = {
+            let state = self.state.read(cx);
+            state
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id && !chat.device_id.is_empty())
+                .map(|chat| {
+                    let target = (state.local_device_id.as_deref()
+                        != Some(chat.device_id.as_str()))
+                    .then(|| chat.device_id.clone());
+                    (target, chat.config.as_ref().map(|config| config.harness))
+                })
+        };
+        let Some((target, harness)) = route else {
+            // A missing owner must never route the sign-in to the viewer instead.
+            self.sidebar_notice =
+                Some("Chat host unavailable. Open the chat's host in Accounts to sign in.".into());
+            cx.notify();
+            return;
+        };
+        self.open_settings(SettingsSection::Agents, cx);
+        let state = self.state.clone();
+        let page = self
+            .accounts_page
+            .get_or_insert_with(|| cx.new(|cx| AccountsPage::new(state, cx)))
+            .clone();
+        page.update(cx, |page, cx| page.sign_in(target, harness, cx));
+    }
+
     pub(super) fn on_reauth_action(
         &mut self,
         chat_id: &str,

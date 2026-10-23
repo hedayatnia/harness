@@ -22,6 +22,9 @@ pub enum SyncError {
     Auth(String),
     #[error("temporarily unavailable: {0}")]
     TemporarilyUnavailable(String),
+    /// The server refused for quota (HTTP 429); `retry_after_ms` is its hint.
+    #[error("rate limited (retry after {retry_after_ms:?} ms)")]
+    RateLimited { retry_after_ms: Option<u64> },
     #[error("client is shut down")]
     Closed,
 }

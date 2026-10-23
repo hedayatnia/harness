@@ -1205,7 +1205,38 @@ mod pinned_session_tests {
             assert!(cx.debug_bounds("chat-status-archived").is_some());
             let time = cx.debug_bounds("chat-time-archived").unwrap();
             cx.simulate_mouse_move(archived.center(), None, gpui::Modifiers::default());
+            assert!(cx.debug_bounds("chat-time-archived").is_none());
+            assert!(cx.debug_bounds("chat-archived-menu").is_some());
+            assert!(cx.debug_bounds("chat-archived-corner").is_some());
+            cx.simulate_mouse_move(gpui::point(px(500.0), px(500.0)), None, gpui::Modifiers::default());
+            assert!(cx.debug_bounds("chat-archived-menu").is_none());
             assert_eq!(cx.debug_bounds("chat-time-archived").unwrap(), time);
+        }
+
+        // Hiding Archived removes the whole shelf without changing its chats
+        // or disclosure state; showing it again restores both.
+        assert!(cx.debug_bounds("archived-toggle").is_some());
+        for visible in [false, true, false, true] {
+            shell.update(cx, |shell, cx| {
+                let open = shell.archived_open;
+                shell.activate_sidebar_view_row(SidebarViewRow::ShowArchived, cx);
+                assert_eq!(shell.settings.sidebar_show_archived, visible);
+                assert_eq!(shell.archived_open, open);
+                assert!(
+                    shell
+                        .state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .any(|chat| chat.id == "archived" && chat.archived)
+                );
+            });
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            assert_eq!(cx.debug_bounds("archived-toggle").is_some(), visible);
+            assert_eq!(cx.debug_bounds("chat-archived").is_some(), visible);
         }
 
         // Sessions owns all unpinned rows, including their keyboard traversal.
@@ -1236,6 +1267,35 @@ mod pinned_session_tests {
             cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
             assert!(cx.debug_bounds("chat-title-older").unwrap().size.width < title.size.width);
             assert_eq!(cx.debug_bounds("chat-status-older").unwrap(), status);
+            assert!(cx.debug_bounds("chat-time-older").is_none());
+            assert!(cx.debug_bounds("chat-older-corner").is_some());
+            let menu = cx.debug_bounds("chat-older-menu").unwrap().center();
+            let selected = shell.read_with(cx, |shell, cx| shell.state.read(cx).selected_chat.clone());
+            cx.simulate_mouse_move(menu, None, gpui::Modifiers::default());
+            assert!(cx.debug_bounds("chat-older-menu").is_some());
+            cx.simulate_mouse_down(menu, MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_up(menu, MouseButton::Left, gpui::Modifiers::default());
+            shell.update(cx, |shell, cx| {
+                let menu = shell.chat_menu.get().unwrap();
+                assert_eq!(menu.chat_id, "older");
+                assert!(matches!(menu.page, ChatMenuPage::Root));
+                assert_eq!(shell.state.read(cx).selected_chat, selected);
+                assert!(shell.sidebar_session_transfer.is_none());
+                shell.chat_menu = Default::default();
+                cx.notify();
+            });
+            // Right click still opens the identical session/root menu.
+            cx.simulate_mouse_down(row.center(), MouseButton::Right, gpui::Modifiers::default());
+            cx.simulate_mouse_up(row.center(), MouseButton::Right, gpui::Modifiers::default());
+            shell.update(cx, |shell, cx| {
+                let menu = shell.chat_menu.get().unwrap();
+                assert_eq!(menu.chat_id, "older");
+                assert!(matches!(menu.page, ChatMenuPage::Root));
+                shell.chat_menu = Default::default();
+                cx.notify();
+            });
+            cx.simulate_mouse_move(gpui::point(px(500.0), px(500.0)), None, gpui::Modifiers::default());
+            assert!(cx.debug_bounds("chat-older-menu").is_none());
             assert_eq!(cx.debug_bounds("chat-time-older").unwrap(), time);
         }
 
@@ -1858,7 +1918,7 @@ pub(super) fn compare_sidebar_chats(
 pub(super) struct SpacesMenu {
     search: Entity<ComposerInput>,
     /// Keyboard highlight — an index into [`Shell::spaces_menu_rows`], or
-    /// that list's length when the pinned "New project…" footer holds it.
+    /// that list's length when the pinned "New project" footer holds it.
     active: usize,
     /// Tracked on the card — puts it on the keyboard dispatch path while the
     /// search input holds focus (the structure every working picker uses).
@@ -1911,6 +1971,7 @@ enum SidebarViewRow {
     Created,
     ShowBranch,
     ShowHarness,
+    ShowArchived,
 }
 
 impl SidebarViewRow {
@@ -1925,9 +1986,9 @@ impl SidebarViewRow {
 }
 
 const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
-    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..9)];
+    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..10)];
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 9] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 10] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
@@ -1937,6 +1998,7 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 9] = [
     SidebarViewRow::ShowHarness,
     SidebarViewRow::ShowProjectIcon,
     SidebarViewRow::ShowProjectLabel,
+    SidebarViewRow::ShowArchived,
 ];
 
 // list items stay tightly related at 2px, while section boundaries use 12px
@@ -2001,7 +2063,7 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
 }
 
 /// One activatable row of the open dropdown, in nav order. `AddSpace` names
-/// the card's pinned "New project…" footer, not a list row — keyboard nav
+/// the card's pinned "New project" footer, not a list row — keyboard nav
 /// maps the list-length index to it.
 #[derive(Clone, PartialEq)]
 pub(super) enum SpacesMenuRow {
@@ -2958,7 +3020,7 @@ impl Shell {
 
     /// The filter's scrollable rows: "All projects", then spaces matching
     /// the search (ranked — `popover::filter_indices`). "All" only shows on
-    /// an empty query (searching means hunting a space). The "New project…"
+    /// an empty query (searching means hunting a space). The "New project"
     /// action is not a row here — the card renders it as a pinned footer.
     fn spaces_menu_rows(&self, cx: &App) -> Vec<SpacesMenuRow> {
         let query = self
@@ -3153,6 +3215,9 @@ impl Shell {
             SidebarViewRow::ShowHarness => {
                 self.settings.sidebar_show_harness = !self.settings.sidebar_show_harness
             }
+            SidebarViewRow::ShowArchived => {
+                self.settings.sidebar_show_archived = !self.settings.sidebar_show_archived
+            }
         }
         self.schedule_save(cx);
         if row.closes_submenu() {
@@ -3320,6 +3385,7 @@ impl Shell {
             "Harness",
             "Project icon",
             "Location",
+            "Archived",
         ];
         let icons = [
             icons::LAPTOP,
@@ -3331,6 +3397,7 @@ impl Shell {
             icons::BOT,
             icons::PROJECT_DEFAULT,
             icons::FOLDER,
+            icons::ARCHIVE_MINIMALISTIC,
         ];
         let selected = [
             organization == SidebarOrganization::ByDevice,
@@ -3342,6 +3409,7 @@ impl Shell {
             show_harness,
             self.settings.sidebar_show_project_icon,
             self.settings.sidebar_show_project_label,
+            self.settings.sidebar_show_archived,
         ];
         let values = [
             labels[selected[..3].iter().position(|v| *v).unwrap_or(0)].to_string(),
@@ -3845,12 +3913,13 @@ impl Shell {
             .pt(px(8.0))
             .pb(px(4.0))
             .child(trigger)
+            .child(self.render_sidebar_search_trigger(theme, cx))
             .child(view_trigger)
             .into_any_element()
     }
 
     /// The dropdown card: search on top, "All projects" + space rows (check on
-    /// the active filter; right-click for rename/remove) + "New project…".
+    /// the active filter; right-click for rename/remove) + "New project".
     fn render_spaces_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let theme = &theme.for_popup();
         let (search, active, focus, list_scroll) = {
@@ -4031,7 +4100,7 @@ impl Shell {
                 search.into_any_element(),
             ))
             .child(list)
-            // "New project…" is a pinned action row under the list (the
+            // "New project" is a pinned action row under the list (the
             // chat composer's project menu treatment) — scrolling must
             // never carry it away, and its nav index (`add_index`) keeps it
             // LAST.
@@ -4068,7 +4137,7 @@ impl Shell {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .child(SharedString::from("New project…")),
+                        .child(SharedString::from("New project")),
                 ),
             )
             .into_any_element()
@@ -4079,6 +4148,9 @@ impl Shell {
     /// and local-device promotion. Jump shortcuts and session cycling read
     /// this projection so keyboard order never drifts from the screen.
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
+        if self.sidebar_search_is_filtering(cx) {
+            return self.sidebar_search_ids(cx);
+        }
         let filter = self.settings.space_filter.clone();
         let profile_key = self.active_sidebar_pin_profile_key(cx);
         let saved_pins = self.active_sidebar_pins(cx);
@@ -4447,6 +4519,7 @@ impl Shell {
         let mut slot = 0usize;
         let mut rendered = Vec::new();
         let mut moving_row = None;
+        let provisional = self.state.read(cx).provisional_title();
         for (group, rows) in sections {
             let pinned_group = slot < pinned_count;
             let drag_group = if pinned_group {
@@ -4524,9 +4597,11 @@ impl Shell {
                 let slot_height = height - removed;
                 let element = self.render_chat_row(
                     chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
+                    transcript::single_line(&crate::state::chat_label(
+                        &chat,
+                        &provisional,
+                        "New session",
+                    ))
                     .into(),
                     time_ago,
                     folder.into(),
@@ -4883,6 +4958,9 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if !self.settings.sidebar_show_archived {
+            return None;
+        }
         const INITIAL: usize = 10;
         const PAGE: usize = 25;
         let now = Utc::now();
@@ -4955,6 +5033,7 @@ impl Shell {
         let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
         let header = sidebar_disclosure_header(theme, label, chevron)
             .id("archived-toggle")
+            .debug_selector(|| "archived-toggle".into())
             .on_click(cx.listener(move |this, _, _, cx| {
                 let was_open = this.archived_open;
                 this.begin_sidebar_disclosure_motion(
@@ -4969,6 +5048,7 @@ impl Shell {
         let section = div().flex().flex_col().child(header);
         let body = {
             let selected = self.state.read(cx).selected_chat.clone();
+            let provisional = self.state.read(cx).provisional_title();
             let mut list = div()
                 .flex()
                 .flex_col()
@@ -4985,9 +5065,11 @@ impl Shell {
                 list = list.child(
                     self.render_chat_row(
                         chat.id.clone(),
-                        transcript::single_line(
-                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                        )
+                        transcript::single_line(&crate::state::chat_label(
+                            &chat,
+                            &provisional,
+                            "New session",
+                        ))
                         .into(),
                         format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
                             .into(),
@@ -6614,6 +6696,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
         }
     }
 

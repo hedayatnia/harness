@@ -81,10 +81,11 @@ class SessionFlowTest {
     }
 
     @Test
-    fun runningFilterHidesSessionsThatAreNotRunning() {
-        rule.onNodeWithText("Running", substring = true).performClick()
-        rule.waitForIdle()
+    fun homeShowsEveryStatusWithoutStatusFilters() {
+        rule.onNodeWithText("Running").assertDoesNotExist()
+        rule.onNodeWithText("Needs you", substring = true).assertDoesNotExist()
         rule.onNodeWithContentDescription("Streaming veil on transcript rows", substring = true).assertExists()
-        rule.onNodeWithContentDescription("Tool group header colors", substring = true).assertDoesNotExist()
+        rule.onNodeWithContentDescription("Model picker catalog sync", substring = true).assertExists()
+        rule.onNodeWithContentDescription("Tool group header colors", substring = true).assertExists()
     }
 }

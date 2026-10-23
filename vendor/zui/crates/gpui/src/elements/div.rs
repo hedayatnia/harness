@@ -2699,29 +2699,42 @@ impl Interactivity {
         if !drop_listeners.is_empty() {
             let hitbox = hitbox.clone();
             window.on_mouse_event({
-                move |_: &MouseUpEvent, phase, window, cx| {
+                move |event: &MouseUpEvent, phase, window, cx| {
                     if let Some(drag) = &cx.active_drag
+                        && event.button == MouseButton::Left
                         && phase == DispatchPhase::Bubble
                         && hitbox.is_hovered(window)
                     {
                         let drag_state_type = drag.value.as_ref().type_id();
                         for (drop_state_type, listener) in &drop_listeners {
                             if *drop_state_type == drag_state_type {
-                                let drag = cx
+                                // Keep the drag active while validation runs so the
+                                // predicate can cancel it with stop_active_drag.
+                                let value = Arc::clone(&drag.value);
+                                let can_drop = can_drop_predicate
+                                    .as_ref()
+                                    .is_none_or(|predicate| predicate(value.as_ref(), window, cx));
+
+                                let still_active = cx
                                     .active_drag
-                                    .take()
-                                    .expect("checked for type drag state type above");
-
-                                let mut can_drop = true;
-                                if let Some(predicate) = &can_drop_predicate {
-                                    can_drop = predicate(drag.value.as_ref(), window, cx);
-                                }
-
-                                if can_drop {
+                                    .as_ref()
+                                    .is_some_and(|drag| Arc::ptr_eq(&drag.value, &value));
+                                if !still_active {
+                                    // This release belongs to the original payload.
+                                    // An ancestor must not pick up a replacement
+                                    // started by validation with the same release.
+                                    cx.stop_propagation();
+                                } else if can_drop {
+                                    let drag = cx.active_drag.take().unwrap();
                                     listener(drag.value.as_ref(), window, cx);
                                     window.refresh();
                                     cx.stop_propagation();
                                 }
+                                // Rejection leaves an uncancelled drag available
+                                // for an accepting ancestor, without restoring it.
+                                // One element gets one delivery. A second
+                                // same-type listener cannot take it again.
+                                break;
                             }
                         }
                     }
@@ -3227,33 +3240,61 @@ impl Interactivity {
         }
 
         if let Some(hitbox) = hitbox {
-            if let Some(drag) = cx.active_drag.take() {
+            if let Some(drag) = &cx.active_drag
+                && !(drag.value.is::<crate::ExternalPaths>()
+                    && cx.external_file_drag_window.is_some_and(|owner| {
+                        owner != window.handle.window_id()
+                    }))
+            {
+                // Foreign native targets must not validate or cancel the owner's drag.
+                // Validation may stop the drag. Borrow only its shared payload
+                // across the callback, rather than taking and restoring it.
+                let value = Arc::clone(&drag.value);
+                let cursor_style = drag.cursor_style;
                 let mut can_drop = true;
                 if let Some(can_drop_predicate) = &self.can_drop_predicate {
-                    can_drop = can_drop_predicate(drag.value.as_ref(), window, cx);
+                    can_drop = can_drop_predicate(value.as_ref(), window, cx);
                 }
-
-                if can_drop {
+                let mut still_active = cx
+                    .active_drag
+                    .as_ref()
+                    .is_some_and(|drag| Arc::ptr_eq(&drag.value, &value));
+                if can_drop && still_active {
+                    // Feedback callbacks can also cancel or replace the drag.
+                    // Commit their styles only while this payload stays active.
+                    let mut drag_style = StyleRefinement::default();
                     for (state_type, group_drag_style) in &self.group_drag_over_styles {
                         if let Some(group_hitbox_id) =
                             GroupHitboxes::get(&group_drag_style.group, cx)
-                            && *state_type == drag.value.as_ref().type_id()
+                            && *state_type == value.as_ref().type_id()
                             && group_hitbox_id.is_hovered(window)
                         {
-                            style.refine(&group_drag_style.style);
+                            drag_style.refine(&group_drag_style.style);
                         }
                     }
 
                     for (state_type, build_drag_over_style) in &self.drag_over_styles {
-                        if *state_type == drag.value.as_ref().type_id() && hitbox.is_hovered(window)
+                        if *state_type == value.as_ref().type_id() && hitbox.is_hovered(window)
                         {
-                            style.refine(&build_drag_over_style(drag.value.as_ref(), window, cx));
+                            let feedback = build_drag_over_style(value.as_ref(), window, cx);
+                            still_active = cx
+                                .active_drag
+                                .as_ref()
+                                .is_some_and(|drag| Arc::ptr_eq(&drag.value, &value));
+                            if !still_active {
+                                break;
+                            }
+                            drag_style.refine(&feedback);
                         }
+                    }
+                    if still_active {
+                        style.refine(&drag_style);
                     }
                 }
 
-                style.mouse_cursor = drag.cursor_style;
-                cx.active_drag = Some(drag);
+                if still_active {
+                    style.mouse_cursor = cursor_style;
+                }
             }
         }
 

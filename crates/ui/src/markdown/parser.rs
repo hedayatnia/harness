@@ -418,6 +418,15 @@ fn parse_inline_container(cur: &mut Cursor, style: &InlineStyle) -> Vec<InlineRu
         }
         parse_inline_event(cur, &mut runs, style);
     }
+    // Display math at the end of a paragraph leaves a line break with
+    // nothing after it.
+    if let Some(last) = runs.last_mut().filter(|run| run.text.ends_with('\n')) {
+        let trimmed = last.text.trim_end_matches('\n').len();
+        last.text.truncate(trimmed);
+        if last.text.is_empty() {
+            runs.pop();
+        }
+    }
     // Autolink AFTER merging: pulldown splits Text events at would-be
     // emphasis chars ("…/Foo_(bar)" arrives as three events), so scanning
     // per-event would truncate URLs at every underscore.
@@ -435,7 +444,15 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
         }
     };
     match event {
-        Event::Text(t) => push(runs, t.into_string(), style.clone()),
+        Event::Text(t) => {
+            // A line that display math opened starts at its first word.
+            let text = if runs.last().is_some_and(|run| run.text.ends_with('\n')) {
+                t.trim_start_matches(' ').to_owned()
+            } else {
+                t.into_string()
+            };
+            push(runs, text, style.clone())
+        }
         Event::Code(t) => {
             let mut s = style.clone();
             s.code = true;
@@ -443,6 +460,24 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
         }
         Event::SoftBreak => push(runs, " ".into(), style.clone()),
         Event::HardBreak => push(runs, "\n".into(), style.clone()),
+        // Formulas (`super::math`) read as Unicode; display math takes a
+        // line of its own, wherever in the paragraph the model put it.
+        Event::InlineMath(t) => push(runs, super::math::to_unicode(&t), style.clone()),
+        Event::DisplayMath(t) => {
+            if let Some(last) = runs.last_mut() {
+                let kept = last.text.trim_end_matches(' ').len();
+                last.text.truncate(kept);
+            }
+            let at_line_start = runs.last().is_none_or(|run| run.text.ends_with('\n'));
+            let mut text = if at_line_start {
+                String::new()
+            } else {
+                "\n".into()
+            };
+            text.push_str(&super::math::to_unicode(&t));
+            text.push('\n');
+            push(runs, text, style.clone());
+        }
         Event::Html(t) | Event::InlineHtml(t) => {
             if let Some(reference) = super::content_reference::file_reference(&t) {
                 let mut style = style.clone();
@@ -562,6 +597,29 @@ fn push_text_autolinked(runs: &mut Vec<InlineRun>, text: &str, style: &InlineSty
         rest = &from[len..];
     }
     push(runs, rest, style.clone());
+}
+
+/// Byte ranges of the bare `http(s)://` URLs in plain text, by the same rules
+/// as the Markdown autolinker, for verbatim surfaces like tool output.
+pub fn bare_url_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = find_url_start(&text[from..]) {
+        let at = from + rel;
+        let scheme = if text[at..].starts_with("https://") {
+            "https://".len()
+        } else {
+            "http://".len()
+        };
+        let len = bare_url_len(&text[at..]);
+        if len > scheme {
+            ranges.push(at..at + len);
+            from = at + len;
+        } else {
+            from = at + scheme;
+        }
+    }
+    ranges
 }
 
 /// First viable `http(s)://` occurrence: not glued to a preceding
@@ -736,7 +794,7 @@ impl IncrementalParser {
         }
         // The delta may complete a line begun earlier — rescan from that line's
         // start when checking for definitions.
-        let scan_from = self.source.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let scan_from = self.source.rfind(['\n', '\r']).map(|i| i + 1).unwrap_or(0);
         self.source.push_str(delta);
         if !self.full_only && has_link_defs(&self.source[scan_from..]) {
             self.full_only = true;
@@ -762,7 +820,7 @@ impl IncrementalParser {
             n => self.tree.blocks[n - 2].range.start,
         };
         let boundary = self.source[..boundary]
-            .rfind('\n')
+            .rfind(['\n', '\r'])
             .map(|i| i + 1)
             .unwrap_or(0);
 
@@ -816,7 +874,7 @@ impl IncrementalParser {
 /// Conservative detector for link-reference-definition lines
 /// (`[label]: destination`, up to 3 leading spaces).
 fn has_link_defs(text: &str) -> bool {
-    text.lines().any(|line| {
+    text.split(['\n', '\r']).any(|line| {
         let trimmed = line.trim_start();
         line.len() - trimmed.len() <= 3 && trimmed.starts_with('[') && trimmed.contains("]:")
     })
@@ -824,6 +882,24 @@ fn has_link_defs(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bare_url_ranges_follow_the_autolink_rules() {
+        let text = "PR: https://example.com/pr/12. See (https://example.com/a_(b)) and foohttps://x.io, http:// alone, http://b.co/q?x=1";
+        let urls: Vec<&str> = super::bare_url_ranges(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://example.com/pr/12",
+                "https://example.com/a_(b)",
+                "http://b.co/q?x=1",
+            ]
+        );
+        assert!(super::bare_url_ranges("no links here").is_empty());
+    }
+
     use super::*;
 
     #[test]

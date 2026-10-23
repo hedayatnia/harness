@@ -38,6 +38,9 @@ struct QueueEditLease: Equatable, Sendable {
     let text: String
     let baseTextHash: String
     let expiresAtMs: Int64
+    /// The row's attachment paths as the host leased them; nil from a host
+    /// that doesn't report them.
+    var attachments: [String]? = nil
 }
 
 enum QueueEditStartResult: Sendable {

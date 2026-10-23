@@ -10,23 +10,116 @@ use super::*;
 use crate::pickers::CanvasDraft;
 
 #[cfg(test)]
-mod sidebar_tests;
-#[cfg(test)]
 mod header_tests;
 #[cfg(test)]
+pub(super) mod navigation_tests;
+#[cfg(test)]
+mod pane_reopen_tests;
+#[cfg(test)]
+mod reopen_tests;
+#[cfg(test)]
 mod shortcut_tests;
+#[cfg(test)]
+mod sidebar_tests;
 
 /// The most of the sidebar's height the tab list may take before it scrolls.
 const MAX_SIDEBAR_SHARE: f32 = 0.4;
 
 /// A tab's layout while it isn't the active one.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct ChatTab {
+    pub id: uuid::Uuid,
     pub split: Option<chat_split::ChatSplit>,
     pub selected: Option<String>,
     pub project: Option<String>,
     /// The focused pane's composer picks (read when it's a canvas).
     pub draft: Option<CanvasDraft>,
+}
+
+impl Default for ChatTab {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            split: None,
+            selected: None,
+            project: None,
+            draft: None,
+        }
+    }
+}
+
+/// How many closed views ⌘⇧T can bring back.
+const CLOSED_TAB_LIMIT: usize = 20;
+
+/// A closed tab or pane's snapshot and its former position in the tab list.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ClosedChatTab {
+    pub index: usize,
+    pub tab: ChatTab,
+    pub archived: Vec<String>,
+    /// A pane restores inside its original tab rather than adding a tab.
+    pane: bool,
+    /// The untouched new-session canvas left behind by closing the last tab.
+    replacement: Option<ChatTab>,
+}
+
+impl ChatTab {
+    /// Every chat the tab shows, the selected one first.
+    pub(super) fn chats(&self) -> Vec<String> {
+        let mut chats = Vec::new();
+        let panes = self
+            .split
+            .iter()
+            .flat_map(|split| split.panes.iter().flatten());
+        for id in self.selected.iter().chain(panes) {
+            if !chats.contains(id) {
+                chats.push(id.clone());
+            }
+        }
+        chats
+    }
+
+    /// Drop deleted chats without resurrecting an otherwise empty tab.
+    pub(super) fn without_deleted(mut self, exists: impl Fn(&str) -> bool) -> Option<Self> {
+        self.selected = self.selected.filter(|id| exists(id));
+        if let Some(split) = self.split.as_mut() {
+            for pane in &mut split.panes {
+                if pane.as_deref().is_some_and(|id| !exists(id)) {
+                    *pane = None;
+                }
+            }
+        }
+        (!self.chats().is_empty()).then_some(self)
+    }
+
+    fn has_canvas_input(&self) -> bool {
+        self.draft
+            .iter()
+            .chain(
+                self.split
+                    .iter()
+                    .flat_map(|split| split.drafts.iter().flatten()),
+            )
+            .any(|draft| {
+                draft
+                    .input
+                    .as_ref()
+                    .is_some_and(|input| !input.text.is_empty() || !input.stage.is_empty())
+            })
+    }
+
+    fn contains_chat(&self, id: &str) -> bool {
+        self.selected.as_deref() == Some(id)
+            || self
+                .split
+                .as_ref()
+                .is_some_and(|split| split.panes.iter().any(|pane| pane.as_deref() == Some(id)))
+    }
+}
+
+/// Its old place, or the end if the tab list has since shrunk.
+pub(super) fn reopen_index(closed_at: usize, len: usize) -> usize {
+    closed_at.min(len)
 }
 
 /// Remove a closed tab from visit history and reindex the remaining entries.
@@ -84,29 +177,88 @@ pub(super) fn index_after_move(ix: usize, from: usize, to: usize) -> usize {
     }
 }
 
-/// Saved tabs back as parked tabs, dropping chats that no longer exist.
-/// `None` unless there are two or more and the active index fits.
+/// What [`restore_chat_tabs`] brings back.
+#[derive(Debug, PartialEq)]
+pub(super) struct RestoredTabs {
+    /// The parked tabs; empty when one tab is left, which lives in the
+    /// shell's live fields like any lone tab.
+    pub tabs: Vec<ChatTab>,
+    pub active: usize,
+    /// Set when the saved active tab had nothing to show and was dropped:
+    /// the tab to load as the live one, in place of the saved live chat and
+    /// layout (which belonged to the dropped tab).
+    pub replace_live: Option<ChatTab>,
+}
+
+/// Saved tabs back as parked tabs, dropping chats that no longer exist and
+/// tabs left with nothing to show: a new-session canvas saved as `{}`, or a
+/// tab whose chats are all gone (#342). Restoring those as phantom "New
+/// session" tabs is never what the user wants. If the active tab is dropped,
+/// the nearest kept tab before it (else the first) takes over. `None` when
+/// there is nothing to change: fewer than two saved tabs, an active index
+/// that doesn't fit, nothing kept, or only the active tab kept.
 pub(super) fn restore_chat_tabs(
     saved: &[crate::settings::SavedChatTab],
     active: usize,
     live: impl Fn(&str) -> bool,
-) -> Option<(Vec<ChatTab>, usize)> {
+) -> Option<RestoredTabs> {
     if saved.len() < 2 || active >= saved.len() {
         return None;
     }
-    let tabs = saved
-        .iter()
-        .map(|tab| ChatTab {
+    let mut tabs = Vec::new();
+    let mut kept_active = None;
+    let mut kept_before_active: usize = 0;
+    for (ix, tab) in saved.iter().enumerate() {
+        let tab = ChatTab {
             split: tab
                 .layout
                 .as_ref()
-                .and_then(|layout| chat_split::ChatSplit::from_saved(layout, &live)),
+                .and_then(|layout| chat_split::ChatSplit::from_saved(layout, |id| {
+                    live(id) && tab.selected.as_deref() != Some(id)
+                })),
             selected: tab.selected.clone().filter(|id| live(id)),
             project: tab.project.clone(),
             draft: None,
-        })
-        .collect();
-    Some((tabs, active))
+            ..Default::default()
+        };
+        let empty = tab.selected.is_none()
+            && tab
+                .split
+                .as_ref()
+                .is_none_or(|split| split.panes.iter().all(Option::is_none));
+        if empty {
+            continue;
+        }
+        if ix == active {
+            kept_active = Some(tabs.len());
+        } else if ix < active {
+            kept_before_active += 1;
+        }
+        tabs.push(tab);
+    }
+    if tabs.is_empty() {
+        return None;
+    }
+    let (active, replace_live) = match kept_active {
+        Some(active) => (active, None),
+        None => {
+            let active = kept_before_active.saturating_sub(1);
+            (active, Some(tabs[active].clone()))
+        }
+    };
+    if tabs.len() == 1 {
+        // Only the active tab is left, or a single tab replaces it.
+        return replace_live.map(|tab| RestoredTabs {
+            tabs: Vec::new(),
+            active: 0,
+            replace_live: Some(tab),
+        });
+    }
+    Some(RestoredTabs {
+        tabs,
+        active,
+        replace_live,
+    })
 }
 
 /// A chat tab dragged within the tab list.
@@ -144,6 +296,10 @@ impl Shell {
 
     fn park_chat_tab(&mut self, cx: &App) -> ChatTab {
         ChatTab {
+            id: self
+                .chat_tabs
+                .get(self.chat_tab)
+                .map_or(self.chat_tab_id, |tab| tab.id),
             split: self.chat_split.clone(),
             selected: self.state.read(cx).selected_chat.clone(),
             project: self.settings.space_filter.clone(),
@@ -152,6 +308,19 @@ impl Shell {
     }
 
     fn load_chat_tab(&mut self, tab: ChatTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_chat_tab_without_window(tab, cx);
+        window.focus(&self.composer.focus_handle(cx), cx);
+    }
+
+    fn load_chat_tab_without_window(&mut self, mut tab: ChatTab, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        tab.selected = chat_split::existing_chat_selection(tab.selected, state);
+        if let Some(split) = tab.split.as_mut() {
+            for pane in &mut split.panes {
+                *pane = chat_split::existing_chat_selection(pane.take(), state);
+            }
+        }
+        self.chat_tab_id = tab.id;
         self.chat_split = tab.split;
         self.chat_split_selected = tab.selected.clone();
         let draft = tab.draft.filter(|_| tab.selected.is_none());
@@ -161,7 +330,7 @@ impl Shell {
         self.adopt_canvas_draft(draft, cx);
         self.sync_chat_panes(cx);
         self.persist_chat_tabs(cx);
-        window.focus(&self.composer.focus_handle(cx), cx);
+        self.focus_composer(cx);
         cx.notify();
     }
 
@@ -222,6 +391,16 @@ impl Shell {
     /// new-session canvas in the current project). The layout you were in
     /// stays whole in its own tab.
     pub(super) fn new_chat_tab(&mut self, open: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_chat_tab(open, cx);
+        window.focus(&self.composer.focus_handle(cx), cx);
+    }
+
+    fn create_chat_tab(&mut self, open: Option<String>, cx: &mut Context<Self>) {
+        if open.is_some()
+            && chat_split::existing_chat_selection(open.clone(), self.state.read(cx)).is_none()
+        {
+            return;
+        }
         if !matches!(self.route, Route::Chat) {
             self.close_settings(cx);
         }
@@ -241,35 +420,55 @@ impl Shell {
             self.chat_tabs[self.chat_tab] = parked;
         }
         // A chat moving into the new tab leaves its old pane empty.
-        if let Some(id) = open.as_deref()
-            && let Some(split) = self.chat_tabs[self.chat_tab].split.as_mut()
-        {
-            for pane in split.panes.iter_mut().filter(|p| p.as_deref() == Some(id)) {
-                *pane = None;
-            }
+        if let Some(id) = open.as_deref() {
+            self.detach_chat_from_tab_snapshots(id);
         }
         let tab = ChatTab {
             split: None,
             selected: open,
             project,
             draft,
+            ..Default::default()
         };
         self.chat_tabs.push(tab.clone());
         self.chat_tab = self.chat_tabs.len() - 1;
         self.record_chat_tab_visit();
-        self.load_chat_tab(tab, window, cx);
+        self.load_chat_tab_without_window(tab, cx);
+    }
+
+    /// Explicit moves leave no second selected/peer reference in parked tabs.
+    pub(super) fn detach_chat_from_tab_snapshots(&mut self, chat_id: &str) {
+        for tab in &mut self.chat_tabs {
+            if tab.selected.as_deref() == Some(chat_id) {
+                tab.selected = None;
+            }
+            if let Some(split) = tab.split.as_mut() {
+                for pane in split.panes.iter_mut().chain(&mut split.vanished) {
+                    if pane.as_deref() == Some(chat_id) {
+                        *pane = None;
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn switch_chat_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.activate_chat_tab(ix, cx) {
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
+    }
+
+    fn activate_chat_tab(&mut self, ix: usize, cx: &mut Context<Self>) -> bool {
         if ix == self.chat_tab || ix >= self.chat_tabs.len() || !matches!(self.route, Route::Chat) {
-            return;
+            return false;
         }
         self.record_chat_tab_visit();
         self.chat_tabs[self.chat_tab] = self.park_chat_tab(cx);
         self.chat_tab = ix;
         self.record_chat_tab_visit();
         let tab = self.chat_tabs[ix].clone();
-        self.load_chat_tab(tab, window, cx);
+        self.load_chat_tab_without_window(tab, cx);
+        true
     }
 
     /// ⌃Tab / ⌃⇧Tab: browser-style tab cycling once two or more tabs are
@@ -302,6 +501,165 @@ impl Shell {
         self.switch_chat_tab(ix, window, cx);
     }
 
+    pub(super) fn remember_closed_chat_tab(&mut self, index: usize, tab: ChatTab) {
+        if tab.chats().is_empty() && !tab.has_canvas_input() {
+            return;
+        }
+        self.remember_closed_chat_view(index, tab, false);
+    }
+
+    fn remember_closed_chat_view(&mut self, index: usize, tab: ChatTab, pane: bool) {
+        if self.closed_chat_tabs.len() == CLOSED_TAB_LIMIT {
+            self.closed_chat_tabs.remove(0);
+        }
+        self.closed_chat_tabs.push(ClosedChatTab {
+            index,
+            tab,
+            archived: Vec::new(),
+            pane,
+            replacement: None,
+        });
+    }
+
+    pub(super) fn remember_closed_chat_pane(&mut self, cx: &App) {
+        let tab = self.park_chat_tab(cx);
+        self.remember_closed_chat_view(self.chat_tab, tab, true);
+    }
+
+    pub(super) fn remember_last_tab_canvas(&mut self, cx: &App) {
+        let canvas = self.park_chat_tab(cx);
+        if let Some(closed) = self.closed_chat_tabs.last_mut() {
+            closed.replacement = Some(canvas);
+        }
+    }
+
+    /// Restore a tab or pane without reviving deleted chats.
+    fn reopen_closed_chat_tab_without_window(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = loop {
+            let Some(mut closed) = self.closed_chat_tabs.pop() else {
+                return false;
+            };
+            let state = self.state.read(cx);
+            let exists = |id: &str| state.chats.iter().any(|chat| chat.id == id);
+            if closed.pane {
+                if closed.tab.selected.as_deref().is_some_and(|id| !exists(id)) {
+                    continue;
+                }
+            } else if !closed.tab.chats().is_empty() {
+                let Some(tab) = closed.tab.clone().without_deleted(exists) else {
+                    continue;
+                };
+                closed.tab = tab;
+            }
+            closed.archived.retain(|id| exists(id));
+            break closed;
+        };
+        if !matches!(self.route, Route::Chat) {
+            self.close_settings(cx);
+        }
+        if closed.pane {
+            let parent = if self.park_chat_tab(cx).id == closed.tab.id {
+                Some(self.chat_tab)
+            } else {
+                self.chat_tabs
+                    .iter()
+                    .position(|tab| tab.id == closed.tab.id)
+            };
+            if let Some(parent) = parent {
+                self.activate_chat_tab(parent, cx);
+                let Some(tab) = self.restore_closed_pane(&closed.tab, cx) else {
+                    self.sidebar_notice = Some(
+                        "Cannot reopen pane: the split direction changed or it is full".into(),
+                    );
+                    self.closed_chat_tabs.push(closed);
+                    cx.notify();
+                    return false;
+                };
+                for id in closed.archived {
+                    self.queue_close_archive(id, false, cx);
+                }
+                self.load_chat_tab_without_window(tab, cx);
+                return true;
+            }
+        }
+        let parked = self.park_chat_tab(cx);
+        let replace_canvas =
+            self.chat_tabs.is_empty() && closed.replacement.as_ref() == Some(&parked);
+        if !replace_canvas {
+            self.record_chat_tab_visit();
+            if self.chat_tabs.is_empty() {
+                self.chat_tabs.push(parked);
+            } else {
+                self.chat_tabs[self.chat_tab] = parked;
+            }
+            let index = reopen_index(closed.index, self.chat_tabs.len());
+            for ix in &mut self.chat_tab_history {
+                if *ix >= index {
+                    *ix += 1;
+                }
+            }
+            self.chat_tabs.insert(index, closed.tab.clone());
+            self.chat_tab = index;
+            self.record_chat_tab_visit();
+        }
+        for id in closed.archived {
+            self.queue_close_archive(id, false, cx);
+        }
+        self.chat_tab_revealed = None;
+        self.load_chat_tab_without_window(closed.tab, cx);
+        true
+    }
+
+    /// Insert only the closed pane: keep any edits made in the surviving panes.
+    fn restore_closed_pane(&mut self, closed: &ChatTab, cx: &App) -> Option<ChatTab> {
+        let original = closed.split.as_ref()?;
+        let current = self.park_chat_tab(cx);
+        let mut split = current
+            .split
+            .clone()
+            .unwrap_or_else(|| chat_split::ChatSplit {
+                axis: original.axis,
+                panes: vec![None],
+                focus: 0,
+                shares: vec![1.0],
+                projects: vec![None],
+                drafts: vec![None],
+                vanished: vec![None],
+                zoomed: false,
+            });
+        if split.axis != original.axis || split.panes.len() >= chat_split::MAX_CHAT_PANES {
+            return None;
+        }
+        let index = original.focus.min(split.panes.len());
+        let mut after_close = original.clone();
+        after_close.close_focused();
+        let unchanged_sizes = split.shares == after_close.shares;
+        let share = original.shares[original.focus];
+        split.panes[split.focus] = current.selected;
+        split.projects[split.focus] = current.project;
+        split.drafts[split.focus] = current.draft;
+        for size in &mut split.shares {
+            *size *= 1.0 - share;
+        }
+        split.panes.insert(index, None);
+        split.projects.insert(index, closed.project.clone());
+        split.drafts.insert(index, None);
+        split.vanished.insert(index, None);
+        split.shares.insert(index, share);
+        if unchanged_sizes && split.shares.len() == original.shares.len() {
+            split.shares.clone_from(&original.shares);
+        }
+        split.focus = index;
+        split.zoomed = original.zoomed;
+        Some(ChatTab {
+            id: current.id,
+            split: Some(split),
+            selected: closed.selected.clone(),
+            project: closed.project.clone(),
+            draft: closed.draft.clone(),
+        })
+    }
+
     /// ⌘W on a tab down to one pane closes the tab (not the window) while
     /// other tabs remain. The shared pane/tab close handler owns archiving.
     pub(super) fn close_chat_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -309,6 +667,8 @@ impl Shell {
             return false;
         }
         let closed = self.chat_tab;
+        let tab = self.park_chat_tab(cx);
+        self.remember_closed_chat_tab(closed, tab);
         let next = tab_after_close(closed, self.chat_tabs.len(), &mut self.chat_tab_history);
         tracing::info!(closed, tabs = self.chat_tabs.len(), "closing chat tab");
         self.chat_tabs.remove(closed);
@@ -322,6 +682,67 @@ impl Shell {
         }
         self.load_chat_tab(tab, window, cx);
         true
+    }
+
+    /// The ✕ on a tab row: close that tab whole, every pane it shows, and
+    /// archive its sessions under the same rules as ⌘W
+    /// ([`Self::archive_closed_session`]). The lit tab hands off to the last
+    /// visited survivor; a parked one just leaves the list.
+    pub(super) fn close_chat_tab_at(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let len = self.chat_tabs.len();
+        if len < 2 || ix >= len || !matches!(self.route, Route::Chat) {
+            return false;
+        }
+        let tab = if ix == self.chat_tab {
+            self.park_chat_tab(cx)
+        } else {
+            self.chat_tabs[ix].clone()
+        };
+        let closing = tab.chats();
+        if ix == self.chat_tab {
+            self.close_chat_tab(window, cx);
+        } else {
+            tracing::info!(closed = ix, tabs = len, "closing parked chat tab");
+            self.remember_closed_chat_tab(ix, tab);
+            tab_after_close(ix, len, &mut self.chat_tab_history);
+            self.chat_tabs.remove(ix);
+            if self.chat_tab > ix {
+                self.chat_tab -= 1;
+            }
+            if self.chat_tabs.len() == 1 {
+                self.chat_tab_id = self.chat_tabs[self.chat_tab].id;
+                self.chat_tabs.clear();
+                self.chat_tab = 0;
+                self.chat_tab_history.clear();
+            }
+            self.persist_chat_tabs(cx);
+            cx.notify();
+        }
+        for chat_id in closing {
+            self.archive_closed_session(chat_id, window, cx);
+        }
+        true
+    }
+
+    /// ⌘⇧T: reopen the most recently closed tab in its old place and show
+    /// it. Repeats walk back through earlier closes; a tab whose chats were
+    /// all deleted since is skipped, and with none left this does nothing.
+    pub(super) fn reopen_closed_chat_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.reopen_closed_chat_tab_without_window(cx) {
+            window.focus(&self.composer.focus_handle(cx), cx);
+            true
+        } else {
+            false
+        }
     }
 
     /// Includes the live pane even while Settings is covering the chat outlet.
@@ -341,7 +762,27 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> CloseArchive {
-        if !settings::archive_sessions_on_close(cx) {
+        self.archive_closed_session_impl(chat_id, window, false, cx)
+    }
+
+    /// Cmd+W explicitly archives; Cmd+Option+W never enters this path.
+    pub(crate) fn archive_closed_session_explicitly(
+        &mut self,
+        chat_id: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> CloseArchive {
+        self.archive_closed_session_impl(chat_id, window, true, cx)
+    }
+
+    fn archive_closed_session_impl(
+        &mut self,
+        chat_id: String,
+        window: &Window,
+        explicit: bool,
+        cx: &mut Context<Self>,
+    ) -> CloseArchive {
+        if !explicit && !settings::archive_sessions_on_close(cx) {
             return CloseArchive::Off;
         }
         if self.chat_still_open(&chat_id, cx)
@@ -369,24 +810,72 @@ impl Shell {
             cx.notify();
             return CloseArchive::Running;
         }
-        if let Some(engine) = state.engine().cloned() {
-            // Each close owns its request. Reusing mutate_task would cancel
-            // an earlier archive when panes or tabs close in quick succession.
-            cx.spawn(async move |this, cx| {
-                if let Err(error) = engine.client().call(methods::MUTATE, serde_json::json!({
-                    "op": "setChatArchived", "chatId": chat_id, "archived": true,
-                })).await {
-                    this.update(cx, |shell, cx| {
-                        shell.sidebar_notice = Some(format!("Could not archive closed session: {error}").into());
-                        cx.notify();
-                    }).ok();
-                }
-            }).detach();
-        } else {
+        if let Some(closed) = self.closed_chat_tabs.last_mut()
+            && closed.tab.contains_chat(&chat_id)
+            && !closed.archived.contains(&chat_id)
+        {
+            closed.archived.push(chat_id.clone());
+        }
+        self.queue_close_archive(chat_id, true, cx);
+        CloseArchive::Archived
+    }
+
+    /// Keep close/undo requests in order, independently of unrelated mutations.
+    fn queue_close_archive(&mut self, chat_id: String, archived: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.sidebar_notice = Some("Engine not connected".into());
             cx.notify();
+            return;
+        };
+        if !archived {
+            *self
+                .chat_tab_unarchiving
+                .entry(chat_id.clone())
+                .or_default() += 1;
         }
-        CloseArchive::Archived
+        let requested_at = Utc::now().timestamp_millis();
+        let previous = self.chat_close_archive_tasks.remove(&chat_id);
+        let key = chat_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let mut params = serde_json::json!({
+                "op": "setChatArchived", "chatId": chat_id, "archived": archived,
+            });
+            if archived {
+                params["archiveRequestedAt"] = requested_at.into();
+            }
+            let result = engine.client().call(methods::MUTATE, params).await;
+            this.update(cx, |shell, cx| {
+                if !archived {
+                    if result.is_ok() {
+                        shell.state.update(cx, |state, cx| {
+                            if let Some(chat) =
+                                state.chats.iter_mut().find(|chat| chat.id == chat_id)
+                            {
+                                chat.archived = false;
+                            }
+                            cx.notify();
+                        });
+                    }
+                    if let Some(count) = shell.chat_tab_unarchiving.get_mut(&chat_id) {
+                        *count -= 1;
+                        if *count == 0 {
+                            shell.chat_tab_unarchiving.remove(&chat_id);
+                        }
+                    }
+                }
+                if let Err(error) = result {
+                    let verb = if archived { "archive" } else { "restore" };
+                    shell.sidebar_notice =
+                        Some(format!("Could not {verb} closed session: {error}").into());
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.chat_close_archive_tasks.insert(key, task);
     }
 
     /// Where `chat_id` is open in a PARKED tab: (tab, pane) — the pane is
@@ -412,20 +901,41 @@ impl Shell {
     /// Opening a chat that already lives in another tab goes THERE (its
     /// tab, then its pane) instead of showing it twice. False when it isn't
     /// open in another tab.
-    pub(super) fn reveal_chat_in_tabs(&mut self, chat_id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn reveal_chat_in_tabs(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
         let Some((tab, pane)) = self.chat_in_other_tab(chat_id) else {
             return false;
         };
-        self.switch_chat_tab(tab, window, cx);
+        self.activate_chat_tab(tab, cx);
         if let Some(pane) = pane {
-            self.focus_chat_pane(pane, window, cx);
+            self.select_chat_pane(pane, cx);
         }
         true
     }
 
     /// Sidebar navigation preserves the current tab: reveal an open chat in
     /// its tab/pane, or give a previously unopened chat its own new tab.
-    pub(super) fn open_chat_in_tab(&mut self, chat_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_chat_in_tab(
+        &mut self,
+        chat_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let already_selected =
+            self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str());
+        self.open_chat_preserving_tabs(chat_id, cx);
+        if already_selected {
+            self.composer
+                .update(cx, |composer, cx| composer.reveal_pending_question(cx));
+        }
+        window.focus(&self.composer.focus_handle(cx), cx);
+    }
+
+    /// External navigation preserves tabs; explicit replacement (`/resume`)
+    /// continues using `open_chat` instead.
+    pub(crate) fn open_chat_preserving_tabs(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if chat_split::existing_chat_selection(Some(chat_id.clone()), self.state.read(cx)).is_none() {
+            return;
+        }
         self.command_palette = None;
         self.route = Route::Chat;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
@@ -438,11 +948,11 @@ impl Shell {
                 ix != split.focus && id.as_deref() == Some(chat_id.as_str())
             })
         }) {
-            self.focus_chat_pane(pane, window, cx);
+            self.select_chat_pane(pane, cx);
             return;
         }
-        if !self.reveal_chat_in_tabs(&chat_id, window, cx) {
-            self.new_chat_tab(Some(chat_id), window, cx);
+        if !self.reveal_chat_in_tabs(&chat_id, cx) {
+            self.create_chat_tab(Some(chat_id), cx);
         }
     }
 
@@ -450,10 +960,17 @@ impl Shell {
     /// The lit tab's pane strip shows its panes, so rows carry titles only.
     fn chat_tab_labels(&self, cx: &App) -> Vec<SharedString> {
         let state = self.state.read(cx);
+        let provisional = state.provisional_title();
         let title = |selected: Option<&str>| -> SharedString {
             selected
                 .and_then(|id| state.chats.iter().find(|c| c.id == id))
-                .map(|c| transcript::single_line(c.title.as_deref().unwrap_or("Untitled session")))
+                .map(|c| {
+                    transcript::single_line(&crate::state::chat_label(
+                        c,
+                        &provisional,
+                        "Untitled session",
+                    ))
+                })
                 .unwrap_or_else(|| "New session".into())
                 .into()
         };
@@ -538,9 +1055,12 @@ impl Shell {
                             .child(SharedString::from(format!("Tabs · {}", labels.len()))),
                     )
                 })
+                // Tabs have their own viewport, outside the sessions fade.
+                // Fade the whole subtree, including the active tab's pane cards.
                 .child(rows.children(labels.into_iter().enumerate().flat_map(|(ix, title)| {
                     let lit = ix == active;
                     let key: SharedString = format!("chat-tab-{ix}").into();
+                    let group: SharedString = format!("chat-tab-row-{ix}").into();
                     let row = div()
                         .id(("chat-tab", ix))
                         .debug_selector(move || format!("chat-tab-{ix}"))
@@ -561,7 +1081,15 @@ impl Shell {
                         .on_hover(motion::hover_listener(key))
                         .text_size(crate::typography::ui_rems(12.5))
                         .text_color(if lit { theme.text } else { theme.text_muted })
-                        .on_click(cx.listener(move |this, _, window, cx| this.switch_chat_tab(ix, window, cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if ix == this.chat_tab {
+                                this.composer
+                                    .update(cx, |composer, cx| composer.reveal_pending_question(cx));
+                                window.focus(&this.composer.focus_handle(cx), cx);
+                            } else {
+                                this.switch_chat_tab(ix, window, cx);
+                            }
+                        }))
                         .when(multiple && crate::click_activation_drag_enabled(), |row| {
                             row.on_drag(
                                 ChatTabDrag {
@@ -585,22 +1113,75 @@ impl Shell {
                         .on_drop(cx.listener(move |this, drag: &ChatTabDrag, _, cx| {
                             this.move_chat_tab(drag.from, ix, cx)
                         }))
-                        .child(
+                        .group(group.clone())
+                        .child({
+                            let number = || {
+                                div()
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .child(SharedString::from(format!("{}", ix + 1)))
+                            };
+                            // Leading slot: the tab's number, ✕ on row hover
+                            // (two stacked layers, as on the right panel's
+                            // tabs). A lone tab has nothing to close.
                             div()
+                                .id(("chat-tab-close", ix))
+                                .debug_selector(move || format!("chat-tab-close-{ix}"))
                                 .flex_none()
-                                .w(px(14.0))
-                                .text_size(crate::typography::ui_rems(11.0))
-                                .text_color(theme.text_muted.opacity(0.7))
-                                .child(SharedString::from(format!("{}", ix + 1))),
-                        )
+                                .size(px(16.0))
+                                .rounded(px(4.0))
+                                .relative()
+                                .when(!multiple, |slot| slot.flex().items_center().child(number()))
+                                .when(multiple, |slot| {
+                                    slot.hover(|s| s.bg(crate::theme::wash(0.12)))
+                                        // The row owns a drag payload: claim the
+                                        // press so it closes instead of dragging.
+                                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                                            window.prevent_default();
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.close_chat_tab_at(ix, window, cx);
+                                        }))
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .inset_0()
+                                                .flex()
+                                                .items_center()
+                                                .group_hover(group.clone(), |s| s.opacity(0.0))
+                                                .child(number()),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .inset_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .opacity(0.0)
+                                                .group_hover(group.clone(), |s| s.opacity(1.0))
+                                                .child(
+                                                    icon(icons::CLOSE)
+                                                        .size(px(12.0))
+                                                        .text_color(theme.text_muted),
+                                                ),
+                                        )
+                                })
+                        })
                         .child(div().flex_1().min_w_0().truncate().child(title))
                         .into_any_element();
-                    // The strip owns its sidebar gutters. Cancel the tab list's
-                    // inset so grouping cards under a header does not narrow them.
+                    // Keep the strip inside the tab scroll viewport. Negative
+                    // gutters would put the cards' rounded edges under its clip.
                     let strip = if lit { pane_strip.take() } else { None }
-                        .map(|strip| div().flex_none().mx(px(-10.0)).child(strip).into_any_element());
+                        .map(|strip| div().flex_none().child(strip).into_any_element());
                     std::iter::once(row).chain(strip)
-                })))
+                })).map(|rows| {
+                    crate::edge_fade::edge_faded(SIDEBAR_GLASS_FADE_BAND, true, true, rows)
+                        .band_top(18.0)
+                        .fade_overflow_y(&self.chat_tab_scroll)
+                }))
                 .into_any_element(),
         )
     }
@@ -852,6 +1433,7 @@ mod tests {
                                 started_at: None,
                                 updated_at: chrono::Utc::now() - chrono::Duration::hours(1),
                                 last_completed_turn: None,
+                                last_completed_peer_only: false,
                             });
                         }
                         state.set_test_engine(engine.clone());
@@ -934,14 +1516,64 @@ mod tests {
                 layout: None,
             },
         ];
-        let live = |id: &str| id == "live";
-        let (tabs, active) = restore_chat_tabs(&saved, 1, live).unwrap();
-        assert_eq!(active, 1);
-        assert_eq!(tabs[0].selected.as_deref(), Some("live"));
-        assert_eq!(tabs[0].project.as_deref(), Some("space"));
-        assert_eq!(tabs[1].selected, None, "a deleted chat reopens as a new session");
+        let live = |id: &str| id == "live" || id == "other";
+        // The tab whose chat is gone has nothing to show: it is dropped, and
+        // the one tab left takes over as the live one.
+        let restored = restore_chat_tabs(&saved, 1, live).unwrap();
+        assert!(restored.tabs.is_empty());
+        let tab = restored.replace_live.unwrap();
+        assert_eq!(tab.selected.as_deref(), Some("live"));
+        assert_eq!(tab.project.as_deref(), Some("space"));
+        // Only the active tab left: nothing to change.
+        assert!(restore_chat_tabs(&saved, 0, live).is_none());
         assert!(restore_chat_tabs(&saved[..1], 0, live).is_none());
         assert!(restore_chat_tabs(&saved, 2, live).is_none());
+    }
+
+    #[test]
+    fn saved_empty_tabs_do_not_come_back_as_phantom_new_sessions() {
+        use crate::settings::SavedChatTab;
+        let tab = |selected: Option<&str>| SavedChatTab {
+            selected: selected.map(Into::into),
+            project: None,
+            layout: None,
+        };
+        let live = |id: &str| ["a", "b", "c"].contains(&id);
+        // #342: Cmd+T pressed during a freeze saved `{}` tabs, and the active
+        // index pointed at one of them.
+        let saved = [
+            tab(Some("a")),
+            tab(None),
+            tab(Some("b")),
+            tab(None),
+            tab(Some("c")),
+        ];
+        let restored = restore_chat_tabs(&saved, 3, live).unwrap();
+        let selected: Vec<_> = restored
+            .tabs
+            .iter()
+            .map(|t| t.selected.as_deref())
+            .collect();
+        assert_eq!(selected, [Some("a"), Some("b"), Some("c")]);
+        // The dropped active tab hands over to the nearest kept tab before it.
+        assert_eq!(restored.active, 1);
+        assert_eq!(
+            restored.replace_live.unwrap().selected.as_deref(),
+            Some("b")
+        );
+        // A kept active tab keeps its place, reindexed past the dropped ones.
+        let restored = restore_chat_tabs(&saved, 4, live).unwrap();
+        assert_eq!((restored.active, restored.replace_live), (2, None));
+        // An empty first tab hands over to the first kept tab after it.
+        let saved = [tab(None), tab(Some("a")), tab(Some("b"))];
+        let restored = restore_chat_tabs(&saved, 0, live).unwrap();
+        assert_eq!(restored.active, 0);
+        assert_eq!(
+            restored.replace_live.unwrap().selected.as_deref(),
+            Some("a")
+        );
+        // Nothing left to show: nothing to restore.
+        assert!(restore_chat_tabs(&[tab(None), tab(Some("gone"))], 0, live).is_none());
     }
 
     #[gpui::test]
@@ -1008,6 +1640,101 @@ mod tests {
         }
         window
             .update(cx, |shell, _, _| assert!(shell.chat_tabs.is_empty()))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_closed_tab_keeps_only_chats_that_still_exist() {
+        let mut split =
+            chat_split::ChatSplit::split(None, SplitAxis::Horizontal, Some("a".into()), None)
+                .unwrap();
+        split.panes[1] = Some("gone".into());
+        let tab = ChatTab {
+            selected: Some("a".into()),
+            split: Some(split),
+            ..Default::default()
+        };
+        assert_eq!(tab.chats(), ["a", "gone"]);
+        let kept = tab.clone().without_deleted(|id| id == "a").unwrap();
+        assert_eq!(kept.chats(), ["a"]);
+        assert!(tab.without_deleted(|_| false).is_none());
+        // Its old place, or the end once the list is shorter.
+        assert_eq!(reopen_index(1, 3), 1);
+        assert_eq!(reopen_index(4, 2), 2);
+    }
+
+    #[gpui::test]
+    fn reopening_closed_tabs_restores_them_in_place_newest_first(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_archive_test(cx, dir.path());
+        let window = archive_test_window(cx, dir.path());
+        window
+            .update(cx, |shell, window, cx| {
+                shell.route = Route::Chat;
+                shell.state.update(cx, |state, _| {
+                    state.chats = ["a", "b", "c", "d"].map(archive_test_chat).into();
+                    state.selected_chat = Some("a".into());
+                });
+                let tabs = |shell: &Shell, cx: &App| -> Vec<Option<String>> {
+                    let live = shell.state.read(cx).selected_chat.clone();
+                    shell
+                        .chat_tabs
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, tab)| {
+                            if ix == shell.chat_tab {
+                                live.clone()
+                            } else {
+                                tab.selected.clone()
+                            }
+                        })
+                        .collect()
+                };
+                let names = |names: &[&str]| -> Vec<Option<String>> {
+                    names.iter().map(|name| Some(name.to_string())).collect()
+                };
+                // Nothing closed yet: nothing to reopen.
+                assert!(!shell.reopen_closed_chat_tab(window, cx));
+                shell.new_chat_tab(Some("b".into()), window, cx);
+                shell.new_chat_tab(Some("c".into()), window, cx);
+                assert_eq!(tabs(shell, cx), names(&["a", "b", "c"]));
+
+                // B closes from the middle and comes back between A and C.
+                shell.switch_chat_tab(1, window, cx);
+                assert!(shell.close_focused_chat_pane(window, cx));
+                assert_eq!(tabs(shell, cx), names(&["a", "c"]));
+                assert!(shell.reopen_closed_chat_tab(window, cx));
+                assert_eq!(tabs(shell, cx), names(&["a", "b", "c"]));
+                assert_eq!(shell.chat_tab, 1);
+                assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("b"));
+
+                // Down to one tab, then back in reverse closing order.
+                shell.switch_chat_tab(2, window, cx);
+                assert!(shell.close_focused_chat_pane(window, cx));
+                shell.switch_chat_tab(0, window, cx);
+                assert!(shell.close_focused_chat_pane(window, cx));
+                assert!(shell.chat_tabs.is_empty());
+                assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("b"));
+                assert!(shell.reopen_closed_chat_tab(window, cx));
+                assert_eq!(tabs(shell, cx), names(&["a", "b"]));
+                assert_eq!(shell.chat_tab, 0);
+                assert!(shell.reopen_closed_chat_tab(window, cx));
+                assert_eq!(tabs(shell, cx), names(&["a", "b", "c"]));
+                assert_eq!(shell.chat_tab, 2);
+                assert!(!shell.reopen_closed_chat_tab(window, cx));
+
+                // A tab whose chat was deleted since is skipped.
+                shell.new_chat_tab(Some("d".into()), window, cx);
+                assert!(shell.close_focused_chat_pane(window, cx));
+                shell.switch_chat_tab(0, window, cx);
+                assert!(shell.close_focused_chat_pane(window, cx));
+                shell.state.update(cx, |state, _| {
+                    state.chats.retain(|chat| chat.id != "a");
+                });
+                assert!(shell.reopen_closed_chat_tab(window, cx));
+                assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("d"));
+                assert!(!shell.reopen_closed_chat_tab(window, cx));
+            })
             .unwrap();
     }
 

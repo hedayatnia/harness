@@ -34,6 +34,9 @@ struct MdSelection {
     anchor_key: String,
     /// Byte offset of the anchor within its element.
     anchor_ix: usize,
+    /// The immediate word/paragraph selected by a multi-click. Moving inside
+    /// it (including a stationary pointer refresh) must not erase that span.
+    initial_span: Option<Range<usize>>,
     dragging: bool,
     /// Document direction established while the anchor is still painted.
     /// Once virtualization moves it out of the registry, this tells us which
@@ -90,6 +93,7 @@ pub fn begin(key: &str, ix: usize) {
     *state().lock().unwrap() = Some(MdSelection {
         anchor_key: key.to_string(),
         anchor_ix: ix,
+        initial_span: None,
         dragging: true,
         forward: None,
         spans: Vec::new(),
@@ -101,6 +105,7 @@ pub fn begin_with_span(key: &str, text: &str, range: Range<usize>) {
     *state().lock().unwrap() = Some(MdSelection {
         anchor_key: key.to_string(),
         anchor_ix: range.start,
+        initial_span: Some(range.clone()),
         dragging: true,
         forward: None,
         spans: vec![Span {
@@ -151,7 +156,19 @@ pub fn update_drag(elements: &[(&str, &str)], head: (usize, usize)) -> bool {
         .iter()
         .position(|(key, _)| *key == selection.anchor_key)
     {
-        let anchor = (anchor_ei, selection.anchor_ix);
+        let (anchor, head) = if let Some(range) = &selection.initial_span {
+            let start = (anchor_ei, range.start);
+            let end = (anchor_ei, range.end);
+            if head < start {
+                (end, head)
+            } else if head > end {
+                (start, head)
+            } else {
+                (start, end)
+            }
+        } else {
+            ((anchor_ei, selection.anchor_ix), head)
+        };
         selection.forward = Some(anchor <= head);
         resolve_spans(elements, anchor, head)
     } else {
@@ -436,6 +453,42 @@ mod tests {
         begin_with_span("p1", "hello world", 6..11);
         assert_eq!(wash_range("p1"), Some(6..11));
         assert_eq!(end_drag("p1").as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn multi_click_span_survives_stationary_and_inside_span_drag_updates() {
+        let _state = test_state_lock();
+        let elements = [("p1", "hello world")];
+        for range in [6..11, 0..11] {
+            begin_with_span("p1", "hello world", range.clone());
+            for ix in range.start..=range.end {
+                assert!(!update_drag(&elements, (0, ix)));
+                assert_eq!(wash_range("p1"), Some(range.clone()));
+            }
+            assert_eq!(end_drag("p1"), Some("hello world"[range].to_string()));
+        }
+    }
+
+    #[test]
+    fn multi_click_drag_extends_from_the_opposite_edge_and_can_reverse() {
+        let _state = test_state_lock();
+        begin_with_span("p2", "second", 0..6);
+        assert!(update_drag(&elems(), (2, 5)));
+        assert_eq!(selected_text().as_deref(), Some("second\nthird"));
+        assert!(update_drag(&elems(), (0, 6)));
+        assert_eq!(selected_text().as_deref(), Some("paragraph\nsecond"));
+        assert!(update_drag(&elems(), (1, 3)));
+        assert_eq!(end_drag("p2").as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn ordinary_drag_can_still_contract_to_an_empty_selection() {
+        let _state = test_state_lock();
+        begin("p1", 6);
+        assert!(update_drag(&elems(), (0, 15)));
+        assert_eq!(selected_text().as_deref(), Some("paragraph"));
+        assert!(update_drag(&elems(), (0, 6)));
+        assert_eq!(end_drag("p1"), None);
     }
 
     #[test]

@@ -42,6 +42,17 @@ impl GraffWorktree {
     }
 }
 
+/// Where `graff -w` must launch for a run whose cwd is `cwd`: the main
+/// checkout. A follow-up can carry the chat's re-homed cwd, the tree itself,
+/// and `-w` from inside it asks Graff for a nested tree on a branch that is
+/// already checked out, which fails with a name collision.
+pub fn launch_root(cwd: &str) -> &str {
+    match cwd.find(MARKER) {
+        Some(at) if GraffWorktree::from_path(cwd).is_some() => &cwd[..at],
+        _ => cwd,
+    }
+}
+
 /// Graff's `-w` name rule: 1–64 of `[A-Za-z0-9._-]`.
 pub fn valid_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -82,6 +93,20 @@ mod tests {
         for other in ["/repo", "/repo/.graff/worktrees/", "/.graff/worktrees/x", "/r/.graff/worktrees/bad name"] {
             assert_eq!(GraffWorktree::from_path(other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn worktree_runs_launch_from_the_main_checkout() {
+        assert_eq!(launch_root("/repo"), "/repo");
+        assert_eq!(launch_root("/repo/.graff/worktrees/harness-ab12"), "/repo");
+        assert_eq!(
+            launch_root("/repo/.graff/worktrees/harness-ab12/src"),
+            "/repo"
+        );
+        assert_eq!(
+            launch_root("/repo/.graff/worktrees/bad name"),
+            "/repo/.graff/worktrees/bad name"
+        );
     }
 
     #[test]

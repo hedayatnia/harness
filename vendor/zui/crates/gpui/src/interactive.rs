@@ -3,7 +3,35 @@ use crate::{
     Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
-use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
+use std::{any::Any, cell::Cell, fmt::Debug, ops::Deref, path::PathBuf, time::Duration};
+
+thread_local! {
+    static INPUT_EVENT_AGE: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// How long the input event now being dispatched waited between the OS
+/// recording it and the app receiving it. Input pressed while the main thread
+/// was blocked arrives late, in a burst, once it unblocks; handlers can read
+/// this to tell that input apart from a fresh press.
+///
+/// `None` outside input dispatch, and on platforms that don't report it.
+pub fn input_event_age() -> Option<Duration> {
+    INPUT_EVENT_AGE.with(Cell::get)
+}
+
+/// Run `f` with [`input_event_age`] reporting `age`. Platforms wrap their
+/// input dispatch in this; tests use it to simulate input that was buffered
+/// during a stall.
+pub fn with_input_event_age<R>(age: Option<Duration>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INPUT_EVENT_AGE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(INPUT_EVENT_AGE.with(|cell| cell.replace(age)));
+    f()
+}
 
 /// An event from a platform input source.
 pub trait InputEvent: Sealed + 'static {

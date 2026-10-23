@@ -11,17 +11,8 @@ import SwiftUI
 struct UsageView: View {
     @Environment(AppModel.self) private var model
     @State private var selectedDeviceId: String?
-    @State private var state: LoadState = .idle
-    /// The computer `state` describes; another one shows a spinner, not stale numbers.
-    @State private var loadedDeviceId: String?
+    @State private var state = UsageLoadState<CodegraffUsage?, [AgentAccount]>()
     @State private var now = Date()
-
-    enum LoadState {
-        case idle
-        case loading
-        case loaded(codegraff: CodegraffUsage?, accounts: [AgentAccount])
-        case failed(String)
-    }
 
     /// Computers that can run agents, online ones first.
     private var hosts: [DeviceRow] {
@@ -70,25 +61,40 @@ struct UsageView: View {
 
     @ViewBuilder
     private var content: some View {
+        // Host selection can change before its .task starts. Never render the
+        // previous computer's account names (or signed-out claims) in that gap.
+        if state.deviceId != deviceId {
+            Section { ProgressView() }
+                .harnessListRow()
+        } else {
+            endpointSection("CodeGraff", state: state.codegraff) { codegraffSection($0) }
+            endpointSection("Agent plans", state: state.accounts) { agentSections($0) }
+        }
+    }
+
+    @ViewBuilder
+    private func endpointSection<Value, Content: View>(
+        _ title: String, state: UsageSectionState<Value>,
+        @ViewBuilder content: (Value) -> Content
+    ) -> some View {
         switch state {
-        case .idle, .loading:
-            Section {
-                HStack {
-                    Spacer()
-                    ProgressView()
-                    Spacer()
-                }
-            }
-            .harnessListRow()
-        case .failed(let message):
-            Section {
-                Text(message).foregroundStyle(.secondary)
+        case .loaded(let value):
+            content(value)
+        case .loading:
+            Section(title) { ProgressView() }
+                .harnessListRow()
+        case .idle:
+            Section(title) {
+                Text("Usage wasn't loaded.").foregroundStyle(.secondary)
                 Button("Try again") { Task { await reload() } }
             }
             .harnessListRow()
-        case .loaded(let codegraff, let accounts):
-            codegraffSection(codegraff)
-            agentSections(accounts)
+        case .failed(let message):
+            Section(title) {
+                Text("Couldn't load usage: \(message)").foregroundStyle(.secondary)
+                Button("Try again") { Task { await reload() } }
+            }
+            .harnessListRow()
         }
     }
 
@@ -144,29 +150,48 @@ struct UsageView: View {
         }
     }
 
+    @MainActor
     private func reload() async {
-        guard let deviceId else { return }
-        // A refresh keeps the numbers on screen until the new ones arrive.
-        if case .loaded = state, loadedDeviceId == deviceId {} else { state = .loading }
-        // The two answers are independent; one failing (a CLI that can't
-        // report, a signed-out gateway) shouldn't blank the other.
-        async let codegraff = capture { try await model.codegraffUsage(deviceId: deviceId) }
-        async let accounts = capture { try await model.agentAccounts(deviceId: deviceId, forceUsage: true) }
-        let (usage, snapshot) = await (codegraff, accounts)
-        guard self.deviceId == deviceId else { return }
-        now = Date()
-        loadedDeviceId = deviceId
-        switch (usage, snapshot) {
-        case (.failure(let error), .failure):
-            state = .failed("Couldn't reach \(model.deviceName(deviceId)): \(describeTransportError(error))")
-        default:
-            state = .loaded(codegraff: (try? usage.get()) ?? nil,
-                            accounts: (try? snapshot.get())?.accounts ?? [])
+        guard !Task.isCancelled else { return }
+        guard let deviceId else {
+            state.clear()
+            return
+        }
+        // Pin the initial/fallback choice: presence sorting must not switch
+        // the computer being inspected while a usage request is in flight.
+        if selectedDeviceId != deviceId { selectedDeviceId = deviceId }
+        let request = state.begin(deviceId: deviceId)
+        // Publish each result as soon as it arrives. A slow or failing endpoint
+        // must not hide the other endpoint's successful response.
+        async let codegraff: Void = reloadCodegraff(request)
+        async let accounts: Void = reloadAccounts(request)
+        _ = await (codegraff, accounts)
+    }
+
+    @MainActor
+    private func reloadCodegraff(_ request: UsageLoadState<CodegraffUsage?, [AgentAccount]>.Request) async {
+        let result = await capture { try await model.codegraffUsage(deviceId: request.deviceId) }
+        if state.finishCodegraff(request, currentDeviceId: deviceId, result: result,
+                                cancelled: Task.isCancelled) {
+            now = Date()
         }
     }
 
-    private func capture<T>(_ body: () async throws -> T) async -> Result<T, Error> {
-        do { return .success(try await body()) } catch { return .failure(error) }
+    @MainActor
+    private func reloadAccounts(_ request: UsageLoadState<CodegraffUsage?, [AgentAccount]>.Request) async {
+        let result = await capture {
+            try await model.agentAccounts(deviceId: request.deviceId, forceUsage: true).accounts
+        }
+        if state.finishAccounts(request, currentDeviceId: deviceId, result: result,
+                                cancelled: Task.isCancelled) {
+            now = Date()
+        }
+    }
+
+    @MainActor
+    private func capture<T>(_ body: () async throws -> T) async -> Result<T, UsageLoadFailure> {
+        do { return .success(try await body()) }
+        catch { return .failure(UsageLoadFailure(message: describeTransportError(error))) }
     }
 }
 

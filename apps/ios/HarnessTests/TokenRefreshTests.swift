@@ -58,15 +58,80 @@ final class TokenRefreshTests: XCTestCase {
         XCTAssertEqual(calls.value, 1)  // replaying a spent token only invites a family revocation
     }
 
-    func testARejectionAfterABlipStillCounts() async {
+    func testASecondRejectionAfterABlipStillCounts() async {
         let calls = counter()
         let outcome = await TokenRefresh.run(retryDelays: [0, 0]) {
             calls.bump()
             if calls.value == 1 { throw URLError(.timedOut) }
-            throw AuthError.http(401, "")
+            throw AuthError.http(400, #"{"error":"CodeGraff rejected the grant (400)"}"#)
         }
         XCTAssertEqual(outcome, .rejected)
-        XCTAssertEqual(calls.value, 2)
+        XCTAssertEqual(calls.value, 3)  // the blip, the spared rejection, the one that stands
+    }
+
+    /// The reply to a refresh is lost after the edge rotated the credential (walking out of Wi-Fi), and
+    /// the next attempt is turned down although the sign-in is fine: one more try, not a sign-out.
+    func testARejectionRightAfterALostReplyGetsOneMoreTry() async {
+        let calls = counter()
+        let outcome = await TokenRefresh.run(retryDelays: [0, 0]) {
+            calls.bump()
+            switch calls.value {
+            case 1: throw URLError(.networkConnectionLost)
+            case 2: throw AuthError.http(400, #"{"error":"CodeGraff rejected the grant (400)"}"#)
+            default: return self.tokens
+            }
+        }
+        XCTAssertEqual(outcome, .refreshed(tokens))
+        XCTAssertEqual(calls.value, 3)
+    }
+
+    func testTheLostReplyIsRememberedAcrossRoundsWithinTheReplayWindow() async {
+        let memory = TokenRefresh.Memory()
+        let start = Date()
+        let first = await TokenRefresh.run(retryDelays: [], memory: memory, now: { start }) {
+            throw URLError(.timedOut)
+        }
+        XCTAssertEqual(first, .unavailable)
+        let calls = counter()
+        let second = await TokenRefresh.run(retryDelays: [], memory: memory, now: { start + 60 }) {
+            calls.bump()
+            if calls.value == 1 { throw AuthError.http(401, "") }
+            return self.tokens
+        }
+        XCTAssertEqual(second, .refreshed(tokens))
+        // Past the window a rejection stands at once.
+        let stale = TokenRefresh.Memory()
+        _ = await TokenRefresh.run(retryDelays: [], memory: stale, now: { start }) { throw URLError(.timedOut) }
+        let late = await TokenRefresh.run(retryDelays: [], memory: stale, now: { start + 121 }) {
+            throw AuthError.http(401, "")
+        }
+        XCTAssertEqual(late, .rejected)
+    }
+
+    func testADefiniteRejectionAfterABlipStandsAtOnce() async {
+        for body in [#"{"error":"invalid refresh credential"}"#,
+                     #"{"error":"workspace does not belong to this account"}"#,
+                     #"{"error":"missing refreshToken"}"#] {
+            let calls = counter()
+            let outcome = await TokenRefresh.run(retryDelays: [0, 0]) {
+                calls.bump()
+                if calls.value == 1 { throw URLError(.timedOut) }
+                throw AuthError.http(401, body)
+            }
+            XCTAssertEqual(outcome, .rejected, body)
+            XCTAssertEqual(calls.value, 2, body)
+        }
+    }
+
+    func testRejectionsAreCategorizedFromTheEdgeText() {
+        XCTAssertEqual(RefreshRejection(body: #"{"error":"invalid refresh credential"}"#), .invalid)
+        XCTAssertEqual(RefreshRejection(body: #"{"error":"workspace does not belong to this account"}"#), .workspace)
+        XCTAssertEqual(RefreshRejection(body: #"{"error":"bad request"}"#), .malformed)
+        XCTAssertEqual(RefreshRejection(body: #"{"error":"CodeGraff rejected the grant (400)"}"#), .rejected)
+        XCTAssertEqual(RefreshRejection(body: ""), .unknown)
+        XCTAssertEqual(RefreshRejection(body: "<html>"), .unknown)
+        XCTAssertFalse(RefreshRejection.rejected.definite)
+        XCTAssertFalse(RefreshRejection.unknown.definite)
     }
 
     func testKeychainUpdatesInPlaceAndKeepsBothHalves() throws {
@@ -83,9 +148,13 @@ final class TokenRefreshTests: XCTestCase {
         SecItemDelete(probe as CFDictionary)
         let key = "testToken-\(UUID().uuidString)"
         defer { Keychain.delete(key: key) }
-        Keychain.save("one", key: key)
-        Keychain.save("two", key: key)
+        XCTAssertEqual(Keychain.read(key: key), .missing, "absent is not the same as unreadable")
+        XCTAssertTrue(Keychain.save("one", key: key))
+        XCTAssertTrue(Keychain.save("two", key: key))
         XCTAssertEqual(Keychain.load(key: key), "two")
+        XCTAssertEqual(Keychain.read(key: key), .found("two"))
+        Keychain.delete(key: key)
+        XCTAssertEqual(Keychain.read(key: key), .missing)
     }
 
     final class Counter: @unchecked Sendable {

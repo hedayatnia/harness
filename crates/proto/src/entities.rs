@@ -198,6 +198,13 @@ pub struct Chat {
     /// chat sharing the same checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_context: Option<ConversationSourceContext>,
+    /// Set when the chat's latest accepted run could not observe its checkout
+    /// (not a repository, or inspection failed): `source_context` is then only
+    /// the last known one, not where the chat runs now, and nothing may treat
+    /// it as current (branch PRs, branch labels). Cleared by the next
+    /// successful capture. Written only by the host, never by row upserts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context_unavailable_at: Option<DateTime<Utc>>,
     pub config: Option<ChatConfig>,
     pub last_message_preview: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
@@ -304,6 +311,12 @@ pub struct Session {
     /// Interrupts, failures and liveness expiry never advance this marker.
     #[serde(default)]
     pub last_completed_turn: Option<String>,
+    /// `last_completed_turn` answered peer mail only (another chat's message
+    /// or a room delivery, no person's prompt): clients consume the marker
+    /// without a completion alert. Published with the marker; older hosts
+    /// omit it, which reads as an ordinary completion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_completed_peer_only: bool,
     pub chat_id: String,
     pub device_id: String,
     pub status: SessionStatus,
@@ -813,6 +826,15 @@ pub struct ChangeRequestSummary {
     pub state: ChangeRequestState,
     pub base_ref: String,
     pub head_ref: String,
+}
+
+/// Result of merging a checkout's change request on its host. `merged: false`
+/// carries the provider's own reason (checks pending, review required, …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRequestMergeResult {
+    pub merged: bool,
+    pub message: String,
 }
 
 /// Latest successful change request resolution for one checkout and branch.

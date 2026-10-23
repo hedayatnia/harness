@@ -7,6 +7,8 @@
 //!   background thread: `afplay` (macOS), PowerShell `Media.SoundPlayer`
 //!   (Windows), first of `paplay`/`pw-play`/`aplay`/`ffplay`/`mpv` (Linux —
 //!   WAV, so even bare ALSA `aplay` decodes it);
+//! - on macOS a session chime for a background banner is attached to that
+//!   notification instead of played here, so Focus applies ([`plan_alert`]);
 //! - `HARNESS_DISABLE_SOUND` env kill-switch + the `soundEnabled` ui-setting;
 //! - failures are logged and swallowed — a missing player must never bother
 //!   the session flow.
@@ -35,6 +37,76 @@ pub enum Sound {
     Request,
     /// A run failed or the durable connection state degraded.
     Attention,
+}
+
+impl Sound {
+    /// The chime's file name inside the macOS app bundle's `Resources`
+    /// (copied there by `scripts/package-macos.sh`), the name a system
+    /// notification plays it by.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn bundle_file_name(self) -> &'static str {
+        match self {
+            Sound::Done => "harness-done.wav",
+            Sound::Request => "harness-request.wav",
+            Sound::Attention => "harness-attention.wav",
+        }
+    }
+}
+
+/// Whether the `HARNESS_DISABLE_SOUND` kill-switch is set. Applies to chimes
+/// attached to notifications as well as local playback.
+pub(crate) fn disabled_by_env() -> bool {
+    std::env::var_os(DISABLE_ENV).is_some()
+}
+
+/// Where one alert's chime is played.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Chime {
+    Silent,
+    /// Harness plays it itself ([`play`]). macOS Focus can't silence this.
+    Local,
+    /// Attached to the alert's system notification, so the system applies
+    /// Focus / Do Not Disturb and the per-app notification settings to it.
+    WithNotification,
+}
+
+/// How one session or connectivity alert is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AlertDelivery {
+    pub banner: bool,
+    pub chime: Chime,
+}
+
+/// Route one alert. Each alert rings at most once: a chime that rides on the
+/// notification is never also played locally.
+///
+/// - `sound`: the chime is wanted (session-sound settings, attention gate);
+/// - `banner`: the banner is wanted (desktop setting, background-only check);
+/// - `app_focused`: a Harness window is key;
+/// - `notification_sound`: this platform's notification path can carry the
+///   chime (native macOS center).
+///
+/// In the background, a chime travels with the banner when there is one, so
+/// Focus and the app's notification settings decide whether it is heard.
+/// While Harness is focused the chime stays in-app feedback and plays
+/// locally; a banner shown then is silent. With banners off (sound-only
+/// alerts) nothing exists for the system to filter, so the chime plays
+/// locally as before rather than being dropped or forcing a banner the user
+/// turned off.
+pub(crate) fn plan_alert(
+    sound: bool,
+    banner: bool,
+    app_focused: bool,
+    notification_sound: bool,
+) -> AlertDelivery {
+    let chime = if !sound {
+        Chime::Silent
+    } else if banner && !app_focused && notification_sound {
+        Chime::WithNotification
+    } else {
+        Chime::Local
+    };
+    AlertDelivery { banner, chime }
 }
 
 /// Play a chime on a background thread. Silently a no-op when disabled or no
@@ -313,6 +385,15 @@ use harness_proto::{
     view::{Indicator, effective_indicator},
 };
 
+/// Whether a completed turn earns a completion sound and "Run finished"
+/// banner. An archived chat is out of the person's working set, and a turn
+/// that answered only peer mail is agent coordination, not a result anyone
+/// asked to hear about (#499). Input requests and failures keep their own
+/// alerts; only completion is withheld.
+pub(crate) fn completion_alert_allowed(chat_archived: bool, peer_only_turn: bool) -> bool {
+    !chat_archived && !peer_only_turn
+}
+
 /// Notification baseline is separate from the visual activity indicator:
 /// going idle can mean cancellation, expiry, or an internal handoff.
 #[derive(Debug, Clone)]
@@ -320,10 +401,15 @@ pub(crate) struct SessionNotificationState {
     indicator: Indicator,
     last_completed_turn: Option<String>,
     fresh: bool,
+    completion_alert: bool,
 }
 
 impl SessionNotificationState {
-    pub(crate) fn new(session: &Session, now: chrono::DateTime<chrono::Utc>) -> Self {
+    pub(crate) fn new(
+        session: &Session,
+        chat_archived: bool,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
         Self {
             indicator: effective_indicator(Some(session), now),
             last_completed_turn: session.last_completed_turn.clone(),
@@ -331,11 +417,17 @@ impl SessionNotificationState {
                 .signed_duration_since(session.updated_at)
                 .num_milliseconds()
                 <= harness_proto::view::SESSION_STALE_MS,
+            completion_alert: completion_alert_allowed(
+                chat_archived,
+                session.last_completed_peer_only,
+            ),
         }
     }
 
     /// Call after saving the new baseline, including when delivery is pending
-    /// or outputs are disabled. Suppressed pings must never be replayed later.
+    /// or outputs are disabled. Suppressed pings must never be replayed later:
+    /// a withheld completion (archived chat, peer-only turn) still advances the
+    /// baseline, so a restore or heartbeat cannot replay it.
     pub(crate) fn sound_since(&self, prev: &Self, send_pending: bool) -> Option<Sound> {
         if self.indicator == Indicator::Errored && prev.indicator != Indicator::Errored {
             return Some(Sound::Attention);
@@ -345,6 +437,7 @@ impl SessionNotificationState {
             return Some(Sound::Request);
         }
         if !send_pending
+            && self.completion_alert
             && self.fresh
             && self.last_completed_turn.is_some()
             && self.last_completed_turn != prev.last_completed_turn
@@ -437,7 +530,76 @@ mod tests {
             indicator,
             last_completed_turn: turn.map(str::to_owned),
             fresh: true,
+            completion_alert: true,
         }
+    }
+
+    fn session(
+        status: harness_proto::SessionStatus,
+        turn: Option<&str>,
+        peer_only: bool,
+    ) -> Session {
+        Session {
+            last_completed_turn: turn.map(str::to_owned),
+            last_completed_peer_only: peer_only,
+            chat_id: "chat".into(),
+            device_id: "device".into(),
+            status,
+            started_at: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn archived_chats_never_alert_completion_and_never_replay_it() {
+        use harness_proto::SessionStatus::{Idle, Working};
+        let now = chrono::Utc::now();
+        let working =
+            SessionNotificationState::new(&session(Working, Some("t1"), false), false, now);
+        // Archived after the run started: the late completion is consumed.
+        let late = SessionNotificationState::new(&session(Idle, Some("t2"), false), true, now);
+        assert_eq!(late.sound_since(&working, false), None);
+        // Restoring the chat (or a heartbeat) re-reads the same marker: silent.
+        let restored = SessionNotificationState::new(&session(Idle, Some("t2"), false), false, now);
+        assert_eq!(restored.sound_since(&late, false), None);
+        let heartbeat =
+            SessionNotificationState::new(&session(Working, Some("t2"), false), false, now);
+        assert_eq!(heartbeat.sound_since(&restored, false), None);
+        // A failure or a question in an archived chat still alerts.
+        let failed = SessionNotificationState::new(
+            &session(harness_proto::SessionStatus::Errored, Some("t2"), false),
+            true,
+            now,
+        );
+        assert_eq!(failed.sound_since(&late, false), Some(Sound::Attention));
+        let asking = SessionNotificationState::new(
+            &session(
+                harness_proto::SessionStatus::AwaitingInput,
+                Some("t2"),
+                false,
+            ),
+            true,
+            now,
+        );
+        assert_eq!(asking.sound_since(&late, false), Some(Sound::Request));
+    }
+
+    #[test]
+    fn peer_only_turns_complete_silently_and_human_turns_still_chime() {
+        use harness_proto::SessionStatus::{Idle, Working};
+        let now = chrono::Utc::now();
+        let before =
+            SessionNotificationState::new(&session(Working, Some("t1"), false), false, now);
+        let peer = SessionNotificationState::new(&session(Idle, Some("t2"), true), false, now);
+        assert_eq!(peer.sound_since(&before, false), None);
+        assert_eq!(peer.sound_since(&peer, false), None);
+        // A person's next request (which may consult peers) chimes as usual.
+        let human = SessionNotificationState::new(&session(Idle, Some("t3"), false), false, now);
+        assert_eq!(human.sound_since(&peer, false), Some(Sound::Done));
+        assert!(completion_alert_allowed(false, false));
+        assert!(!completion_alert_allowed(true, false));
+        assert!(!completion_alert_allowed(false, true));
+        assert!(!completion_alert_allowed(true, true));
     }
 
     #[test]
@@ -516,6 +678,98 @@ mod tests {
         assert_eq!(stale.sound_since(&before, false), None);
         let refreshed = baseline(Indicator::Working, Some("old"));
         assert_eq!(refreshed.sound_since(&stale, false), None);
+    }
+
+    #[test]
+    fn background_chimes_ride_on_the_notification_so_focus_applies() {
+        // Background with a banner: the system notification carries the
+        // chime, so Focus / Do Not Disturb can silence it. Never also local.
+        assert_eq!(
+            plan_alert(true, true, false, true),
+            AlertDelivery {
+                banner: true,
+                chime: Chime::WithNotification
+            }
+        );
+        // Sound off: the banner is silent and nothing plays locally.
+        assert_eq!(
+            plan_alert(false, true, false, true),
+            AlertDelivery {
+                banner: true,
+                chime: Chime::Silent
+            }
+        );
+        assert_eq!(
+            plan_alert(false, false, false, true),
+            AlertDelivery {
+                banner: false,
+                chime: Chime::Silent
+            }
+        );
+    }
+
+    #[test]
+    fn foreground_and_sound_only_chimes_are_kept_and_never_doubled() {
+        // Focused, banner skipped by background-only: in-app chime.
+        assert_eq!(
+            plan_alert(true, false, true, true),
+            AlertDelivery {
+                banner: false,
+                chime: Chime::Local
+            }
+        );
+        // Focused with a banner anyway: one local chime, silent banner.
+        assert_eq!(
+            plan_alert(true, true, true, true),
+            AlertDelivery {
+                banner: true,
+                chime: Chime::Local
+            }
+        );
+        // Sound-only alerts in the background still ring, without a banner.
+        assert_eq!(
+            plan_alert(true, false, false, true),
+            AlertDelivery {
+                banner: false,
+                chime: Chime::Local
+            }
+        );
+        // No notification sound on this platform: the chime plays locally
+        // and the banner stays as configured.
+        assert_eq!(
+            plan_alert(true, true, false, false),
+            AlertDelivery {
+                banner: true,
+                chime: Chime::Local
+            }
+        );
+        // Exhaustively: a wanted chime is never dropped, and an unwanted one
+        // never plays.
+        for sound in [false, true] {
+            for banner in [false, true] {
+                for focused in [false, true] {
+                    for carried in [false, true] {
+                        let plan = plan_alert(sound, banner, focused, carried);
+                        assert_eq!(plan.banner, banner);
+                        assert_eq!(plan.chime != Chime::Silent, sound);
+                        if plan.chime == Chime::WithNotification {
+                            assert!(banner && !focused && carried);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_chime_names_are_distinct_wavs() {
+        let names = [Sound::Done, Sound::Request, Sound::Attention].map(Sound::bundle_file_name);
+        for name in names {
+            assert!(name.starts_with("harness-") && name.ends_with(".wav"));
+        }
+        assert_ne!(names[0], names[1]);
+        assert_ne!(names[1], names[2]);
+        assert_ne!(names[0], names[2]);
     }
 
     #[test]

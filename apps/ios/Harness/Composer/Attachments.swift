@@ -133,6 +133,7 @@ struct StagedAttachment: Identifiable, Hashable {
     /// serves (png/jpg/gif/webp) as-is; transcode everything else (HEIC
     /// camera shots, mainly) to JPEG.
     static func stage(data: Data) -> StagedAttachment? {
+        guard data.count <= maxAttachmentBytes else { return nil }
         var bytes = data
         var ext = sniffExtension(data)
         if ext == nil {
@@ -520,6 +521,8 @@ struct AttachmentStripView: View {
                             .strokeBorder(hairline(0.11), lineWidth: 1))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Preview attached image")
+                .accessibilityIdentifier("composer-attachment-\(att.id)")
                 .overlay(alignment: .topTrailing) {
                     Button {
                         remove(att.id)
@@ -533,6 +536,8 @@ struct AttachmentStripView: View {
                     }
                     .buttonStyle(.plain)
                     .offset(x: 5, y: -5)
+                    .accessibilityLabel("Remove attached image")
+                    .accessibilityIdentifier("composer-remove-attachment-\(att.id)")
                 }
             }
         }

@@ -712,7 +712,7 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
             _ => None,
         })
         .expect("Agent spawn tool call in the parent feed");
-    // The synthesized opening user message rides WITH the spawn (before the
+    // The opening user message comes from the spawn's task_started (before the
     // eager done); the child's own interior streams between the two dones.
     let opening: Vec<usize> = events
         .iter()
@@ -727,7 +727,7 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
             .then_some(i)
         })
         .collect();
-    assert_eq!(opening.len(), 1, "one seeded opening prompt: {events:?}");
+    assert_eq!(opening.len(), 1, "one opening prompt: {events:?}");
     assert!(opening[0] < dones[0], "opening rides with the spawn");
     let tagged: Vec<usize> = events
         .iter()
@@ -966,5 +966,96 @@ async fn claude_skills_follow_native_availability_and_dollar_selection_keeps_arg
     assert_eq!(
         harness_prompt(&format!("{} 123", invocation.link()), HarnessId::ClaudeCode),
         "/review 123"
+    );
+}
+
+/// Replay a verbatim CLI capture through the fake-CLI transport (wire parse →
+/// normalize → run loop) and return every event the driver emits.
+async fn replay_capture(name: &str) -> Vec<AgentEvent> {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("claude")
+        .join(name);
+    let dir = std::env::temp_dir().join(format!(
+        "claude-replay-{}-{}",
+        std::process::id(),
+        name.replace('.', "-")
+    ));
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    let frames = dir.join("frames.jsonl");
+    std::fs::copy(&fixture, &frames).expect("frames copied");
+    let cli = dir.join("replay.sh");
+    std::fs::write(
+        &cli,
+        format!(
+            "#!/bin/sh\nread -r _first || exit 1\ncat '{}'\n",
+            frames.display()
+        ),
+    )
+    .expect("replayer written");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let harness = ClaudeHarness::new().with_executable(&cli);
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness, request("replay"), controls).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    events
+}
+
+/// #517: the engine keeps a parked session alive while the CLI reports work
+/// still running, so that report has to be complete and balanced on the real
+/// wire. Every task the captures start settles (nothing can hold a session
+/// forever), nothing settles that never started, and the background agent's
+/// task is open across the turn's end, which is exactly when the idle reaper
+/// used to stop the CLI under it.
+#[tokio::test]
+async fn captured_background_tasks_start_and_settle_in_balance() {
+    for capture in [
+        "live-2.1.228-background-subagent.jsonl",
+        "live-2.1.285-workflow.jsonl",
+    ] {
+        let events = replay_capture(capture).await;
+        let mut open: Vec<String> = Vec::new();
+        let mut started = 0;
+        for event in &events {
+            if let AgentEvent::BackgroundTask { id, running } = event {
+                if *running {
+                    started += 1;
+                    open.push(id.clone());
+                } else {
+                    let at = open.iter().position(|o| o == id);
+                    assert!(at.is_some(), "{capture}: {id} settled without starting");
+                    open.remove(at.unwrap());
+                }
+            }
+        }
+        assert!(started > 0, "{capture}: the capture's tasks are reported");
+        assert!(open.is_empty(), "{capture}: tasks never settled: {open:?}");
+    }
+
+    // The background agent's task starts before the turn's first Done (the
+    // park) and settles after it.
+    let events = replay_capture("live-2.1.228-background-subagent.jsonl").await;
+    let first_done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("the turn ends");
+    let spans_park = events.iter().enumerate().any(|(start, e)| {
+        let AgentEvent::BackgroundTask { id, running: true } = e else {
+            return false;
+        };
+        start < first_done
+            && events.iter().enumerate().any(|(end, e)| {
+                end > first_done
+                    && matches!(e, AgentEvent::BackgroundTask { id: settled, running: false } if settled == id)
+            })
+    });
+    assert!(
+        spans_park,
+        "a background task is open across the park: {events:?}"
     );
 }

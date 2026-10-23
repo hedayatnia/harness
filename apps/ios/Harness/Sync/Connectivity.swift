@@ -21,16 +21,44 @@ enum ConnectivityState: Equatable {
 }
 
 /// A pending send's user-visible truth (state.rs send_pending/send_queued/
-/// send_undelivered). `failed` wins over `queued` in the UI.
+/// send_undelivered).
 enum SendState {
     case sending
     case queued
+    /// Unadopted past the grace, but its command is still pending in the doc
+    /// and can run whenever the host picks it up (#413). Not a failure.
+    case waiting
+    /// No command for the send can run any more: the host rejected or
+    /// expired it, or it outlived its TTL. Retry re-issues it.
     case failed
+
+    /// `failed` needs the doc's word that the send can't run; the grace
+    /// alone only turns Sending into Waiting. A degraded path reads Queued.
+    static func of(oldestStarted: Int64, undeliverable: Bool, degraded: Bool,
+                   now: Int64) -> SendState {
+        if undeliverable { return .failed }
+        if degraded { return .queued }
+        if now - oldestStarted > undeliveredGraceMs { return .waiting }
+        return .sending
+    }
 }
 
-/// state.rs UNDELIVERED_GRACE_MS: a send unadopted past this is explicitly
-/// Failed (with a retry affordance), never a silent forever-spinner.
+/// state.rs UNDELIVERED_GRACE_MS: a send unadopted past this stops reading
+/// "Sending…" and says it is waiting for the host, never a forever-spinner.
 let undeliveredGraceMs: Int64 = 120_000
+
+/// transcript.rs TURN_WAIT_SHOWN_SECS / turn_wait_secs: how long the running
+/// turn's prompt waited before the turn began, when it is worth showing. The
+/// timer counts the run only; nil unless the last user entry started the turn.
+let turnWaitShownSecs: Int64 = 60
+
+func turnWaitSecs(entries: [MessageEntry], turnStartedAt: Int64?) -> Int64? {
+    guard let started = turnStartedAt,
+          let prompt = entries.lastIndex(where: { $0.role == .user }) else { return nil }
+    if entries[(prompt + 1)...].contains(where: { $0.createdAt < started }) { return nil }
+    let waited = (started - entries[prompt].createdAt) / 1000
+    return waited >= turnWaitShownSecs ? waited : nil
+}
 
 @MainActor
 @Observable

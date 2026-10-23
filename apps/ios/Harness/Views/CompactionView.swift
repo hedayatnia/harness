@@ -146,7 +146,7 @@ struct CompactionView: View {
             if case RelayError.rpc(let message) = error, message.contains("unknown method") {
                 return .failed("Update Harness on \(name) to change this from your phone.")
             }
-            let reason = (error as? RelayError)?.errorDescription ?? describeTransportError(error)
+            let reason = describeUserFacingError(error)
             return .failed("Couldn't reach \(name): \(reason)")
         }
     }

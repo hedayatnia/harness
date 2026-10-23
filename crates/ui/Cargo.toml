@@ -42,6 +42,10 @@ name = "reauth-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "error-cards-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "question-wrap-fixture"
 required-features = ["appshots-fixture"]
 
@@ -51,6 +55,10 @@ required-features = ["appshots-fixture"]
 
 [[example]]
 name = "readme-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "markdown-math-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]

@@ -16,22 +16,17 @@ final class HomeFilterTests: XCTestCase {
         chat("d", title: "New session", device: "studio"),
     ]
 
-    private let indicators: [String: ChatIndicator] = [
-        "a": .working, "b": .awaitingInput, "c": .completed, "d": .idle,
-    ]
-
     private let projects = ["harness": "Harness", "site": "Website"]
     private let devices = ["studio": "Mac Studio", "laptop": "MacBook"]
 
-    private func apply(_ query: String, _ status: HomeStatusFilter = .all) -> [String] {
-        HomeFilter.apply(chats, query: query, status: status,
-                         indicator: { self.indicators[$0.id] ?? .idle }) { chat in
+    private func apply(_ query: String) -> [String] {
+        HomeFilter.apply(chats, query: query) { chat in
             HomeFilter.Names(project: chat.spaceId.flatMap { self.projects[$0] },
                              device: self.devices[chat.deviceId] ?? chat.deviceId)
         }.map(\.id)
     }
 
-    func testEmptyQueryAndAllKeepsEverythingInOrder() {
+    func testEmptyQueryKeepsEverythingInOrder() {
         XCTAssertEqual(apply(""), ["a", "b", "c", "d"])
         XCTAssertEqual(apply("   "), ["a", "b", "c", "d"])
     }
@@ -52,11 +47,5 @@ final class HomeFilterTests: XCTestCase {
     func testEveryWordMustMatch() {
         XCTAssertEqual(apply("harness macbook"), ["c"])
         XCTAssertEqual(apply("harness website"), [])
-    }
-
-    func testStatusFilters() {
-        XCTAssertEqual(apply("", .running), ["a"])
-        XCTAssertEqual(apply("", .attention), ["b", "c"])
-        XCTAssertEqual(apply("harness", .attention), ["c"])
     }
 }

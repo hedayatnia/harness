@@ -1,9 +1,9 @@
 // chat2 wire frames — the Swift twin of crates/sync/src/chat_frames.rs and
 // edge/src/chat-frames.ts. Binary WS frames:
 // `[type u8][headerLen u32 LE][header JSON][payload]`. Headers are tiny JSON;
-// payloads are opaque bytes (Loro updates, the checkpoint frontier). The
-// layout tests in HarnessTests pin the same vectors as the Rust/TS suites —
-// change all three together.
+// payloads are opaque bytes (Loro updates, the checkpoint frontier).
+// `protocol/chat2-vectors.json` pins the codec, the catch-up plan and the row
+// cursor for every implementation (Chat2VectorTests runs it here).
 
 import Foundation
 
@@ -112,4 +112,13 @@ func chatPlanCatchUp(cursor: UInt64, state: ChatStateHeader,
         return .rowsOnly(after: max(cursor, state.checkpointSeq))
     }
     return .checkpointThenRows(after: state.checkpointSeq)
+}
+
+/// The contiguity rule for a ROW at `seq` (chat_client.rs `next_row_cursor`):
+/// the cursor claims every row up to it is in the doc, so it only walks.
+/// `nil` is a gap: the bytes are still imported, but the cursor holds and a
+/// backfill repair is due. Pinned for every client by
+/// `protocol/chat2-vectors.json`.
+func chatNextRowCursor(cursor: UInt64, seq: UInt64) -> UInt64? {
+    seq <= cursor || seq - cursor == 1 ? max(cursor, seq) : nil
 }

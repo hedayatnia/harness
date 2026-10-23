@@ -73,6 +73,7 @@ fn chat(project: Option<&str>) -> Chat {
         space_id: project.map(str::to_owned),
         last_seen_at: None,
         room_gen: None,
+        source_context_unavailable_at: None,
     }
 }
 
@@ -299,18 +300,18 @@ fn selecting_text_in_an_unfocused_pane_keeps_the_selection(cx: &mut TestAppConte
             let focus = shell.chat_split.as_ref().unwrap().focus;
             let other = 1 - focus;
 
-            // A drag in the unfocused pane selected some text: releasing it
-            // must not focus (and so rebuild) that pane.
+            // Selecting text must activate the peer without rebuilding its
+            // transcript or losing the selected range.
             crate::markdown::selection::begin_with_span("peer-row:0", "copy me", 0..4);
-            shell.release_on_peer_pane(other, window, cx);
-            assert_eq!(shell.chat_split.as_ref().unwrap().focus, focus, "a text drag must not move focus");
+            shell.select_chat_pane(other, cx);
+            assert_eq!(shell.chat_split.as_ref().unwrap().focus, other, "selection activates the pane");
             assert_eq!(crate::markdown::selection::selected_text().as_deref(), Some("copy"));
             crate::markdown::selection::end_active_drag();
             crate::markdown::selection::clear_if_owner("peer-row:0");
 
-            // A plain click (nothing selected) still focuses the pane.
-            shell.release_on_peer_pane(other, window, cx);
-            assert_eq!(shell.chat_split.as_ref().unwrap().focus, other, "a click focuses the pane");
+            // A plain click (nothing selected) can still return to the other pane.
+            shell.select_chat_pane(focus, cx);
+            assert_eq!(shell.chat_split.as_ref().unwrap().focus, focus, "a click focuses the pane");
         })
         .unwrap();
 }

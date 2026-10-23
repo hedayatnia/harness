@@ -11,7 +11,6 @@ import harness.codegraff.android.perf.PerfSpan
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,7 +29,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -59,7 +57,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -74,7 +71,6 @@ import harness.codegraff.android.model.HomeFilter
 import harness.codegraff.android.model.HomeGroup
 import harness.codegraff.android.model.HomeGroupBy
 import harness.codegraff.android.model.HomeGrouping
-import harness.codegraff.android.model.HomeStatusFilter
 import harness.codegraff.android.model.NewSessionDestination
 import harness.codegraff.android.model.relativeTime
 import harness.codegraff.android.theme.opacity
@@ -115,23 +111,20 @@ fun HomeScreen(
     val spaceFilter = rememberPref("homeSpaceFilter", "")
     val groupByPref = rememberPref("homeGroupBy", HomeGroupBy.None.name.lowercase())
     val collapsedPref = rememberPref("homeCollapsedGroups", "")
-    // Not persisted: a filter left on across launches reads as lost sessions.
     var searchText by rememberSaveable { mutableStateOf("") }
-    var statusFilter by rememberSaveable { mutableStateOf(HomeStatusFilter.All) }
 
     val selectedSpace = state.spaces.firstOrNull { it.id == spaceFilter.value }
     val grouping = HomeGroupBy.fromKey(groupByPref.value)
     val collapsedGroups = collapsedPref.value.split(',').filter { it.isNotEmpty() }.toSet()
-    // Filtering, grouping and counting are the list's real work: redo it only when an input changes,
-    // not on every recomposition (typing in search, a dropdown opening, a chip animating).
+    // Filtering and grouping are the list's real work: redo it only when an input changes,
+    // not on every recomposition (typing in search or a dropdown opening).
     val scoped = remember(state, selectedSpace) { selectedSpace?.let { state.chatsIn(it.id) } ?: state.overviewChats }
-    val chats = remember(state, scoped, searchText, statusFilter) {
-        HomeFilter.apply(scoped, searchText, statusFilter, state::indicator, state::filterNames)
+    val chats = remember(state, scoped, searchText) {
+        HomeFilter.apply(scoped, searchText, state::filterNames)
     }
     val groups = remember(chats, grouping, state.pinnedSessionIds) {
         Perf.measure(PerfSpan.HomeGroup) { HomeGrouping.groups(chats, grouping, state.pinnedSessionIds.toSet()) }
     }
-    val counts = remember(state, scoped) { statusCounts(state, scoped) }
     val archived = remember(state, selectedSpace, searchText) { state.archivedMatches(selectedSpace?.id, searchText) }
     val topInset = statusBarHeight()
 
@@ -145,20 +138,14 @@ fun HomeScreen(
             ),
         ) {
             if (scoped.isNotEmpty()) {
-                item(key = "filters") {
-                    Row(
-                        // Chips draw 28dp inside 44dp touch targets, so the row needs less padding to keep its rhythm.
-                        Modifier.padding(start = 16.dp, end = 16.dp, top = 0.dp, bottom = 0.dp).horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        HomeStatusChips(statusFilter, counts) { statusFilter = it }
+                item(key = "grouping") {
+                    Box(Modifier.padding(horizontal = 16.dp)) {
                         GroupPill(grouping) { groupByPref.set(it.name.lowercase()) }
                     }
                 }
             }
             if (chats.isEmpty()) {
-                val archivedHit = statusFilter == HomeStatusFilter.All && searchText.isNotEmpty() && archived.isNotEmpty()
+                val archivedHit = searchText.isNotEmpty() && archived.isNotEmpty()
                 if (!archivedHit) {
                     item(key = "empty") {
                         val readiness = state.agentReadiness
@@ -197,8 +184,8 @@ fun HomeScreen(
                 }
             }
             // The desktop's archived shelf sits under the active list, scoped by the same space
-            // filter and search. Archived sessions are never running or waiting, so a status filter hides it.
-            if (statusFilter == HomeStatusFilter.All && archived.isNotEmpty()) {
+            // filter and search.
+            if (archived.isNotEmpty()) {
                 archivedShelf(archived, state, model, selectedChatId, onOpen)
             }
         }
@@ -238,15 +225,6 @@ fun HomeScreen(
             SearchField(searchText, { searchText = it }, Modifier.padding(horizontal = 16.dp))
         }
     }
-}
-
-private fun statusCounts(state: WorkspaceState, chats: List<Chat>): Map<HomeStatusFilter, Int> {
-    val counts = HashMap<HomeStatusFilter, Int>()
-    for (chat in chats) {
-        val indicator = state.indicator(chat)
-        for (filter in HomeStatusFilter.entries) if (filter.matches(indicator)) counts[filter] = (counts[filter] ?: 0) + 1
-    }
-    return counts
 }
 
 // MARK: bar controls
@@ -381,46 +359,9 @@ private fun SearchField(text: String, onChange: (String) -> Unit, modifier: Modi
     }
 }
 
-// MARK: chips
+// MARK: grouping
 
-/** All · Needs you · Running, with live counts. Sits above the list. */
-@Composable
-private fun HomeStatusChips(selection: HomeStatusFilter, counts: Map<HomeStatusFilter, Int>, onSelect: (HomeStatusFilter) -> Unit) {
-    val p = Theme.palette
-    HomeStatusFilter.entries.forEach { filter ->
-        val selected = selection == filter
-        val count = counts[filter] ?: 0
-        // The chip is drawn 28dp tall but the touch target is the full 44dp row.
-        Box(
-            Modifier.heightIn(min = 44.dp)
-                // Tapping the active chip again clears it.
-                .clickable(interactionSource = null, indication = null, role = Role.Tab) {
-                    onSelect(if (selected && filter != HomeStatusFilter.All) HomeStatusFilter.All else filter)
-                }
-                .semantics { this.selected = selected },
-            contentAlignment = Alignment.Center,
-        ) {
-            Row(
-                Modifier.height(28.dp)
-                    .background(if (selected) p.elementActive else Color.Transparent, CircleShape)
-                    .border(1.dp, if (selected) Color.Transparent else p.border, CircleShape)
-                    .padding(horizontal = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-            ) {
-                if (filter != HomeStatusFilter.All) {
-                    Box(Modifier.size(6.dp).background(if (filter == HomeStatusFilter.Running) p.statusWorking else p.warning, CircleShape))
-                }
-                Text(filter.label, style = sans(13f, if (selected) FontWeight.SemiBold else FontWeight.Medium), color = if (selected) p.text else p.textMuted)
-                if (filter != HomeStatusFilter.All && count > 0) {
-                    Text("$count", style = sans(12f, FontWeight.Medium), color = if (selected) p.text else p.textFaint)
-                }
-            }
-        }
-    }
-}
-
-/** Grouping sits on the filter row as a labeled pill: one tap opens the choices, one tap picks. */
+/** Grouping sits above the list as a labeled pill: one tap opens the choices, one tap picks. */
 @Composable
 private fun GroupPill(grouping: HomeGroupBy, onSelect: (HomeGroupBy) -> Unit) {
     val p = Theme.palette

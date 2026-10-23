@@ -135,6 +135,129 @@ pub struct LinkUi {
     pub handler: Rc<dyn Fn(&LinkActivation, &mut Window, &mut gpui::App) -> LinkOutcome>,
 }
 
+/// Verbatim text whose bare `http(s)://` URLs are links, with the transcript's
+/// usual activation, validation and Open/Copy menu — for surfaces that are
+/// not Markdown, such as expanded tool output (#348). `None` without a URL.
+pub fn autolinked_text(
+    id: SharedString,
+    text: SharedString,
+    ui: Option<LinkUi>,
+    theme: &Theme,
+) -> Option<AnyElement> {
+    let ranges = super::parser::bare_url_ranges(&text);
+    if ranges.is_empty() {
+        return None;
+    }
+    // Monochrome like Markdown links: the text color with an underline.
+    let underline = gpui::HighlightStyle {
+        underline: Some(UnderlineStyle {
+            color: Some(theme.text_muted),
+            thickness: px(1.0),
+            wavy: false,
+        }),
+        ..Default::default()
+    };
+    let styled = StyledText::new(text.clone())
+        .with_highlights(ranges.iter().map(|range| (range.clone(), underline)));
+    let layout = styled.layout().clone();
+    let links = ranges
+        .into_iter()
+        .map(|range| {
+            let url = &text[range.clone()];
+            (range, LinkTarget::new(url, url))
+        })
+        .collect();
+    Some(
+        super::link_interaction::LinkRanges {
+            id,
+            child: styled.into_any_element(),
+            layout,
+            selection_key: None,
+            links,
+            ui,
+        }
+        .into_any_element(),
+    )
+}
+
+/// Verbatim text in `color` that joins the transcript's text selection under
+/// `key` (drag-select across lines, Cmd+C), with bare `http(s)://` URLs as
+/// links like [`autolinked_text`]. A click on a link only activates it when
+/// this text holds no selection, so selecting across a URL never navigates.
+pub(crate) fn selectable_autolinked_text(
+    key: std::sync::Arc<str>,
+    text: SharedString,
+    font: gpui::Font,
+    color: Hsla,
+    ui: Option<LinkUi>,
+    theme: &Theme,
+) -> AnyElement {
+    let ranges = super::parser::bare_url_ranges(&text);
+    let run = |len: usize, link: bool| TextRun {
+        len,
+        font: font.clone(),
+        color,
+        background_color: None,
+        // Monochrome like Markdown links: the text color with an underline.
+        underline: link.then_some(UnderlineStyle {
+            color: Some(theme.text_muted),
+            thickness: px(1.0),
+            wavy: false,
+        }),
+        strikethrough: None,
+    };
+    let mut runs = Vec::with_capacity(ranges.len() * 2 + 1);
+    let mut at = 0;
+    for range in &ranges {
+        if range.start > at {
+            runs.push(run(range.start - at, false));
+        }
+        runs.push(run(range.len(), true));
+        at = range.end;
+    }
+    if at < text.len() || runs.is_empty() {
+        runs.push(run(text.len() - at, false));
+    }
+    let styled = StyledText::new(text.clone()).with_runs(runs);
+    let layout = styled.layout().clone();
+    let wash = selection_wash(theme);
+    let paint_key = key.clone();
+    let paint_text = text.clone();
+    let paint_layout = layout.clone();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            paint_text_selection_with_wash(window, &paint_key, &paint_text, &paint_layout, wash);
+        },
+    )
+    .absolute()
+    .size_full();
+    let child = div()
+        .relative()
+        .child(underlay)
+        .child(styled)
+        .into_any_element();
+    if ranges.is_empty() {
+        return child;
+    }
+    let links = ranges
+        .into_iter()
+        .map(|range| {
+            let url = &text[range.clone()];
+            (range, LinkTarget::new(url, url))
+        })
+        .collect();
+    super::link_interaction::LinkRanges {
+        id: SharedString::from(key.to_string()),
+        child,
+        layout,
+        selection_key: Some(key),
+        links,
+        ui,
+    }
+    .into_any_element()
+}
+
 pub fn activate_link(
     target: LinkTarget,
     action: LinkAction,
@@ -1123,6 +1246,7 @@ pub(super) fn flat_text_presented_element(
     // same paint pass re-registers the frame-scoped window mouse listeners
     // that drive text selection (round 18; see markdown/selection.rs).
     let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
+    let link_selection_key = sel_key.clone();
     let code_ranges = flat.code_ranges.clone();
     let flat_text = flat
         .original
@@ -1201,6 +1325,7 @@ pub(super) fn flat_text_presented_element(
         .into(),
         child,
         layout: link_layout,
+        selection_key: Some(link_selection_key),
         links: flat
             .links
             .iter()
@@ -1275,7 +1400,7 @@ fn paint_text_selection_with_wash(
     register_selection_listeners(window, key, text, layout, None);
 }
 
-fn selectable_text_element(
+pub(crate) fn selectable_text_element(
     key: std::sync::Arc<str>,
     text: SharedString,
     runs: Vec<TextRun>,
@@ -1345,7 +1470,7 @@ pub(crate) fn selection_test_bounds(key: &str) -> gpui::Bounds<gpui::Pixels> {
 }
 
 #[cfg(test)]
-pub(super) fn selection_test_snapshot(
+pub(crate) fn selection_test_snapshot(
     key: &str,
 ) -> (
     SharedString,
@@ -1494,6 +1619,48 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
             ei,
             reg[ei].offsets.as_ref().map_or(ix, |map| map.original(ix)),
         ))
+    })
+}
+
+/// Claim a drag from horizontal whitespace in one transcript's text bands.
+/// The transcript handles this after direct text/control listeners, so gutters
+/// are forgiving without expanding glyph hit targets into neighbouring panes
+/// or turning the blank area below an answer into selectable text.
+pub(crate) fn begin_drag_in_whitespace(owner: u64, position: gpui::Point<gpui::Pixels>) -> bool {
+    REGISTRY.with(|r| {
+        let reg = r.borrow();
+        let nearest = reg
+            .iter()
+            .filter_map(|entry| {
+                let bounds = entry.layout.bounds();
+                if entry.owner != owner
+                    || !selection_scope(&entry.key).is_empty()
+                    || position.y < bounds.top()
+                    || position.y >= bounds.bottom()
+                {
+                    return None;
+                }
+                let distance = if position.x < bounds.left() {
+                    bounds.left() - position.x
+                } else if position.x > bounds.right() {
+                    position.x - bounds.right()
+                } else {
+                    return None;
+                };
+                Some((entry, distance))
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let Some((entry, _)) = nearest else {
+            return false;
+        };
+        // Preserve the layout's visual-line boundary, including soft wraps;
+        // whitespace after a line is its END, not its final character.
+        let ix = match entry.layout.index_for_position(position) {
+            Ok(ix) | Err(ix) => ix,
+        };
+        let ix = entry.offsets.as_ref().map_or(ix, |map| map.original(ix));
+        super::selection::begin(&entry.key, ix);
+        true
     })
 }
 

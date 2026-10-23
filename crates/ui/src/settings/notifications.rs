@@ -191,9 +191,15 @@ impl Render for NotificationsPage {
                                 &theme,
                                 vec![
                                     div()
-                                        .child(SharedString::from(
-                                            "Allow sounds for the selected session events below.",
-                                        ))
+                                        // macOS: background chimes ride on
+                                        // their banner (sound::plan_alert).
+                                        .child(SharedString::from(if cfg!(target_os = "macos") {
+                                            "Allow sounds for the selected session events below. \
+                                             With desktop notifications on, sounds in the \
+                                             background follow Focus."
+                                        } else {
+                                            "Allow sounds for the selected session events below."
+                                        }))
                                         .into_any_element(),
                                 ],
                             )),

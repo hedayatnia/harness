@@ -722,6 +722,8 @@ pub struct AppState {
     pub chats_synced: bool,
     pub spaces_synced: bool,
     pending_deep_link: Option<crate::links::ConversationDeepLink>,
+    /// Validated conversation link; the shell owns tab-preserving navigation.
+    pending_linked_chat: Option<String>,
     deep_link_notice: Option<String>,
     /// The selected chat when a chats frame arrived without it. A later frame
     /// that lists it again re-selects it, unless something else was picked.
@@ -735,6 +737,10 @@ pub struct AppState {
     /// agent was busy, in the order it will be sent. Device-agnostic: the
     /// chat's doc holds them (every device sees the same queue).
     pub queue: Vec<harness_doc::QueuedMessage>,
+    /// The selected chat's prompts sent as Run commands that its host hasn't
+    /// turned into messages yet (sent from a phone, waiting for the host or
+    /// for attachments). Shown as pending user rows, never as delivered.
+    pub(crate) remote_pending: Vec<RemotePendingPrompt>,
     /// The selected chat's running tools' live output (graff subagent logs),
     /// straight from its host. Live-only: never in the transcript's doc.
     pub tool_progress: Vec<harness_proto::ToolProgressItem>,
@@ -793,6 +799,8 @@ pub struct AppState {
     /// the engine LRU — closing a tab MUST go through
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
+    /// The account's Codegraff cloud sandboxes ([`cloud_sandboxes`]).
+    cloud_sandboxes: cloud_sandboxes::CloudSandboxesState,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -803,6 +811,11 @@ pub(crate) struct TranscriptTextChanged {
 }
 
 impl gpui::EventEmitter<TranscriptTextChanged> for AppState {}
+
+#[cfg(test)]
+mod deep_link_tests;
+
+pub mod cloud_sandboxes;
 
 fn is_text_append(frame: &TranscriptFrame) -> bool {
     matches!(frame, TranscriptFrame::Delta { upsert, append, remove, .. }
@@ -840,6 +853,7 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             queue: Vec::new(),
+            remote_pending: Vec::new(),
             tool_progress: Vec::new(),
             context_usage: None,
             transcript_replayed: false,
@@ -866,10 +880,12 @@ impl AppState {
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
+            cloud_sandboxes: Default::default(),
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
             pending_deep_link: None,
+            pending_linked_chat: None,
             deep_link_notice: None,
             vanished_selection: None,
             pending_open_folder: None,
@@ -1068,6 +1084,7 @@ impl AppState {
             self.transcript_replayed = false;
             self.transcript_task = None;
             self.queue.clear();
+            self.remote_pending.clear();
             self.queue_task = None;
             self.tool_progress.clear();
             self.tool_progress_task = None;
@@ -1763,6 +1780,32 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// The selected chat's name while it is untitled and another device's
+    /// prompt is waiting to start: that prompt's first words, as the host's
+    /// own title fallback would read, instead of "New session" (#415).
+    pub(crate) fn provisional_title(&self) -> Option<(String, String)> {
+        let chat_id = self.selected_chat.as_deref()?;
+        if self.chats.iter().find(|c| c.id == chat_id)?.title.is_some() {
+            return None;
+        }
+        let prompt = self.remote_pending_prompts().next()?;
+        let text = prompt.entry.parts.iter().find_map(|p| match p {
+            harness_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })?;
+        provisional_title_from(text).map(|title| (chat_id.to_string(), title))
+    }
+
+    /// Prompts the host hasn't started, not already shown as a message or as
+    /// this device's own echo (#415).
+    pub(crate) fn remote_pending_prompts(&self) -> impl Iterator<Item = &RemotePendingPrompt> {
+        let echoes = self.pending_echoes();
+        self.remote_pending.iter().filter(move |p| {
+            !self.transcript.iter().rev().any(|e| e.id == p.entry.id)
+                && !echoes.iter().any(|e| e.id == p.entry.id)
+        })
+    }
+
     // ---- queries ----
 
     /// Non-archived, top-level chats in sidebar order. Chats spawned by
@@ -1979,6 +2022,14 @@ impl AppState {
             .change_request_for_chat(chat, &self.spaces)
     }
 
+    /// Whether a chat's branch PR is the chat's own or found from a shared branch (#357).
+    pub(crate) fn change_request_provenance(
+        &self,
+        chat: &Chat,
+    ) -> crate::change_requests::ChangeRequestProvenance {
+        crate::change_requests::change_request_provenance(chat, &self.chats, &self.spaces)
+    }
+
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
@@ -2033,6 +2084,7 @@ impl AppState {
         self.transfers.clear();
         self.local_device_id = None;
         self.update = None;
+        self.reset_cloud_sandboxes();
         cx.notify();
     }
 
@@ -2168,6 +2220,8 @@ impl AppState {
                 self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
             }
         }
+        // A cloud sandbox left running keeps costing credit: show it from the start.
+        self.refresh_cloud_sandboxes(cx);
         cx.notify();
     }
 
@@ -2248,11 +2302,16 @@ impl AppState {
         }
         if self.chats.iter().any(|chat| chat.id == link.chat_id) {
             self.pending_deep_link = None;
-            self.select_chat(Some(link.chat_id), cx);
+            self.pending_linked_chat = Some(link.chat_id);
+            cx.notify();
         } else if self.chats_synced {
             self.pending_deep_link = None;
             self.deep_link_notice = Some("The linked conversation was not found".into());
         }
+    }
+
+    pub(crate) fn take_linked_chat(&mut self) -> Option<String> {
+        self.pending_linked_chat.take()
     }
 
     /// Re-select a chat that dropped out of an earlier chats frame once a
@@ -2272,6 +2331,52 @@ impl AppState {
         self.deep_link_notice.take()
     }
 
+    /// Switch visible split panes without blanking either live transcript while
+    /// its replacement watch replays. The peer snapshot is newer than a warm
+    /// navigation-cache entry; keep both panes' prepared rows and baselines.
+    pub(crate) fn select_split_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
+        let incoming = chat_id.as_ref().and_then(|id| {
+            self.sub_transcripts.remove(id).map(|entries| {
+                (
+                    entries,
+                    self.prepared_transcripts.get(id).cloned(),
+                    self.transcript_baselines.get(id).cloned(),
+                )
+            })
+        });
+        let outgoing = self
+            .selected_chat
+            .clone()
+            .filter(|_| self.transcript_replayed)
+            .map(|id| {
+                let entries = self.transcript.clone();
+                let prepared = self.prepared_transcripts.get(&id).cloned();
+                let baseline = self.transcript_baselines.get(&id).cloned();
+                (id, entries, prepared, baseline)
+            });
+        self.select_chat(chat_id.clone(), cx);
+        if let Some((entries, prepared, baseline)) = incoming {
+            let id = chat_id.as_ref().expect("peer snapshot has a chat");
+            self.transcript = entries;
+            self.transcript_replayed = true;
+            if let Some(prepared) = prepared {
+                self.prepared_transcripts.insert(id.clone(), prepared);
+            }
+            if let Some(baseline) = baseline {
+                self.transcript_baselines.insert(id.clone(), baseline);
+            }
+        }
+        if let Some((id, entries, prepared, baseline)) = outgoing {
+            self.sub_transcripts.insert(id.clone(), entries);
+            if let Some(prepared) = prepared {
+                self.prepared_transcripts.insert(id.clone(), prepared);
+            }
+            if let Some(baseline) = baseline {
+                self.transcript_baselines.insert(id, baseline);
+            }
+        }
+    }
+
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
     /// dropping the old task drops its stream receiver, which cancels the doc
     /// watch server-side. Selecting a chat also lands in its space and marks it
@@ -2283,6 +2388,8 @@ impl AppState {
             self.focus_chat_sync(id, cx);
         }
         if self.selected_chat == chat_id {
+            // An explicit pick of the already-blank boot canvas is intent too.
+            self.auto_selected = true;
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
                 self.mark_chat_seen(&id, cx);
@@ -2382,6 +2489,7 @@ impl AppState {
         }
         self.transcript_task = None;
         self.queue.clear();
+        self.remote_pending.clear();
         self.queue_task = None;
         self.tool_progress.clear();
         self.tool_progress_task = None;
@@ -2894,6 +3002,80 @@ fn spawn_transcript_watch(
     })
 }
 
+/// The first line of a prompt, cut at a word near 48 characters.
+pub(crate) fn provisional_title_from(prompt: &str) -> Option<String> {
+    const MAX: usize = 48;
+    let line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if line.chars().count() <= MAX {
+        return Some(line.to_string());
+    }
+    let cut: String = line.chars().take(MAX).collect();
+    let cut = match cut.rfind(' ') {
+        Some(space) if space > MAX / 2 => &cut[..space],
+        _ => cut.as_str(),
+    };
+    Some(format!("{}…", cut.trim_end()))
+}
+
+/// A chat's sidebar or tab label: its title, else the provisional one, else
+/// `fallback`.
+pub(crate) fn chat_label(
+    chat: &Chat,
+    provisional: &Option<(String, String)>,
+    fallback: &str,
+) -> String {
+    chat.title
+        .clone()
+        .or_else(|| {
+            provisional
+                .as_ref()
+                .filter(|(id, _)| *id == chat.id)
+                .map(|(_, title)| title.clone())
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// One `pendingPrompts` row of a queue frame (the engine's `PendingPrompt`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingPromptFrame {
+    message_id: String,
+    text: String,
+    issued_at: i64,
+    #[serde(default)]
+    issued_by: String,
+    #[serde(default)]
+    waiting_for_attachments: bool,
+}
+
+/// A prompt waiting to start, as the user row it will become.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RemotePendingPrompt {
+    pub entry: SessionMessageEntry,
+    pub waiting_for_attachments: bool,
+}
+
+impl From<PendingPromptFrame> for RemotePendingPrompt {
+    fn from(p: PendingPromptFrame) -> Self {
+        Self {
+            entry: SessionMessageEntry {
+                id: p.message_id,
+                role: harness_doc::MessageRole::User,
+                parts: vec![harness_doc::MessagePart::Text {
+                    id: "t0".into(),
+                    text: p.text,
+                }],
+                created_at: p.issued_at,
+                device_id: p.issued_by,
+                status: Some(harness_doc::MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            },
+            waiting_for_attachments: p.waiting_for_attachments,
+        }
+    }
+}
+
 /// The selected chat's pending-message queue, straight off its doc. Whole-list
 /// frames (the queue is a handful of rows at most), retried like the transcript
 /// watch — a queue that silently stopped updating would show messages the host
@@ -2904,9 +3086,12 @@ fn spawn_queue_watch(
     chat_id: String,
 ) -> Task<()> {
     #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct QueueFrame {
         #[serde(default)]
         items: Vec<harness_doc::QueuedMessage>,
+        #[serde(default)]
+        pending_prompts: Vec<PendingPromptFrame>,
     }
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
@@ -2939,6 +3124,11 @@ fn spawn_queue_watch(
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
                         state.queue = frame.items;
+                        state.remote_pending = frame
+                            .pending_prompts
+                            .into_iter()
+                            .map(RemotePendingPrompt::from)
+                            .collect();
                         cx.notify();
                     }
                 });
@@ -3107,6 +3297,57 @@ mod tests {
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `harness_proto::view`.
     use harness_proto::{SessionStatus, UserProfile};
+
+    #[test]
+    fn another_devices_pending_prompt_shows_until_its_message_lands() {
+        let frame: PendingPromptFrame = serde_json::from_value(serde_json::json!({
+            "messageId": "m1",
+            "text": "look at this",
+            "issuedAt": 1_000,
+            "issuedBy": "phone",
+            "waitingForAttachments": true,
+        }))
+        .unwrap();
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        state.remote_pending = vec![RemotePendingPrompt::from(frame)];
+        let shown = |state: &AppState| {
+            state
+                .remote_pending_prompts()
+                .map(|p| (p.entry.id.clone(), p.waiting_for_attachments))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&state), vec![("m1".to_string(), true)]);
+        assert_eq!(
+            state.remote_pending[0].entry.role,
+            harness_doc::MessageRole::User
+        );
+        // Untitled, the chat reads as the prompt instead of "New session".
+        state.chats.push(chat("c", 0, None));
+        assert_eq!(
+            state.provisional_title(),
+            Some(("c".into(), "look at this".into()))
+        );
+        // The host writes the message under the same id: the transcript has it.
+        let landed = state.remote_pending[0].entry.clone();
+        state.transcript.push(landed);
+        assert!(shown(&state).is_empty());
+        assert_eq!(state.provisional_title(), None);
+    }
+
+    #[test]
+    fn provisional_titles_take_the_first_line_and_cut_at_a_word() {
+        assert_eq!(
+            provisional_title_from("\n  fix the login page \nmore"),
+            Some("fix the login page".into())
+        );
+        assert_eq!(provisional_title_from("   "), None);
+        let long = "compare three rollout plans and adjust the expected traffic for each region";
+        assert_eq!(
+            provisional_title_from(long),
+            Some("compare three rollout plans and adjust the…".into())
+        );
+    }
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
@@ -3646,6 +3887,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
         }
     }
 
@@ -3673,6 +3915,7 @@ mod tests {
     ) -> Session {
         Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: chat_id.into(),
             device_id: "dev".into(),
             status,
@@ -3953,6 +4196,7 @@ mod tests {
         let now = Utc::now();
         let mut row = Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,
@@ -3984,6 +4228,7 @@ mod tests {
         let now = Utc::now();
         state.sessions = vec![Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,

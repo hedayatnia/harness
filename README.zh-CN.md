@@ -4,7 +4,7 @@
 
 在你自己的机器上管理编码 agent 的原生桌面界面：Claude Code、Codex、Cursor、Devin、Grok、Hermes、graff、Pi、OpenCode、Antigravity。默认纯本地，需要时再打开多设备同步。
 
-*[English](README.md) · 简体中文 · [Deutsch](README.de.md) · [हिन्दी](README.hindi.md) · [ไทย](README.thai.md) · [Bahasa Indonesia](README.indo.md) · [Bahasa Melayu](README.malay.md)*
+*[English](README.md) · 简体中文 · [Deutsch](README.de.md) · [Español](README.es.md) · [हिन्दी](README.hindi.md) · [ไทย](README.thai.md) · [Bahasa Indonesia](README.indo.md) · [Bahasa Melayu](README.malay.md)*
 
 产品名是 **Harness**（`harness.codegraff.app`），命令行程序是 `harness`。同一个程序既能打开图形界面，也能作为无界面引擎运行。
 

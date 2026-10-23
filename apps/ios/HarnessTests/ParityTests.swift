@@ -441,6 +441,24 @@ final class ParityTests: XCTestCase {
         }
     }
 
+    // MARK: Run errors (the desktop runs the same cases in harness-proto `run_errors`)
+
+    func testRunErrorsReadTheSameAsTheDesktop() throws {
+        let v = try load("vectors/run-errors.json")
+        let labels = try XCTUnwrap(v["labels"] as? [String: String])
+        let cases = try rows(v, "cases")
+        XCTAssertFalse(cases.isEmpty)
+        for c in cases {
+            let message = try XCTUnwrap(c["message"] as? String)
+            let problem = RunErrors.providerProblem(message)
+            XCTAssertEqual(problem?.rawValue, c["expect"] as? String, message)
+            if let problem {
+                XCTAssertEqual(problem.label, labels[problem.rawValue], message)
+                XCTAssertEqual(problem.actionLabel, v["actionLabel"] as? String)
+            }
+        }
+    }
+
     // MARK: Live sync: registry projection and transcript decoding (Android runs these in crates/mobile)
 
     func testRegistryRowsProjectTheSameWay() throws {
@@ -541,5 +559,85 @@ final class ParityTests: XCTestCase {
                                                    joinedAt: joinedAt, rowLastSeen: row),
                            (c["nextChange"] as? NSNumber)?.int64Value, name)
         }
+    }
+
+    // MARK: Cloud sandboxes (the desktop runs the same cases in harness-ui's codegraff_sandboxes)
+    //
+    // The phone reaches cloud sandboxes through one of its computers' engines, which does the
+    // gateway side of this file itself (sign-in, call plans, state words, error sentences; the
+    // engine's codegraff_auth tests). What the phone owns, and is pinned here, is how a list
+    // the engine sends reads: row titles and details, buttons, rates, size choices and the
+    // running summary.
+
+    private func decode<T: Decodable>(_ type: T.Type, _ object: Any?) throws -> T {
+        let data = try JSONSerialization.data(withJSONObject: try XCTUnwrap(object), options: [.fragmentsAllowed])
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func cloudNow(_ vector: [String: Any]) throws -> Date {
+        Date(timeIntervalSince1970: try XCTUnwrap((vector["now"] as? NSNumber)?.doubleValue))
+    }
+
+    func testCloudSandboxRowsReadTheSameAsTheDesktop() throws {
+        let vector = try load("vectors/cloud-sandbox.json")
+        let now = try cloudNow(vector)
+        let cases = try rows(vector, "rows")
+        XCTAssertFalse(cases.isEmpty)
+        for c in cases {
+            let sandbox = try decode(CodegraffSandbox.self, c["sandbox"])
+            XCTAssertEqual(CloudSandboxRules.title(sandbox), c["title"] as? String, "\(c)")
+            XCTAssertEqual(CloudSandboxRules.detail(sandbox, now: now), c["detail"] as? String, "\(c)")
+            XCTAssertEqual(CloudSandboxRules.canStart(sandbox), c["canStart"] as? Bool, "\(c)")
+            XCTAssertEqual(CloudSandboxRules.canStop(sandbox), c["canStop"] as? Bool, "\(c)")
+            if CloudSandboxRules.canStart(sandbox) {
+                XCTAssertEqual(CloudSandboxRules.startLabels(sandbox).label, c["startLabel"] as? String, "\(c)")
+            } else {
+                XCTAssertTrue(c["startLabel"] is NSNull, "\(c)")
+            }
+        }
+    }
+
+    func testCloudSandboxRatesAndSizeChoicesReadTheSame() throws {
+        let vector = try load("vectors/cloud-sandbox.json")
+        for c in try rows(vector, "rates") {
+            let micro = try XCTUnwrap((c["microUsd"] as? NSNumber)?.int64Value)
+            XCTAssertEqual(CloudSandboxRules.formatRate(micro), c["text"] as? String, "\(c)")
+        }
+        for c in try rows(vector, "sizeChoices") {
+            let size = try decode(PersonalSize.self, c["size"])
+            XCTAssertEqual(CloudSandboxRules.sizeTitle(size), c["title"] as? String, "\(c)")
+            XCTAssertEqual(CloudSandboxRules.sizeDetail(size), c["detail"] as? String, "\(c)")
+        }
+    }
+
+    func testCloudSandboxRunningSummariesReadTheSame() throws {
+        let vector = try load("vectors/cloud-sandbox.json")
+        let now = try cloudNow(vector)
+        for c in try rows(vector, "summaries") {
+            let list = CodegraffSandboxes(enabled: true, sandboxes: try decode([CodegraffSandbox].self, c["sandboxes"]))
+            let summary = try XCTUnwrap(CloudSandboxRules.runningSummary(list, now: now), "\(c)")
+            XCTAssertEqual(summary.label, c["label"] as? String, "\(c)")
+            XCTAssertEqual(summary.detail, c["detail"] as? String, "\(c)")
+            XCTAssertEqual(CloudSandboxRules.compactTooltip(summary), c["tooltip"] as? String, "\(c)")
+        }
+    }
+
+    /// A create names a size id and the engine sends that size's machine: the id the phone picks
+    /// must be the one whose machine the vector's createLarge body carries, and with no pick the
+    /// default size is used.
+    func testCloudSandboxCreatePicksTheSizeTheVectorSends() throws {
+        let vector = try load("vectors/cloud-sandbox.json")
+        let personal = try XCTUnwrap(vector["personalSizes"] as? [String: Any])
+        let sizes = try decode([PersonalSize].self, personal["sizes"])
+        let plans = try XCTUnwrap(vector["plans"] as? [String: Any])
+        let createLarge = try XCTUnwrap(plans["createLarge"] as? [[String: Any]])
+        let body = try XCTUnwrap(createLarge.first { ($0["method"] as? String) == "POST" }?["body"] as? [String: Any])
+        let large = try XCTUnwrap(CloudSandboxRules.selectedSize(sizes, picked: "large"))
+        XCTAssertEqual(large.cpu, (body["cpu"] as? NSNumber)?.intValue)
+        XCTAssertEqual(large.memoryGiB, (body["memory"] as? NSNumber)?.intValue)
+        XCTAssertEqual(large.diskGiB, (body["disk"] as? NSNumber)?.intValue)
+        XCTAssertEqual(CloudSandboxRules.selectedSize(sizes, picked: nil)?.id, "standard")
+        XCTAssertEqual(CloudSandboxRules.selectedSize(sizes, picked: "gone")?.id, "standard")
+        XCTAssertNil(CloudSandboxRules.selectedSize([], picked: nil), "no sizes: today's create")
     }
 }

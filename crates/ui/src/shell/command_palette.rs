@@ -8,7 +8,14 @@ const HISTORY_RESULT_LIMIT: usize = 30;
 const EXTERNAL_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 const RESULTS_FADE_BAND: f32 = 18.0;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteNavigation {
+    PreserveTabs,
+    ReplaceCurrent,
+}
+
 pub(super) struct CommandPalette {
+    navigation: PaletteNavigation,
     search: Entity<ComposerInput>,
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
@@ -149,11 +156,25 @@ impl Shell {
     }
 
     pub(super) fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_command_palette_with_navigation(PaletteNavigation::PreserveTabs, window, cx);
+    }
+
+    pub(super) fn toggle_resume_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_command_palette_with_navigation(PaletteNavigation::ReplaceCurrent, window, cx);
+    }
+
+    fn toggle_command_palette_with_navigation(
+        &mut self,
+        navigation: PaletteNavigation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.command_palette.is_some() {
             self.close_command_palette(window, cx);
             return;
         }
         self.add_space = None;
+        self.sidebar_search = None;
         let placeholder = if self.chat_split.as_ref().is_some_and(|split| split.panes.len() > 1) {
             "Search open panes, commands and chats…"
         } else {
@@ -181,6 +202,7 @@ impl Shell {
             self.load_external_sessions(cx);
         }
         self.command_palette = Some(CommandPalette {
+            navigation,
             search,
             focus: cx.focus_handle(),
             previous_focus,
@@ -395,8 +417,14 @@ impl Shell {
             cx.notify();
             return;
         }
+        // /resume is an intentional current-tab replacement, unlike global
+        // search. Capture the invocation's policy before closing the palette.
+        let replace_current = self.command_palette.as_ref().is_some_and(|palette| {
+            palette.navigation == PaletteNavigation::ReplaceCurrent
+        });
         self.close_command_palette(window, cx);
         match entry {
+            Entry::NewChat if replace_current => self.open_new_session(cx),
             Entry::NewChat => self.new_chat_tab(None, window, cx),
             Entry::NewProject => self.open_add_space(cx),
             Entry::Settings => {
@@ -407,11 +435,11 @@ impl Shell {
             Entry::External(source, id) => self.import_external(vec![(source, id)], cx),
             Entry::ImportAll => self.import_external(Vec::new(), cx),
             Entry::Pane(ix) => self.focus_chat_pane(ix, window, cx),
-            Entry::Chat(id) => {
-                if !self.reveal_chat_in_tabs(&id, window, cx) {
-                    self.open_chat(id, cx)
-                }
+            Entry::Chat(id) if replace_current => {
+                self.open_chat(id, cx);
+                window.focus(&self.composer.focus_handle(cx), cx);
             }
+            Entry::Chat(id) => self.open_chat_in_tab(id, window, cx),
         }
     }
 
@@ -661,7 +689,10 @@ impl Shell {
                     .map(str::trim)
                     .filter(|branch| !branch.is_empty())
                     .map(SharedString::from);
-                let pr = state.change_request_for_chat(chat).cloned();
+                let pr = state
+                    .change_request_for_chat(chat)
+                    .cloned()
+                    .map(|pr| (pr, state.change_request_provenance(chat)));
                 let harness = self
                     .settings
                     .sidebar_show_harness
@@ -901,6 +932,66 @@ mod tests {
     use super::*;
     use crate::appearance::AppearanceMode;
 
+    #[gpui::test]
+    fn chat_search_results_preserve_tabs_and_reveal_parked_panes(cx: &mut gpui::TestAppContext) {
+        use crate::shell::chat_tabs::navigation_tests::{assert_target_preserved, fixture};
+        for parked in [None, Some(false), Some(true)] {
+            let (_dir, window) = fixture(cx, true, parked);
+            window.update(cx, |shell, window, cx| {
+                let layout = shell.chat_split.clone();
+                for _ in 0..2 {
+                    shell.toggle_command_palette(window, cx);
+                    shell.activate_command(Entry::Chat("target".into()), window, cx);
+                    assert!(shell.command_palette.is_none());
+                    assert_target_preserved(shell, cx);
+                    assert_eq!(shell.chat_tabs[0].split, layout);
+                }
+            }).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn resume_search_replaces_current_tab_without_revealing_parked_targets(cx: &mut gpui::TestAppContext) {
+        use crate::shell::chat_tabs::navigation_tests::fixture;
+        for split in [false, true] {
+            for parked in [None, Some(false), Some(true)] {
+                let (_dir, window) = fixture(cx, split, parked);
+                cx.run_until_parked();
+                let (tabs, active, layout) = window.update(cx, |shell, _, _| {
+                    (shell.chat_tabs.clone(), shell.chat_tab, shell.chat_split.clone())
+                }).unwrap();
+                for _ in 0..2 {
+                    window.update(cx, |shell, window, cx| {
+                        shell.pending_workspace_command = Some(crate::composer::WorkspaceCommand::Resume);
+                        let _ = shell.render(window, cx);
+                        assert!(shell.command_palette.is_some());
+                        shell.activate_command(Entry::Chat("target".into()), window, cx);
+                        assert!(shell.command_palette.is_none());
+                    }).unwrap();
+                    cx.run_until_parked();
+                    window.update(cx, |shell, _, cx| {
+                        assert_eq!(shell.chat_tabs, tabs, "resume must not add, switch or alter parked tabs");
+                        assert_eq!(shell.chat_tab, active);
+                        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("target"));
+                        assert!(matches!(shell.route, Route::Chat));
+                        assert_eq!(shell.chat_split, layout, "other split panes stay open");
+                    }).unwrap();
+                }
+                // Closing a resume picker must not leak replacement behavior
+                // into the next ordinary command-palette invocation.
+                window.update(cx, |shell, window, cx| {
+                    shell.toggle_resume_palette(window, cx);
+                    shell.close_command_palette(window, cx);
+                    shell.toggle_command_palette(window, cx);
+                    shell.activate_command(Entry::Chat("current".into()), window, cx);
+                    assert_eq!(shell.chat_tab, shell.chat_tabs.len() - 1);
+                    assert_eq!(shell.chat_tabs[active].selected.as_deref(), Some("target"));
+                    assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("current"));
+                }).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn x11_unflagged_enter_repeats_activate_once_until_release() {
         let mut enter = EnterPress::default();
@@ -997,6 +1088,28 @@ mod tests {
         .unwrap();
         assert_eq!(row.source_label(), "Codex");
         assert_eq!(row.folder(), "app");
+    }
+
+    #[gpui::test]
+    fn resume_replaces_current_tab_even_when_target_is_open_elsewhere(cx: &mut gpui::TestAppContext) {
+        for split in [false, true] {
+            for parked in [None, Some(false), Some(true)] {
+                let (_dir, window) = chat_tabs::navigation_tests::fixture(cx, split, parked);
+                window.update(cx, |shell, window, cx| {
+                    let tabs = shell.chat_tabs.clone();
+                    let pane_count = shell.chat_split.as_ref().map(|split| split.panes.len());
+                    shell.pending_workspace_command = Some(crate::composer::WorkspaceCommand::Resume);
+                    let _ = shell.render(window, cx);
+                    assert!(shell.command_palette.is_some());
+                    shell.activate_command(Entry::Chat("target".into()), window, cx);
+                    assert!(shell.command_palette.is_none());
+                    assert_eq!(shell.chat_tab, 0, "/resume must not switch tabs");
+                    assert_eq!(shell.chat_tabs, tabs, "/resume must not create or modify parked tabs");
+                    assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("target"));
+                    assert_eq!(shell.chat_split.as_ref().map(|split| split.panes.len()), pane_count);
+                }).unwrap();
+            }
+        }
     }
 
     #[gpui::test]

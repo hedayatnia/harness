@@ -36,28 +36,13 @@ struct WorkingSpinner: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(paused: reduceMotion)) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate / Motion.gradientSpinPeriod
-            grid(time: t)
-        }
-    }
-
-    private func grid(time: Double) -> some View {
-        VStack(spacing: cellSize * 0.8) {
-            ForEach(0..<3, id: \.self) { row in
-                HStack(spacing: cellSize * 0.8) {
-                    ForEach(0..<3, id: \.self) { col in
-                        let dx = Double(col - 1)
-                        let dy = Double(2 - row)  // distance from bottom-center
-                        let dist = (dx * dx + dy * dy).squareRoot() / 2.5
-                        Rectangle()
-                            .fill(GradientSpin.rowTints[row])
-                            .frame(width: cellSize, height: cellSize)
-                            .opacity(GradientSpin.opacity(phase: time - dist))
-                    }
-                }
+        GradientSpinCells(cellSize: cellSize, animated: !reduceMotion, offsets: (0..<3).map { row in
+            (0..<3).map { col in
+                let dx = Double(col - 1)
+                let dy = Double(2 - row)  // distance from bottom-center
+                return (dx * dx + dy * dy).squareRoot() / 2.5
             }
-        }
+        })
     }
 }
 
@@ -73,25 +58,105 @@ struct MiniSpinner: View {
     ]
 
     var body: some View {
-        TimelineView(.animation(paused: reduceMotion)) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate / Motion.gradientSpinPeriod
-            grid(time: t)
+        GradientSpinCells(cellSize: cellSize, animated: !reduceMotion, offsets: (0..<3).map { row in
+            (0..<2).map { col in
+                let ix = Self.ring.firstIndex { $0 == (row, col) } ?? 0
+                return Double(ix) / Double(Self.ring.count)
+            }
+        })
+    }
+}
+
+/// The gradient spinners' cells, animated by Core Animation. A TimelineView redrew the spinner in SwiftUI on
+/// every display frame, and a spinner in a list row (a Working session) made the list update that row every
+/// frame on the main thread: with the stacked split's list on screen, scrolling the session below it lagged.
+/// The render server runs these animations, so the main thread does nothing per frame.
+private struct GradientSpinCells: UIViewRepresentable {
+    let cellSize: CGFloat
+    let animated: Bool
+    /// Each cell's phase offset in periods, by row (top first) and column; a row takes its tint by index.
+    let offsets: [[Double]]
+
+    private var gap: CGFloat { cellSize * 0.8 }
+    private var columns: Int { offsets.map(\.count).max() ?? 0 }
+
+    func makeUIView(context: Context) -> SpinCellsView { SpinCellsView() }
+
+    func updateUIView(_ view: SpinCellsView, context: Context) {
+        view.configure(cellSize: cellSize, gap: gap, offsets: offsets, animated: animated)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: SpinCellsView, context: Context) -> CGSize? {
+        let rows = CGFloat(offsets.count), cols = CGFloat(columns)
+        return CGSize(width: cols * cellSize + max(0, cols - 1) * gap,
+                      height: rows * cellSize + max(0, rows - 1) * gap)
+    }
+}
+
+private final class SpinCellsView: UIView {
+    private var cells: [[CALayer]] = []
+    private var config: (cellSize: CGFloat, gap: CGFloat, offsets: [[Double]], animated: Bool)?
+
+    func configure(cellSize: CGFloat, gap: CGFloat, offsets: [[Double]], animated: Bool) {
+        if let config, config.cellSize == cellSize, config.gap == gap, config.offsets == offsets,
+           config.animated == animated { return }
+        config = (cellSize, gap, offsets, animated)
+        cells.joined().forEach { $0.removeFromSuperlayer() }
+        cells = offsets.enumerated().map { row, line in
+            line.map { _ in
+                let cell = CALayer()
+                cell.backgroundColor = UIColor(GradientSpin.rowTints[row % GradientSpin.rowTints.count]).cgColor
+                layer.addSublayer(cell)
+                return cell
+            }
+        }
+        setNeedsLayout()
+        animate()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let config else { return }
+        let step = config.cellSize + config.gap
+        for (row, line) in cells.enumerated() {
+            for (col, cell) in line.enumerated() {
+                cell.frame = CGRect(x: CGFloat(col) * step, y: CGFloat(row) * step,
+                                    width: config.cellSize, height: config.cellSize)
+            }
         }
     }
 
-    private func grid(time: Double) -> some View {
-        VStack(spacing: cellSize * 0.8) {
-            ForEach(0..<3, id: \.self) { row in
-                HStack(spacing: cellSize * 0.8) {
-                    ForEach(0..<2, id: \.self) { col in
-                        let ix = Self.ring.firstIndex { $0 == (row, col) } ?? 0
-                        let phase = Double(ix) / Double(Self.ring.count)
-                        Rectangle()
-                            .fill(GradientSpin.rowTints[row])
-                            .frame(width: cellSize, height: cellSize)
-                            .opacity(GradientSpin.opacity(phase: time - phase))
-                    }
+    // Animations are dropped while the view is out of a window (and when the app is in the background).
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { animate() }
+    }
+
+    /// The same keyframes as `GradientSpin.opacity`, each cell `offset` periods behind the wall clock, so
+    /// every spinner on screen pulses in step.
+    private func animate() {
+        guard let config else { return }
+        let period = Motion.gradientSpinPeriod
+        let now = CACurrentMediaTime()
+        for (row, line) in cells.enumerated() {
+            for (col, cell) in line.enumerated() {
+                let offset = config.offsets[row][col]
+                cell.removeAnimation(forKey: "pulse")
+                guard config.animated else {
+                    cell.opacity = Float(GradientSpin.opacity(phase: -offset + 1))
+                    continue
                 }
+                let phase = (now / period - offset).truncatingRemainder(dividingBy: 1)
+                let pulse = CAKeyframeAnimation(keyPath: "opacity")
+                pulse.values = [1, GradientSpin.dim, GradientSpin.dim, 1]
+                pulse.keyTimes = [0, 0.45, 0.92, 1]
+                pulse.timingFunctions = [CAMediaTimingFunction(name: .easeInEaseOut),
+                                         CAMediaTimingFunction(name: .linear), CAMediaTimingFunction(name: .linear)]
+                pulse.duration = period
+                pulse.repeatCount = .infinity
+                pulse.beginTime = cell.convertTime(now, from: nil) - (phase < 0 ? phase + 1 : phase) * period
+                pulse.isRemovedOnCompletion = false
+                cell.add(pulse, forKey: "pulse")
             }
         }
     }

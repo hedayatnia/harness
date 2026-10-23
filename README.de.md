@@ -4,7 +4,7 @@
 
 <p align="center">Ein nativer Arbeitsbereich für die Coding-Agents auf deinen Geräten.</p>
 
-<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · Deutsch · <a href="README.hindi.md">हिन्दी</a> · <a href="README.thai.md">ไทย</a> · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
+<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · Deutsch · <a href="README.es.md">Español</a> · <a href="README.hindi.md">हिन्दी</a> · <a href="README.thai.md">ไทย</a> · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
 
 Harness vereint **CodeGraff (graff)**, Claude Code, Codex, Cursor, Devin, Grok,
 Hermes, Pi, OpenCode und Antigravity in einer Desktop-Oberfläche. Du kannst

@@ -96,6 +96,12 @@ impl Shell {
                     if settled && let Some(error) = status.error.clone() {
                         shell.sidebar_notice = Some(format!("Codegraff sign-in failed: {error}").into());
                     }
+                    if settled && status.signed_in {
+                        // The account may already have a sandbox running.
+                        shell
+                            .state
+                            .update(cx, |state, cx| state.refresh_cloud_sandboxes(cx));
+                    }
                     shell.codegraff = Some(status);
                     cx.notify();
                 })

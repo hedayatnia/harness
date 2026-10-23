@@ -266,6 +266,10 @@ impl EngineCore {
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
         }
+        match sessions.resume_after_restart() {
+            0 => {}
+            resumed => tracing::info!(resumed, "work cut short by the last shutdown resumed"),
+        }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
         doc_host.set_repos(repos.clone());

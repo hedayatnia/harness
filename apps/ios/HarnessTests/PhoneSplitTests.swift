@@ -122,4 +122,13 @@ final class PhoneSplitTests: XCTestCase {
             XCTAssertEqual(PhoneSplit.shownPane(resting: rest, composerFocused: false), rest)
         }
     }
+
+    /// With nothing open the detail is only a placeholder: folded it left the list out of reach, and at the
+    /// split's rest it left the lower half of the screen blank.
+    func testWithNothingOpenTheListHasTheScreen() {
+        for rest in [PhoneSplit.StackedPane.session, .split, .list] {
+            XCTAssertEqual(PhoneSplit.shownPane(resting: rest, composerFocused: false, hasDetail: false), .list)
+            XCTAssertEqual(PhoneSplit.shownPane(resting: rest, composerFocused: true, hasDetail: false), .list)
+        }
+    }
 }

@@ -49,8 +49,28 @@ actor ChatRoomClient {
     /// session that joined AND survived this long resets backoff to base —
     /// reset-on-join let connect-and-die sockets hot-loop at 250ms forever.
     static let stableResetNs: UInt64 = 30_000_000_000
-    /// Re-push cadence after a `quota` rejection (server window is 60s).
-    static let quotaRetryNs: UInt64 = 5_000_000_000
+    /// Wait before the next head probe after a `quota` refusal (#344), the
+    /// twin of chat_client.rs `quota_retry_delay`: the room's `retryAfterMs`
+    /// bounded to 250 ms...120 s plus up to an eighth (at most 2 s) of
+    /// jitter; without a hint (an older edge), 5 s doubling per refused probe
+    /// up to the 60 s window, plus up to a quarter of jitter.
+    static func quotaRetryDelayMs(strikes: Int, hintMs: UInt64?) -> UInt64 {
+        if let hintMs {
+            let base = min(max(hintMs, 250), 120_000)
+            return base + UInt64.random(in: 0...min(base / 8, 2_000))
+        }
+        let base = min(UInt64(5_000) << UInt64(min(max(strikes, 0), 5)), 60_000)
+        return base + UInt64.random(in: 0...(base / 4))
+    }
+
+    /// `retryAfterMs` from a quota refusal: the WS error header or the HTTP
+    /// 429 JSON body, else the `Retry-After` header in whole seconds.
+    static func quotaHintMs(_ fields: [String: Any]?, retryAfterHeader: String? = nil) -> UInt64? {
+        if let ms = (fields?["retryAfterMs"] as? NSNumber)?.uint64Value { return ms }
+        guard let header = retryAfterHeader?.trimmingCharacters(in: .whitespaces),
+              let secs = UInt64(header) else { return nil }
+        return secs.multipliedReportingOverflow(by: 1000).overflow ? UInt64.max : secs * 1000
+    }
     /// Client-side push cap: the DO's per-row cap (1 MiB) minus frame-header
     /// headroom — the runtime closes WS messages at 1 MiB BEFORE the DO runs,
     /// so an over-cap payload would die with no error frame to retire it.
@@ -58,12 +78,17 @@ actor ChatRoomClient {
 
     /// MainActor-isolated bridge to SessionStore's doc. Every apply persists
     /// doc + cursor together; `applyCheckpoint` returns false on an import
-    /// failure (the session redials rather than run blind).
+    /// failure (the session redials rather than run blind). The two applies
+    /// are async: their Loro import runs off the main actor (#484).
     struct Delegate: Sendable {
         var cursor: @MainActor @Sendable () -> UInt64
         var containsFrontier: @MainActor @Sendable (Data) -> Bool
-        var applyCheckpoint: @MainActor @Sendable (Data, UInt64) -> Bool
-        var applyRow: @MainActor @Sendable (Data, UInt64) -> Void
+        var applyCheckpoint: @MainActor @Sendable (Data, UInt64) async -> Bool
+        var applyRow: @MainActor @Sendable (Data, UInt64) async -> Void
+        /// A contiguous run of rows in one import, the cursor then moved to
+        /// the run's last seq. A catch-up that queued many rows rebuilds a
+        /// concurrently edited text once rather than once per row (#484).
+        var applyRows: @MainActor @Sendable ([Data], UInt64) async -> Void
         var advanceCursor: @MainActor @Sendable (UInt64) -> Void
         /// Cursor amnesty: lower the cursor to the checkpoint seq (no-op if
         /// already at or below). See the once-per-session clamp in
@@ -104,6 +129,11 @@ actor ChatRoomClient {
     private var pingTask: Task<Void, Never>?
     private var livenessTask: Task<Void, Never>?
     private var quotaTask: Task<Void, Never>?
+    /// Refused probes since the last ack (backoff without a server hint).
+    private var quotaStrikes = 0
+    /// Pushes (only pushes) wait until here after a quota refusal; pulls and
+    /// rows keep flowing. Shared by the socket and the HTTPS cycle.
+    private var quotaHoldUntil: DispatchTime?
     private var fetchTask: Task<Void, Never>?
     private var pending: [PendingPush] = []
     /// State frame received on the CURRENT socket — pushes are legal from
@@ -158,6 +188,12 @@ actor ChatRoomClient {
     private var lastInbound = DispatchTime.now()
     /// Protocol clock — only real frames count (pongs prove nothing).
     private var lastProtocolRx = DispatchTime.now()
+    /// Frames received but not yet handled, oldest first, with the socket
+    /// generation they arrived on. The receive loop only queues them, so
+    /// rows that arrive while an import runs wait here and are then imported
+    /// together (`drainInbox`).
+    private var inbox: [(frame: ChatWireFrame, gen: Int)] = []
+    private var draining = false
     /// Setting any of the four deadlines wakes a liveness loop that is parked in a long sleep
     /// (LivenessSchedule). Clearing one needs nothing: the loop's next look sees it gone.
     private var helloSentAt: DispatchTime? { didSet { if helloSentAt != nil { wakeLivenessIfParked() } } }
@@ -234,8 +270,10 @@ actor ChatRoomClient {
     func pullSync() async {
         guard !closed else { return }
         // Push first, so a message typed on dead wifi leaves the device on
-        // this cycle rather than the next.
-        for push in pending {
+        // this cycle rather than the next. A quota hold skips the pushes,
+        // never the pull.
+        let held = quotaHoldUntil.map { $0 > .now() } ?? false
+        for push in held ? [] : pending {
             guard var request = await pushRequest(push.batchId) else {
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): http push skipped — no URL (token unavailable)")
                 break
@@ -251,6 +289,8 @@ actor ChatRoomClient {
                let seq = (ack["seq"] as? NSNumber)?.uint64Value {
                 pending.removeAll { $0.batchId == push.batchId }
                 await delegate.retirePush(push.batchId)
+                quotaStrikes = 0
+                quotaHoldUntil = nil
                 // Contiguity rule (see the socket ACK path): a jump would
                 // stamp the cursor over interleaved rows we never pulled —
                 // hold, and this cycle's pull below walks the gap.
@@ -272,6 +312,16 @@ actor ChatRoomClient {
                 roomLog.error("chat2 \(self.chatId, privacy: .public): http push rejected (\(code, privacy: .public)); retiring batch")
                 pending.removeAll { $0.batchId == push.batchId }
                 await delegate.retirePush(push.batchId)
+            } else if http.statusCode == 429 {
+                // The room's quota: hold pushes until its window reopens;
+                // the pull below still runs.
+                let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let hint = Self.quotaHintMs(fields, retryAfterHeader: http.value(forHTTPHeaderField: "Retry-After"))
+                let delayMs = Self.quotaRetryDelayMs(strikes: quotaStrikes, hintMs: hint)
+                quotaStrikes += 1
+                quotaHoldUntil = .now() + .milliseconds(Int(delayMs))
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): http push over quota; pushes wait \(delayMs)ms, pulls continue")
+                break
             } else {
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): http push http=\(http.statusCode); will retry")
                 break  // quota/transient/middlebox: retry next cycle
@@ -342,10 +392,9 @@ actor ChatRoomClient {
             }
         }
         guard !closed else { return }
-        for frame in frames.dropFirst()
-        where frame.kind == ChatFrameType.row || frame.kind == ChatFrameType.rowsDone {
-            await applyRowFrame(frame)
-        }
+        await applyRowFrames(frames.dropFirst().filter {
+            $0.kind == ChatFrameType.row || $0.kind == ChatFrameType.rowsDone
+        })
     }
 
     private func shouldPoll() -> Bool {
@@ -629,6 +678,9 @@ actor ChatRoomClient {
 
     // MARK: Inbound
 
+    /// The receive loop's side: stamp the liveness clocks and queue the
+    /// frame. Handling waits for the drain, so a long import neither stalls
+    /// the socket read nor reads as a silent socket.
     private func handleInbound(_ message: URLSessionWebSocketTask.Message, gen: Int) async {
         guard gen == generation else { return }
         lastInbound = .now()
@@ -642,7 +694,45 @@ actor ChatRoomClient {
         }
         lastProtocolRx = .now()
         probeSentAt = nil
+        inbox.append((frame, gen))
+        guard !draining else { return }
+        draining = true
+        Task { await self.drainInbox() }
+    }
 
+    /// Handle queued frames in arrival order. A run of row frames is applied
+    /// together (`applyRowFrames`); anything else goes through `handleFrame`.
+    private func drainInbox() async {
+        while !inbox.isEmpty {
+            let frames = inbox
+            inbox.removeAll()
+            var i = 0
+            while i < frames.count {
+                let (frame, gen) = frames[i]
+                guard gen == generation, !closed else {
+                    i += 1
+                    continue
+                }
+                guard frame.kind == ChatFrameType.row, checkpointBuffer == nil else {
+                    await handleFrame(frame, gen: gen)
+                    i += 1
+                    continue
+                }
+                var run: [ChatWireFrame] = []
+                while i < frames.count, frames[i].frame.kind == ChatFrameType.row,
+                      frames[i].gen == gen {
+                    run.append(frames[i].frame)
+                    i += 1
+                }
+                await applyRowFrames(run)
+                await maybeRepairGap(gen: gen)
+            }
+        }
+        draining = false
+    }
+
+    private func handleFrame(_ frame: ChatWireFrame, gen: Int) async {
+        guard gen == generation else { return }
         switch frame.kind {
         case ChatFrameType.state:
             await handleState(frame, gen: gen)
@@ -664,11 +754,14 @@ actor ChatRoomClient {
                   let seq = (frame.header["seq"] as? NSNumber)?.uint64Value else { return }
             pending.removeAll { $0.batchId == batchId }
             await delegate.retirePush(batchId)
+            // The room took a push: its quota window has room again.
+            quotaStrikes = 0
+            quotaHoldUntil = nil
             // Contiguity rule, ack flavor: our own batch landing at `seq`
             // proves rows up to seq exist SERVER-side, not that we have the
             // interleaved ones from other devices.
             let cursor = await delegate.cursor()
-            if seq > cursor + 1 {
+            if chatNextRowCursor(cursor: cursor, seq: seq) == nil {
                 gapRepair = true
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): ack gap (seq=\(seq), cursor=\(cursor)); holding cursor and requesting backfill")
             } else {
@@ -807,13 +900,39 @@ actor ChatRoomClient {
             }
             return
         }
-        while let frame = checkpointBuffer?.first {
-            checkpointBuffer?.removeFirst()
-            await applyRowFrame(frame)
+        // Rows that arrive meanwhile keep joining the (non-nil) buffer.
+        while let frames = checkpointBuffer, !frames.isEmpty {
+            checkpointBuffer = []
+            await applyRowFrames(frames)
             guard !closed else { return }
         }
         checkpointBuffer = nil
         await maybeRepairGap(gen: generation)
+    }
+
+    /// Frames in order, with each run of rows that keeps to the contiguity
+    /// rule (`chatNextRowCursor`) imported in one call. A gap row and
+    /// ROWS_DONE go through `applyRowFrame` exactly as before.
+    private func applyRowFrames(_ frames: [ChatWireFrame]) async {
+        var i = 0
+        while i < frames.count {
+            var cursor = await delegate.cursor()
+            var bytes: [Data] = []
+            while i < frames.count, frames[i].kind == ChatFrameType.row,
+                  let seq = (frames[i].header["seq"] as? NSNumber)?.uint64Value,
+                  let next = chatNextRowCursor(cursor: cursor, seq: seq) {
+                bytes.append(frames[i].payload)
+                cursor = next
+                i += 1
+            }
+            if bytes.isEmpty {
+                await applyRowFrame(frames[i])
+                i += 1
+            } else {
+                await delegate.applyRows(bytes, cursor)
+            }
+            guard !closed else { return }
+        }
     }
 
     /// One backfill/broadcast frame: a row, or the ROWS_DONE terminator.
@@ -834,7 +953,7 @@ actor ChatRoomClient {
             // repair. Skipping the hole was the random new-session
             // forever-hang: an empty doc under an advanced cursor.
             let cursor = await delegate.cursor()
-            if seq > cursor + 1 {
+            if chatNextRowCursor(cursor: cursor, seq: seq) == nil {
                 gapRepair = true
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): row gap (seq=\(seq), cursor=\(cursor)); holding cursor and requesting backfill")
                 await delegate.applyRow(frame.payload, cursor)
@@ -902,9 +1021,15 @@ actor ChatRoomClient {
             for ix in pending.indices {
                 pending[ix].inFlight = false
             }
+            // Refusals of pushes already in flight belong to the same
+            // round: keep its clock instead of adding strikes.
+            if let until = quotaHoldUntil, until > .now() { break }
+            let delayMs = Self.quotaRetryDelayMs(strikes: quotaStrikes, hintMs: Self.quotaHintMs(header))
+            quotaStrikes += 1
+            quotaHoldUntil = .now() + .milliseconds(Int(delayMs))
             quotaTask?.cancel()
             quotaTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: ChatRoomClient.quotaRetryNs)
+                try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
                 guard !Task.isCancelled, let self else { return }
                 await self.pushHead(gen: gen)
             }
@@ -920,6 +1045,8 @@ actor ChatRoomClient {
 
     private func pushPending() async {
         guard stateReceived else { return }
+        // During a quota hold only the head probe (pushHead) goes out.
+        if let until = quotaHoldUntil, until > .now() { return }
         for ix in pending.indices where !pending[ix].inFlight {
             pending[ix].inFlight = true
             let push = pending[ix]

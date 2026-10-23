@@ -545,6 +545,11 @@ pub enum AgentEvent {
         tokens: Option<u64>,
         window: Option<u64>,
     },
+    /// The agent's cumulative [`ContextSavings`], replacing the previous one.
+    #[serde(rename_all = "camelCase")]
+    ContextSavings {
+        savings: ContextSavings,
+    },
     /// A Jev selection confirmed by the agent's live thought-level config
     /// update. Values are ACP ids (including MiMo's `none`/Off).
     #[serde(rename_all = "camelCase")]
@@ -622,6 +627,16 @@ pub enum AgentEvent {
     #[serde(rename_all = "camelCase")]
     SubagentProgress {
         summary: String,
+    },
+    /// Work the agent left running past its turn: a background shell command,
+    /// monitor, agent or workflow. `running: true` when it starts, `false`
+    /// when it settles. Not part of the transcript; the engine keeps a parked
+    /// session alive while any is open, since stopping the agent process kills
+    /// that work (#517).
+    #[serde(rename_all = "camelCase")]
+    BackgroundTask {
+        id: String,
+        running: bool,
     },
     /// An event belonging to a SUBAGENT's nested transcript, attributed to
     /// the spawning tool call (`parent_tool_use_id` = the parent-feed
@@ -796,6 +811,38 @@ mod tests {
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub window: Option<u64>,
+    /// What the agent reported keeping out of its context (graff only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savings: Option<ContextSavings>,
+}
+
+/// graff's `_meta["codegraff/savings"]` on its context meter: cumulative,
+/// measured counts for the agent process, never an estimate of what another
+/// agent would have spent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavings {
+    /// Tool-result bytes kept in files instead of the conversation.
+    #[serde(default)]
+    pub handle_bytes: u64,
+    /// Estimated context tokens freed by compaction.
+    #[serde(default)]
+    pub compacted_tokens: u64,
+    /// Input tokens the provider served from its prompt cache.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+}
+
+impl ContextSavings {
+    /// Tool-result bytes as tokens, at the usual ~4 bytes per token.
+    pub fn handle_tokens(self) -> u64 {
+        self.handle_bytes / 4
+    }
+
+    /// Tokens that never had to sit in the model's context.
+    pub fn kept_out_tokens(self) -> u64 {
+        self.handle_tokens().saturating_add(self.compacted_tokens)
+    }
 }
 
 impl ContextUsage {

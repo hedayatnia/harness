@@ -662,12 +662,15 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::ContextUsage { .. }
+        | AgentEvent::ContextSavings { .. }
         | AgentEvent::AvailableCommands { .. }
         | AgentEvent::ReasoningChanged { .. }
         | AgentEvent::ToolProgress { .. }
         // SubagentProgress only means something tagged (handled above).
         | AgentEvent::UserMessage { .. }
-        | AgentEvent::SubagentProgress { .. } => {}
+        | AgentEvent::SubagentProgress { .. }
+        // Engine bookkeeping for the idle reaper, never transcript content.
+        | AgentEvent::BackgroundTask { .. } => {}
     }
 }
 

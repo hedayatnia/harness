@@ -10,8 +10,10 @@ each app runs its own test against the same files, so neither can drift without 
 | `vectors/home-grouping.json` | project and device sections, the Pinned section | `ParityTests.swift` | `ParityTest.kt` |
 | `ux-contract.json` | user-visible strings and the queue panel's layout numbers | `ParityTests.swift` | `ParityTest.kt` |
 | `vectors/agent-readiness.json` | when an agent counts as brought in (Graff, Claude Code, OpenAI Codex on an online computer), and the download link | `ParityTests.swift` | `ParityTest.kt` |
+| `vectors/run-errors.json` | which run errors read as signed out or limit reached, and their labels (the desktop checks it too, in `harness-proto`'s `run_errors`) | `ParityTests.swift` | not yet |
 | `vectors/registry-projection.json` | which registry rows become devices, projects, sessions and pins, with their defaults and order | `ParityTests.swift` (through `WorkspaceStore`) | `ParityTest.kt` (through the native core, `crates/mobile`) |
 | `vectors/transcript-decode.json` | how a session doc's messages, parts and queue rows decode, and which ones are dropped | `ParityTests.swift` (through `SessionStore`) | `ParityTest.kt` (through the native core) |
+| `vectors/cloud-sandbox.json` | how a cloud sandbox list reads: row titles, details and buttons, hourly rates, size choices, the running summary, and which size a create names (the desktop checks it too, in `harness-ui`'s `codegraff_sandboxes`; its gateway half, from sign-in and call plans to error sentences, runs in the engine, which the phone reaches through one of its computers) | `ParityTests.swift` | not yet |
 | `perf-contract.json` | the operations the performance monitor times, their budgets, and the Performance page copy | `ParityTests.swift` | `ParityTest.kt` |
 | `apps/ios/Harness/Theme/themes.json` | the theme catalog (Android bundles a copy) | `ThemeStoreTests.swift` | `ThemeCatalogTest.kt` |
 
@@ -38,3 +40,7 @@ call: behavior that only exists inside a view has to be pulled out before it can
 
 Known differences that are not pinned: the queue panel shows an image placeholder where iOS decodes the upload, and
 Android's drafts survive navigation but not the process being killed, while iOS keeps them on disk.
+
+The Attachments editor on a queued message (add, preview, replace and remove its images; #187, #493) is iOS-only
+for now. Its copy goes into `ux-contract.json` when the Compose app gets the editor, since the string check would
+otherwise fail the Android build.

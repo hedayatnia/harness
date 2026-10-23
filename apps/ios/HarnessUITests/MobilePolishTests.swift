@@ -11,7 +11,9 @@ final class MobilePolishTests: XCTestCase {
     }
 
     private func launch(_ arguments: [String] = []) {
-        app.launchArguments = ["-demo"] + arguments
+        // These cover the single-session layout. Pin the phone split off: PhoneSplitUITests' "Try it" saves a
+        // split mode in the app's defaults, and a later run would rotate into a side-by-side split instead.
+        app.launchArguments = ["-demo", "-phoneSplit", "off"] + arguments
         app.launch()
     }
 
@@ -116,10 +118,19 @@ final class MobilePolishTests: XCTestCase {
     func testSendClearsComposerAndKeepsTheNextDraft() {
         launch(["-route", "chat:chat-tabs", "-slowstream"])
         composer.tap()
+        let send = app.buttons["composer-send"]
         for (cycle, prompt) in ["Fix teh flicker", "A multiline draft\nwith another line", "Keep emoji 👋🏽 and 你好"].enumerated() {
+            if cycle > 0 {
+                // A message sent during a reply joins the host's queue, which the offline demo does not have:
+                // the composer keeps that draft. Send each prompt once the previous slow reply has settled
+                // (the empty composer's button turns from Stop back to Send).
+                let settled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "Send message"),
+                                                        object: send)
+                XCTAssertEqual(XCTWaiter.wait(for: [settled], timeout: 45), .completed)
+            }
             composer.typeText(prompt)
             XCTAssertEqual(composer.value as? String, prompt)
-            app.buttons["composer-send"].tap()
+            send.tap()
             let cleared = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
                 (self.composer.value as? String ?? "").isEmpty
             }, object: nil)
@@ -140,7 +151,10 @@ final class MobilePolishTests: XCTestCase {
         for (index, project) in ["harness", "edge", "All", "harness", "All"].enumerated() {
             filter.tap()
             if index == 0 { capture("project-menu") }
-            let choice = app.buttons.matching(NSPredicate(format: "label == %@", project)).firstMatch
+            // A row's label carries its owning device ("harness, @ MacBook Pro"), and the home list has its own
+            // "All" status chip, so look for the row inside the open menu.
+            let choice = app.collectionViews.buttons.matching(NSPredicate(
+                format: "label == %@ OR label BEGINSWITH %@", project, "\(project), ")).firstMatch
             XCTAssertTrue(choice.waitForExistence(timeout: 3))
             choice.tap()
             XCTAssertTrue(filter.waitForExistence(timeout: 3))

@@ -205,6 +205,7 @@ fn main() -> anyhow::Result<()> {
                             .any(|entry| entry.status == Some(harness_doc::MessageStatus::Streaming));
                         state.apply_sessions(vec![harness_proto::Session {
                             last_completed_turn: None,
+                            last_completed_peer_only: false,
                             chat_id: "profile".into(),
                             device_id: "local".into(),
                             status: if streaming {

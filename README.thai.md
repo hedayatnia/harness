@@ -4,7 +4,7 @@
 
 <p align="center">พื้นที่ทำงานแบบเนทีฟสำหรับเอเจนต์เขียนโค้ดบนเครื่องของคุณ</p>
 
-<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · <a href="README.hindi.md">हिन्दी</a> · ไทย · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
+<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · <a href="README.es.md">Español</a> · <a href="README.hindi.md">हिन्दी</a> · ไทย · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
 
 Harness รวม **CodeGraff (graff)**, Claude Code, Codex, Cursor, Devin, Grok,
 Hermes, Pi, OpenCode และ Antigravity ไว้ในแอปเดสก์ท็อปเดียว เริ่มใช้งานบนเครื่อง

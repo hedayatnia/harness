@@ -1,39 +1,25 @@
 package harness.codegraff.android.model
 
-// Home list search, status filter and grouping (HomeFilter.swift, HomeGrouping.swift).
-// Search and status narrow the same recency-ordered list the grouping splits into
+// Home list search and grouping (HomeFilter.swift, HomeGrouping.swift).
+// Search narrows the same recency-ordered list the grouping splits into
 // sections, so a search inside "Project" grouping still reads by project.
-
-enum class HomeStatusFilter(val label: String) {
-    All("All"), Attention("Needs you"), Running("Running");
-
-    /** Needs you: a question, an error, or a finished run not yet looked at. */
-    fun matches(indicator: ChatIndicator): Boolean = when (this) {
-        All -> true
-        Attention -> indicator == ChatIndicator.AwaitingInput || indicator == ChatIndicator.Errored || indicator == ChatIndicator.Completed
-        Running -> indicator == ChatIndicator.Working
-    }
-}
 
 /** Names a session is searchable by that live outside the chat itself. */
 data class HomeFilterNames(val project: String?, val device: String)
 
 object HomeFilter {
     /**
-     * Sessions whose status matches and whose title, last message, branch, folder, project or
+     * Sessions whose title, last message, branch, folder, project or
      * device contains every word of [query]: "harness studio" finds the harness sessions on the
      * studio, not every session on either.
      */
     fun apply(
         chats: List<Chat>,
         query: String,
-        status: HomeStatusFilter,
-        indicator: (Chat) -> ChatIndicator,
         names: (Chat) -> HomeFilterNames,
     ): List<Chat> {
         val terms = query.split(Regex("\\s+")).filter { it.isNotEmpty() }
         return chats.filter { chat ->
-            if (!status.matches(indicator(chat))) return@filter false
             if (terms.isEmpty()) return@filter true
             val extra = names(chat)
             val fields = listOfNotNull(

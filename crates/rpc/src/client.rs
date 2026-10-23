@@ -4,9 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{ClientFrame, RpcError, ServerFrame};
 
@@ -124,6 +122,9 @@ pub struct RpcClient {
     shared: Arc<Shared>,
     next_id: AtomicU64,
     reader: tokio::task::JoinHandle<()>,
+    /// Why the transport failed, when it did; set before the reader sees the
+    /// inbound channel close.
+    close_reason: Arc<std::sync::OnceLock<String>>,
 }
 
 /// Owned stream receiver whose drop immediately cancels the server task.
@@ -217,7 +218,15 @@ impl RpcClient {
             shared,
             next_id: AtomicU64::new(1),
             reader,
+            close_reason: Arc::default(),
         }
+    }
+
+    /// Why the connection failed (an oversized frame, a reset socket), once
+    /// calls on it fail with [`RpcError::Closed`]; `None` for a clean close
+    /// or a live connection.
+    pub fn close_reason(&self) -> Option<String> {
+        self.close_reason.get().cloned()
     }
 
     /// Unary request.
@@ -457,38 +466,26 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Dial a WebSocket RPC server (`ws://127.0.0.1:{ipc_port}`).
 pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
-    let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
-        .await
-        .map_err(|_| RpcError::Transport(format!("timed out dialing {url}")))?
-        .map_err(|e| RpcError::Transport(e.to_string()))?;
-    let (mut sink, mut stream) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
+    let (ws, _) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(url, Some(crate::ws::config()), false),
+    )
+    .await
+    .map_err(|_| RpcError::Transport(format!("timed out dialing {url}")))?
+    .map_err(|e| RpcError::Transport(e.to_string()))?;
+    let (out_tx, out_rx) = mpsc::channel::<String>(256);
     let (in_tx, in_rx) = mpsc::channel::<String>(256);
+    let client = RpcClient::new(out_tx, in_rx);
+    let close_reason = client.close_reason.clone();
+    let url = url.to_owned();
     tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                frame = out_rx.recv() => match frame {
-                    Some(text) => {
-                        if sink.send(WsMessage::Text(text)).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => {
-                        let _ = sink.send(WsMessage::Close(None)).await;
-                        break;
-                    }
-                },
-                message = stream.next() => match message {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        if in_tx.send(text).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(_)) => {}
-                },
-            }
+        // Hold `in_tx` until the reason is recorded, so a caller woken by
+        // `RpcError::Closed` already sees it.
+        if let Some(reason) = crate::ws::pump(ws, out_rx, in_tx.clone()).await {
+            tracing::warn!(%reason, %url, "rpc: lost the connection");
+            let _ = close_reason.set(reason);
         }
+        drop(in_tx);
     });
-    Ok(RpcClient::new(out_tx, in_rx))
+    Ok(client)
 }

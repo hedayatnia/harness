@@ -308,7 +308,26 @@ enum TranscriptRowBuilder {
 // MARK: - Tool chip content (transcript.rs tool_chip_content_raw)
 
 extension RenderToolCall {
+    /// Presentation only: keep worker IDs in the underlying call, not its chip.
+    private var subagentControlLabel: String? {
+        guard tag == "unknown", let name = string("name") else { return nil }
+        if name.hasPrefix("Wait for ") || name == "agent_output" { return "Waiting on" }
+        for (prefix, label) in [
+            ("Message agent", "Message"),
+            ("Resume agent", "Resume"),
+            ("Close agent", "Close"),
+        ] {
+            if name == prefix || name.hasPrefix(prefix + " ") { return label }
+        }
+        switch name {
+        case "Send agent message", "agent_message": return "Message"
+        case "subagent_resume": return "Resume"
+        default: return nil
+        }
+    }
+
     var chipLabel: String {
+        if let label = subagentControlLabel { return label }
         switch tag {
         case "exec": return "Run"
         case "readFile": return "Read"
@@ -326,6 +345,7 @@ extension RenderToolCall {
     }
 
     var chipDetail: String {
+        if subagentControlLabel != nil { return "subagent" }
         switch tag {
         case "exec": return string("command") ?? ""
         case "readFile", "writeFile", "editFile": return shortPath(string("path") ?? "")

@@ -7,7 +7,9 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{AnyElement, Context, Render, SharedString, Window, div, prelude::*, px};
-use harness_proto::{ChangeRequestSummary, Chat, CheckoutChangeRequestStatus, Space};
+use harness_proto::{
+    ChangeRequestSummary, Chat, CheckoutChangeRequestStatus, ConversationSourceContext, Space,
+};
 
 use crate::theme::Theme;
 
@@ -54,14 +56,91 @@ impl ChangeRequestBadgeModel {
     }
 }
 
+/// How a branch's PR relates to a chat (#357). A PR is found from the
+/// chat's branch, not recorded against the chat, so it is the chat's own
+/// only when nobody else works on that branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangeRequestProvenance {
+    /// The chat works in its own checkout: not the project's main folder,
+    /// and no other chat uses it. Its branch's PR is the chat's.
+    OwnBranch,
+    /// Found from the branch of a checkout that is the project's main
+    /// folder or that `other_chats` other chats share: the branch's PR,
+    /// which this chat did not necessarily open, update or merge.
+    SharedBranch { other_chats: usize },
+}
+
+impl ChangeRequestProvenance {
+    /// A merged or closed PR found from a shared branch is the branch's
+    /// history, not this chat's status, so it doesn't take a state color.
+    fn mutes(self, summary: &ChangeRequestSummary) -> bool {
+        matches!(self, Self::SharedBranch { .. })
+            && summary.state != harness_proto::ChangeRequestState::Open
+    }
+
+    fn note(self, summary: &ChangeRequestSummary) -> Option<String> {
+        let Self::SharedBranch { other_chats } = self else {
+            return None;
+        };
+        let mut note = format!("Found from branch {}", summary.head_ref);
+        match other_chats {
+            0 => {}
+            1 => note.push_str(", also used by 1 other chat"),
+            n => note.push_str(&format!(", also used by {n} other chats")),
+        }
+        note.push_str(
+            if summary.state == harness_proto::ChangeRequestState::Open {
+                ". Not necessarily this chat's."
+            } else {
+                ". Not necessarily from this chat."
+            },
+        );
+        Some(note)
+    }
+}
+
+/// See [`ChangeRequestProvenance`]. A chat without a current source context
+/// or a project to compare against counts as shared: ownership has to be
+/// shown, not assumed.
+pub(crate) fn change_request_provenance(
+    chat: &Chat,
+    chats: &[Chat],
+    spaces: &[Space],
+) -> ChangeRequestProvenance {
+    let checkout = current_source_context(chat).map(|source| source.checkout_id.as_str());
+    let other_chats = checkout.map_or(0, |checkout| {
+        chats
+            .iter()
+            .filter(|other| other.id != chat.id && !other.archived)
+            .filter(|other| other.device_id == chat.device_id)
+            .filter(|other| {
+                current_source_context(other).is_some_and(|source| source.checkout_id == checkout)
+            })
+            .count()
+    });
+    let project_checkout = chat
+        .space_id
+        .as_deref()
+        .and_then(|id| spaces.iter().find(|space| space.id == id))
+        .map(|space| space.checkout_id.as_deref());
+    match (checkout, project_checkout) {
+        (Some(checkout), Some(main)) if other_chats == 0 && main != Some(checkout) => {
+            ChangeRequestProvenance::OwnBranch
+        }
+        _ => ChangeRequestProvenance::SharedBranch { other_chats },
+    }
+}
+
 pub(crate) struct ChangeRequestTooltip {
     model: ChangeRequestBadgeModel,
+    note: Option<String>,
 }
 
 impl ChangeRequestTooltip {
-    pub fn new(summary: &ChangeRequestSummary) -> Self {
+    pub fn new(summary: &ChangeRequestSummary, provenance: ChangeRequestProvenance) -> Self {
         Self {
             model: ChangeRequestBadgeModel::from_summary(summary),
+            note: provenance.note(summary),
         }
     }
 }
@@ -99,7 +178,15 @@ impl Render for ChangeRequestTooltip {
                     .text_size(px(11.0))
                     .text_color(theme.text_muted)
                     .child(self.model.title.clone()),
-            );
+            )
+            .when_some(self.note.clone(), |card, note| {
+                card.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.8))
+                        .child(SharedString::from(note)),
+                )
+            });
         crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
     }
 }
@@ -113,42 +200,50 @@ pub(crate) enum ChangeRequestBadgeSurface {
 pub(crate) fn pull_request_badge(
     id: SharedString,
     summary: ChangeRequestSummary,
+    provenance: ChangeRequestProvenance,
     surface: ChangeRequestBadgeSurface,
     theme: &Theme,
 ) -> AnyElement {
-    pull_request_badge_with_query(id, summary, surface, None, theme)
+    pull_request_badge_with_query(id, summary, provenance, surface, None, theme)
 }
 
 pub(crate) fn pull_request_badge_with_query(
     id: SharedString,
     summary: ChangeRequestSummary,
+    provenance: ChangeRequestProvenance,
     surface: ChangeRequestBadgeSurface,
     query: Option<&str>,
     theme: &Theme,
 ) -> AnyElement {
-    render_pull_request_badge(id, summary, surface, query, true, theme)
+    render_pull_request_badge(id, summary, provenance, surface, query, true, theme)
 }
 
 /// The same badge geometry without hover, tooltip, or click behavior in drag previews.
 pub(crate) fn pull_request_badge_preview(
     id: SharedString,
     summary: ChangeRequestSummary,
+    provenance: ChangeRequestProvenance,
     surface: ChangeRequestBadgeSurface,
     theme: &Theme,
 ) -> AnyElement {
-    render_pull_request_badge(id, summary, surface, None, false, theme)
+    render_pull_request_badge(id, summary, provenance, surface, None, false, theme)
 }
 
 fn render_pull_request_badge(
     id: SharedString,
     summary: ChangeRequestSummary,
+    provenance: ChangeRequestProvenance,
     surface: ChangeRequestBadgeSurface,
     query: Option<&str>,
     interactive: bool,
     theme: &Theme,
 ) -> AnyElement {
     let model = ChangeRequestBadgeModel::from_summary(&summary);
-    let color = model.tone.color(theme);
+    let color = if provenance.mutes(&summary) {
+        theme.text_muted
+    } else {
+        model.tone.color(theme)
+    };
     let url = summary.url.clone();
     let tooltip_summary = summary;
     let composer = surface == ChangeRequestBadgeSurface::Composer;
@@ -175,7 +270,7 @@ fn render_pull_request_badge(
                     cx.open_url(&url);
                 })
                 .tooltip(move |_, cx| {
-                    cx.new(|_| ChangeRequestTooltip::new(&tooltip_summary))
+                    cx.new(|_| ChangeRequestTooltip::new(&tooltip_summary, provenance))
                         .into()
                 })
                 .tooltip_show_delay(std::time::Duration::from_millis(350))
@@ -274,7 +369,7 @@ pub(crate) fn desired_watch_targets(
         .filter(|chat| !chat.archived)
         .filter(|chat| !is_unsupported(&chat.device_id))
         .filter_map(|chat| {
-            let source = chat.source_context.as_ref()?;
+            let source = current_source_context(chat)?;
             let (cwd, branch, checkout_id) = (
                 source.repo_root.as_str(),
                 source.branch.as_str(),
@@ -312,6 +407,29 @@ pub(crate) fn watch_params(
     params
 }
 
+/// `MergeChangeRequest` params: the checkout and branch this chat's badge
+/// watches, routed to the chat's device. The host re-resolves the branch and
+/// merges only while `number` is still its open pull request.
+pub(crate) fn merge_params(
+    chat: &Chat,
+    number: u64,
+    local_device_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    let source = chat.source_context.as_ref()?;
+    if source.branch.trim().is_empty() {
+        return None;
+    }
+    let target = ChangeRequestWatchKey {
+        device_id: chat.device_id.clone(),
+        cwd: source.repo_root.clone(),
+        branch: source.branch.clone(),
+        checkout_id: None,
+    };
+    let mut params = watch_params(&target, local_device_id);
+    params["number"] = number.into();
+    Some(params)
+}
+
 /// Resolve a snapshot for a row without trusting the cache key alone.
 ///
 /// Only conversation-owned source context is trusted. Legacy scalar metadata
@@ -325,13 +443,9 @@ pub fn change_request_for_chat<'a>(
     if branch.is_empty() {
         return None;
     }
-    let source = chat.source_context.as_ref()?;
+    let source = current_source_context(chat)?;
     let cwd = source.repo_root.as_str();
-    let checkout_id = chat
-        .source_context
-        .as_ref()
-        .map(|source| source.checkout_id.as_str())
-        .or(chat.checkout_id.as_deref());
+    let checkout_id = Some(source.checkout_id.as_str());
 
     snapshots
         .into_iter()
@@ -350,10 +464,26 @@ pub fn change_request_for_chat<'a>(
 /// rows are intentionally rejected: their scalar branch may describe an old
 /// state of either a shared checkout or a worktree.
 pub(crate) fn conversation_branch<'a>(chat: &'a Chat, _spaces: &'a [Space]) -> Option<&'a str> {
-    chat.source_context
-        .as_ref()
+    current_source_context(chat)
         .map(|source| source.branch.as_str())
         .filter(|branch| !branch.trim().is_empty())
+}
+
+/// The chat's source context when it describes where the chat runs now
+/// (#356). Not when the latest accepted run could not observe its checkout,
+/// and not after the chat was moved to another folder that no run has
+/// observed yet: the last known context then belongs to the old place.
+pub(crate) fn current_source_context(chat: &Chat) -> Option<&ConversationSourceContext> {
+    let source = chat.source_context.as_ref()?;
+    if chat.source_context_unavailable_at.is_some() {
+        return None;
+    }
+    let same_folder =
+        |cwd: &str| cwd.trim_end_matches(['/', '\\']) == source.cwd.trim_end_matches(['/', '\\']);
+    if chat.cwd.as_deref().is_some_and(|cwd| !same_folder(cwd)) {
+        return None;
+    }
+    Some(source)
 }
 
 #[cfg(test)]
@@ -384,6 +514,7 @@ mod tests {
             space_id: Some("space".into()),
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
         }
     }
 
@@ -431,6 +562,95 @@ mod tests {
         chat
     }
 
+    /// #357: a branch's PR is a chat's own only when the chat works in its
+    /// own checkout; otherwise it is labelled as found from the branch, and
+    /// merged or closed it is shown without a state color.
+    #[test]
+    fn a_branch_pull_request_is_a_chats_own_only_in_its_own_checkout() {
+        use ChangeRequestProvenance::{OwnBranch, SharedBranch};
+        let spaces = [space("local")];
+        let in_worktree = |id: &str, checkout: &str| {
+            let mut chat = with_source(chat(id, "local", Some("/repo"), None), "feature/pr");
+            chat.source_context.as_mut().unwrap().checkout_id = checkout.into();
+            chat
+        };
+        let own = in_worktree("own", "worktree-1");
+        assert_eq!(
+            change_request_provenance(&own, &[own.clone()], &spaces),
+            OwnBranch
+        );
+
+        let peer = in_worktree("peer", "worktree-1");
+        let chats = [own.clone(), peer];
+        assert_eq!(
+            change_request_provenance(&own, &chats, &spaces),
+            SharedBranch { other_chats: 1 },
+            "two chats in one checkout share its branch"
+        );
+
+        let main = in_worktree("main", "checkout");
+        assert_eq!(
+            change_request_provenance(&main, &[main.clone()], &spaces),
+            SharedBranch { other_chats: 0 },
+            "the project's own folder is shared by whoever checks a branch out there"
+        );
+        assert_eq!(
+            change_request_provenance(&own, &[own.clone()], &[]),
+            SharedBranch { other_chats: 0 },
+            "no project to compare against: not assumed to be the chat's"
+        );
+
+        let mut merged = snapshot("local", "/repo", "checkout")
+            .change_request
+            .unwrap();
+        merged.state = ChangeRequestState::Merged;
+        let open = snapshot("local", "/repo", "checkout")
+            .change_request
+            .unwrap();
+        let shared = SharedBranch { other_chats: 2 };
+        assert!(shared.mutes(&merged));
+        assert!(!shared.mutes(&open));
+        assert!(!OwnBranch.mutes(&merged));
+        assert_eq!(OwnBranch.note(&merged), None);
+        assert_eq!(
+            shared.note(&merged).as_deref(),
+            Some(
+                "Found from branch feature/pr, also used by 2 other chats. Not necessarily from this chat."
+            )
+        );
+        assert_eq!(
+            SharedBranch { other_chats: 0 }.note(&open).as_deref(),
+            Some("Found from branch feature/pr. Not necessarily this chat's.")
+        );
+    }
+
+    /// #356: a context the latest run could not confirm, or one left behind
+    /// by a move to another folder, is history, not where the chat runs.
+    #[test]
+    fn only_a_current_source_context_finds_a_pull_request() {
+        let current = with_source(chat("chat", "local", Some("/repo"), None), "feature/pr");
+        let snapshot = snapshot("local", "/repo", "checkout");
+        assert!(change_request_for_chat(&current, &[], [&snapshot]).is_some());
+
+        let mut unavailable = current.clone();
+        unavailable.source_context_unavailable_at = Some(Utc.timestamp_opt(3, 0).unwrap());
+        assert!(change_request_for_chat(&unavailable, &[], [&snapshot]).is_none());
+        assert_eq!(conversation_branch(&unavailable, &[]), None);
+        assert!(desired_watch_targets(&[unavailable], &[], |_| false).is_empty());
+
+        let mut moved = current.clone();
+        moved.cwd = Some("/elsewhere".into());
+        assert!(change_request_for_chat(&moved, &[], [&snapshot]).is_none());
+        assert!(desired_watch_targets(&[moved], &[], |_| false).is_empty());
+
+        let mut trailing = current;
+        trailing.cwd = Some("/repo/".into());
+        assert!(
+            change_request_for_chat(&trailing, &[], [&snapshot]).is_some(),
+            "the same folder spelled with a trailing slash"
+        );
+    }
+
     #[test]
     fn shared_checkout_keeps_conversation_branches_independent() {
         let first = with_source(chat("first", "local", Some("/repo"), None), "feature/one");
@@ -447,6 +667,28 @@ mod tests {
             Some(90)
         );
         assert!(change_request_for_chat(&second, &[], [&first_snapshot]).is_none());
+    }
+
+    #[test]
+    fn merge_targets_the_badge_checkout_and_routes_to_the_chat_device() {
+        let local = with_source(chat("chat", "local", Some("/repo/wt"), None), "feature/pr");
+        assert_eq!(
+            merge_params(&local, 90, Some("local")),
+            Some(serde_json::json!({ "cwd": "/repo", "branch": "feature/pr", "number": 90 }))
+        );
+        let remote = with_source(chat("chat", "remote", Some("/repo"), None), "feature/pr");
+        assert_eq!(
+            merge_params(&remote, 90, Some("local")).unwrap()["targetDeviceId"],
+            "remote"
+        );
+        assert!(
+            merge_params(
+                &chat("chat", "local", Some("/repo"), None),
+                90,
+                Some("local")
+            )
+            .is_none()
+        );
     }
 
     #[test]

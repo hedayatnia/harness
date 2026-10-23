@@ -7,7 +7,8 @@
     "dev": "wrangler dev --port 27640 --var AUTH_MODE:dev",
     "deploy": "sh scripts/deploy.sh",
     "build": "wrangler deploy --dry-run --outdir dist",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit",
     "test": "npm run test:unit && npm run test:workerd",
     "test:unit": "vitest run",
     "test:workerd": "vitest run -c vitest.workerd.config.ts",
@@ -25,6 +26,7 @@
     "@types/pg": "^8.23.1",
     "loro-adaptors": "^0.6.1",
     "loro-websocket": "^0.6.2",
+    "tsrs": "0.18.0-ts7.1.0-dev.20260929",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10",
     "wrangler": "^4.111.0"

@@ -409,7 +409,29 @@ impl SessionDoc {
         let next = harness_proto::ContextUsage {
             tokens: tokens.or(previous.tokens),
             window: window.filter(|n| *n > 0).or(previous.window),
+            ..previous
         };
+        self.write_context_usage(previous, next)
+    }
+
+    /// The agent's latest cumulative savings replace the previous ones.
+    pub fn update_context_savings(
+        &self,
+        savings: harness_proto::ContextSavings,
+    ) -> Result<(), DocError> {
+        let previous = self.context_usage().unwrap_or_default();
+        let next = harness_proto::ContextUsage {
+            savings: Some(savings),
+            ..previous
+        };
+        self.write_context_usage(previous, next)
+    }
+
+    fn write_context_usage(
+        &self,
+        previous: harness_proto::ContextUsage,
+        next: harness_proto::ContextUsage,
+    ) -> Result<(), DocError> {
         if next != previous {
             self.doc
                 .get_map("meta")
@@ -2534,11 +2556,22 @@ mod context_usage_tests {
             replica.context_usage(),
             Some(harness_proto::ContextUsage {
                 tokens: Some(0),
-                window: Some(200_000)
+                window: Some(200_000),
+                savings: None,
             })
         );
         host.update_context_usage(None, Some(1_000_000)).unwrap();
         assert_eq!(host.context_usage().unwrap().tokens, Some(0));
+        // Savings replace the previous snapshot and survive later meter updates.
+        let savings = harness_proto::ContextSavings {
+            handle_bytes: 4_000,
+            compacted_tokens: 9_000,
+            cache_read_tokens: 0,
+        };
+        host.update_context_savings(savings).unwrap();
+        host.update_context_usage(Some(5), None).unwrap();
+        assert_eq!(host.context_usage().unwrap().savings, Some(savings));
+        assert_eq!(host.context_usage().unwrap().tokens, Some(5));
         let rebuilt = crate::rebuild_thin_doc(&host).unwrap().doc;
         assert_eq!(rebuilt.context_usage(), host.context_usage());
         rebuilt.clear_context_usage().unwrap();

@@ -4,7 +4,7 @@
 
 <p align="center">Ruang kerja natif untuk ejen pengekodan pada peranti anda.</p>
 
-<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · <a href="README.hindi.md">हिन्दी</a> · <a href="README.thai.md">ไทย</a> · <a href="README.indo.md">Bahasa Indonesia</a> · Bahasa Melayu</p>
+<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · <a href="README.es.md">Español</a> · <a href="README.hindi.md">हिन्दी</a> · <a href="README.thai.md">ไทย</a> · <a href="README.indo.md">Bahasa Indonesia</a> · Bahasa Melayu</p>
 
 Harness menyatukan **CodeGraff (graff)**, Claude Code, Codex, Cursor, Devin,
 Grok, Hermes, Pi, OpenCode dan Antigravity dalam satu aplikasi desktop.

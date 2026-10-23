@@ -69,6 +69,18 @@ pub struct HlcClock {
 }
 
 impl HlcClock {
+    fn observe(&mut self, hlc: &str) {
+        let mut parts = hlc.splitn(3, '-');
+        if let (Some(ms), Some(counter)) = (parts.next(), parts.next()) {
+            if let (Ok(ms), Ok(counter)) = (ms.parse::<i64>(), counter.parse::<u32>()) {
+                if (ms, counter) > (self.last_ms, self.counter) {
+                    self.last_ms = ms;
+                    self.counter = counter;
+                }
+            }
+        }
+    }
+
     fn next(&mut self, now_ms: i64, device: &str) -> String {
         if now_ms > self.last_ms {
             self.last_ms = now_ms;
@@ -1041,6 +1053,61 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// Automatic archive-on-close keeps the close intent's time, not the later
+    /// RPC arrival time. Sends win same-millisecond ties conservatively.
+    pub fn archive_chat_at(&mut self, chat_id: &str, requested_at_ms: i64) -> Result<bool, DocError> {
+        let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
+            return Ok(false);
+        };
+        let clock = encode_hlc(requested_at_ms, 0, &self.device_id);
+        self.clock.observe(&clock);
+        if hlc_newer(&clock, row.clocks.get("archived").map(String::as_str)) {
+            self.enqueue_ops(vec![RowOp {
+                kind: KIND_CHATS.to_string(),
+                id: chat_id.to_string(),
+                op: OpKind::Update,
+                set: Some(fields([("archived", json!(true))])),
+                hlc: clock,
+                clocks: None,
+            }]);
+        }
+        Ok(true)
+    }
+
+    /// Reserve send ordering before attempting a restore, including while the
+    /// chat row is absent. A retry must not acquire a newer archive-field clock.
+    pub fn chat_prompt_clock(&mut self, chat_id: &str) -> String {
+        if let Some(row) = self.overlay_row(KIND_CHATS, chat_id) {
+            if let Some(clock) = row.clocks.get("archived") {
+                self.clock.observe(clock);
+            }
+        }
+        // Counter zero is reserved for timestamped automatic close intents;
+        // a prompt wins an ambiguous same-millisecond close on any device.
+        self.next_hlc();
+        self.next_hlc()
+    }
+
+    /// Apply the original send intent, never a fresh write at retry time.
+    /// `false` means metadata has not arrived; no partial chat is fabricated.
+    pub fn restore_chat_on_send(&mut self, chat_id: &str, clock: &str) -> Result<bool, DocError> {
+        let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
+            return Ok(false);
+        };
+        self.clock.observe(clock);
+        if hlc_newer(clock, row.clocks.get("archived").map(String::as_str)) {
+            self.enqueue_ops(vec![RowOp {
+                kind: KIND_CHATS.to_string(),
+                id: chat_id.to_string(),
+                op: OpKind::Update,
+                set: Some(fields([("archived", json!(false))])),
+                hlc: clock.to_string(),
+                clocks: None,
+            }]);
+        }
+        Ok(true)
+    }
+
     /// Flip the chat's sync room generation (docs/chat2-sync.md M2). The
     /// host calls this in the same breath as seeding the chat2 checkpoint;
     /// LWW per-field like every registry write, so the flip is per-chat and
@@ -1085,9 +1152,29 @@ impl RegistryDoc {
             OpKind::Update,
             fields([
                 ("sourceContext", serde_json::to_value(context)?),
+                ("sourceContextUnavailableAt", Value::Null),
                 ("branch", json!(context.branch)),
                 ("checkoutId", json!(context.checkout_id)),
             ]),
+        );
+        Ok(true)
+    }
+
+    /// The chat's latest accepted run could not observe its checkout. The
+    /// last known context stays for history, qualified as not current.
+    pub fn mark_chat_source_context_unavailable(
+        &mut self,
+        chat_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("sourceContextUnavailableAt", json!(at.timestamp_millis()))]),
         );
         Ok(true)
     }
@@ -1223,6 +1310,10 @@ impl RegistryDoc {
             ("deviceId", json!(session.device_id)),
             ("status", serde_json::to_value(session.status)?),
             ("lastCompletedTurn", json!(session.last_completed_turn)),
+            (
+                "lastCompletedPeerOnly",
+                json!(session.last_completed_peer_only),
+            ),
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
         ]);
@@ -1398,6 +1489,10 @@ impl RegistryDoc {
                     ("deviceId", json!(session.device_id)),
                     ("status", serde_json::to_value(session.status)?),
                     ("lastCompletedTurn", json!(session.last_completed_turn)),
+                    (
+                        "lastCompletedPeerOnly",
+                        json!(session.last_completed_peer_only),
+                    ),
                     ("startedAt", opt_ms(session.started_at)),
                     ("updatedAt", json!(session.updated_at.timestamp_millis())),
                 ]),
@@ -1461,3 +1556,5 @@ fn row_to<T: serde::de::DeserializeOwned>(row: &RegistryRow) -> Option<T> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod prompt_restore_tests;

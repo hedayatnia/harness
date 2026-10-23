@@ -74,6 +74,9 @@ final class SessionStore {
     @ObservationIgnored private var firstContactQueued = false
     @ObservationIgnored private(set) var outbox: [(batchId: String, bytes: Data)] = []
     @ObservationIgnored private var admitted: Set<String> = []
+    /// A command was queued since the outbox last drained: nudge the host
+    /// again once it does (see `queueCommand`).
+    @ObservationIgnored private(set) var nudgeWhenOutboxDrains = false
     private(set) var snapshotBytes = 0
     private(set) var viewAttached = false
     var keepsParseCacheWarm = false
@@ -271,8 +274,7 @@ final class SessionStore {
                 return Self.containsFrontier(frontier, in: self.doc)
             },
             applyCheckpoint: { [weak self] bytes, seq in
-                guard let self,
-                      (try? self.doc.importWith(bytes: bytes, origin: "remote")) != nil else {
+                guard let self, await self.importRemote(bytes) else {
                     return false
                 }
                 self.cursor = max(self.cursor, seq)
@@ -285,8 +287,18 @@ final class SessionStore {
                 // Malformed remote bytes cost the row, never the doc. The
                 // cursor still advances: replaying a poison row forever is
                 // the wedge class chat2 replaces.
-                if (try? self.doc.importWith(bytes: bytes, origin: "remote")) == nil {
+                if !(await self.importRemote(bytes)) {
                     roomLog.warning("chat2 \(self.chatId, privacy: .public): row import failed; skipping row \(seq)")
+                }
+                self.cursor = max(self.cursor, seq)
+                self.project()
+                self.saver?.poke()
+            },
+            applyRows: { [weak self] rows, seq in
+                guard let self else { return }
+                let failed = await self.importRemote(batch: rows)
+                if failed > 0 {
+                    roomLog.warning("chat2 \(self.chatId, privacy: .public): \(failed) of \(rows.count) row import(s) failed; skipped through row \(seq)")
                 }
                 self.cursor = max(self.cursor, seq)
                 self.project()
@@ -383,6 +395,10 @@ final class SessionStore {
         admitted.remove(batchId)
         if outbox.count != oldCount {
             saver?.poke()
+        }
+        if nudgeWhenOutboxDrains && outbox.isEmpty {
+            nudgeWhenOutboxDrains = false
+            nudgeHost()
         }
     }
 
@@ -645,6 +661,36 @@ final class SessionStore {
                 }
             }
         }
+    }
+
+    /// Import remote bytes into the doc, off the main actor.
+    ///
+    /// An import whose ops are concurrent with ours (a command the host had
+    /// not yet seen) makes Loro rebuild each changed text from its whole
+    /// history. On a long streamed reply that is seconds per row, and on the
+    /// main actor a catch-up of many rows exhausted the 10 s scene-update
+    /// watchdog and the app was killed (#484). The doc is safe to use from
+    /// any thread; `subscribeRoot`'s EntryCache takes its own lock.
+    private func importRemote(_ bytes: Data) async -> Bool {
+        let doc = self.doc
+        return await Task.detached(priority: .userInitiated) {
+            (try? doc.importWith(bytes: bytes, origin: "remote")) != nil
+        }.value
+    }
+
+    /// Several rows in one import, so a rebuild happens once for the run.
+    /// If the batch is rejected, each row is retried alone so a malformed
+    /// row costs only itself. Returns how many rows failed.
+    private func importRemote(batch rows: [Data]) async -> Int {
+        guard rows.count > 1 else {
+            guard let row = rows.first else { return 0 }
+            return await importRemote(row) ? 0 : 1
+        }
+        let doc = self.doc
+        return await Task.detached(priority: .userInitiated) {
+            if (try? doc.importBatch(bytes: rows)) != nil { return 0 }
+            return rows.filter { (try? doc.importWith(bytes: $0, origin: "remote")) == nil }.count
+        }.value
     }
 
     private func apply(_ decoded: [MessageEntry], queue decodedQueue: [QueuedMessage] = []) {
@@ -917,6 +963,11 @@ final class SessionStore {
             doc.commit()
         } catch {}
         nudgeHost()
+        // That nudge can reach the host before this row reaches the room; the
+        // host then catches up, finds nothing to run and goes idle (#412).
+        // The commit's batch joins the outbox on the next main-actor turn, so
+        // arm after it and nudge again once the room has acknowledged it.
+        Task { @MainActor [weak self] in self?.nudgeWhenOutboxDrains = true }
     }
 
     /// Durable-nudge the host device so a cold host opens the doc and drains
@@ -1063,6 +1114,31 @@ final class SessionStore {
         kickRoom()
         nudgeHost()
         respawnEscorts()
+    }
+
+    /// Pending sends no command can run any more (#413): none of this
+    /// device's attempts for the message is still pending and unexpired. A
+    /// missed delivery deadline is not one of these; the host can adopt a
+    /// pending command at any time until it expires.
+    func undeliverableSends(now: Int64) -> Set<String> {
+        guard !pendingSends.isEmpty else { return [] }
+        let commands = doc.getList(id: "commands").getDeepValue().listValue ?? []
+        return Self.undeliverable(pending: pendingSends.map(\.messageId), commands: commands,
+                                  deviceId: config.deviceId, now: now)
+    }
+
+    nonisolated static func undeliverable(pending: [String], commands: [LoroValue],
+                                          deviceId: String, now: Int64) -> Set<String> {
+        var live: Set<String> = []
+        for value in commands {
+            guard let m = value.mapValue,
+                  m["issuedBy"]?.stringValue == deviceId,
+                  let messageId = m["payload"]?.mapValue?["messageId"]?.stringValue,
+                  (m["status"]?.stringValue ?? "pending") == "pending" else { continue }
+            if let expires = m["expiresAt"]?.i64Value, expires <= now { continue }
+            live.insert(messageId)
+        }
+        return Set(pending).subtracting(live)
     }
 
     /// PR #172's retry semantics, phone half: exactly-once is per command

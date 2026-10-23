@@ -84,6 +84,110 @@ async fn run_to_first_done(
     .expect("run finished in time")
 }
 
+fn completed(events: &[AgentEvent]) -> bool {
+    matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    )
+}
+
+/// A fake shim whose models mode first runs `models_prelude`.
+fn shim_with_models_prelude(dir: &std::path::Path, models_prelude: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shim = dir.join("shim.sh");
+    let source = include_str!("fixtures/fake-cursor-shim.sh").replacen(
+        "if [ \"$1\" = \"models\" ]; then",
+        &format!("if [ \"$1\" = \"models\" ]; then\n{models_prelude}"),
+        1,
+    );
+    std::fs::write(&shim, source).unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    shim
+}
+
+#[tokio::test]
+async fn run_sends_catalog_defaults_when_options_are_implicit() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:model-default");
+    req.model = Some("auto-smart".into());
+    let events = run_to_first_done(&harness(), req, controls).await;
+    assert!(completed(&events), "{events:?}");
+}
+
+#[tokio::test]
+async fn run_preserves_explicit_options_over_catalog_defaults() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:model-override");
+    req.model = Some("auto-smart".into());
+    req.model_options
+        .insert("optimize_for".into(), serde_json::json!("intelligence"));
+    let events = run_to_first_done(&harness(), req, controls).await;
+    assert!(completed(&events), "{events:?}");
+}
+
+#[tokio::test]
+async fn run_preserves_legacy_auto_options_without_duplicate_defaults() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:model-legacy");
+    req.model = Some("auto-smart".into());
+    req.model_options
+        .insert("optimizeFor".into(), serde_json::json!("speed"));
+    let events = run_to_first_done(&harness(), req, controls).await;
+    assert!(completed(&events), "{events:?}");
+}
+
+#[tokio::test]
+async fn catalog_failure_does_not_block_an_existing_model_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let shim = shim_with_models_prelude(
+        dir.path(),
+        "  emit '{\"ev\":\"fatal\",\"message\":\"rate limit\"}'\n  exit 1",
+    );
+    let harness = CursorHarness::new().with_executable(shim);
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:model-override");
+    req.model = Some("auto-smart".into());
+    req.model_options
+        .insert("optimize_for".into(), serde_json::json!("intelligence"));
+    let events = run_to_first_done(&harness, req, controls).await;
+    assert!(completed(&events), "{events:?}");
+}
+
+/// The backend can reject the Max Mode variant its own catalog marks
+/// default, so such models keep the bare id.
+#[tokio::test]
+async fn max_mode_defaults_are_not_sent() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:model-maxmode");
+    req.model = Some("grok-4.7".into());
+    let events = run_to_first_done(&harness(), req, controls).await;
+    assert!(completed(&events), "{events:?}");
+}
+
+#[tokio::test]
+async fn runs_use_the_loaded_catalog_without_refreshing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let probes = dir.path().join("probes");
+    let shim = shim_with_models_prelude(
+        dir.path(),
+        &format!("  echo probe >> '{}'", probes.display()),
+    );
+    let harness = CursorHarness::new().with_executable(shim);
+    harness.models().await.expect("catalog loads");
+    for _ in 0..2 {
+        let (controls, _steer, _token) = controls();
+        let mut req = request("scenario:model-default");
+        req.model = Some("auto-smart".into());
+        let events = run_to_first_done(&harness, req, controls).await;
+        assert!(completed(&events), "{events:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&probes).unwrap().lines().count(), 1);
+}
+
 #[tokio::test]
 async fn happy_path_maps_shim_frames_and_tags_subagents() {
     let (controls, _steer, _token) = controls();
@@ -298,7 +402,7 @@ async fn shim_crash_mid_run_reports_stderr_tail() {
 async fn model_discovery_maps_the_live_catalog() {
     let models = harness().models().await.expect("models");
     // Parameterized Auto first; its bare `default` alias twin skipped.
-    assert_eq!(models.len(), 2, "{models:?}");
+    assert_eq!(models.len(), 3, "{models:?}");
     assert_eq!(models[0].id, "auto-smart");
     assert_eq!(models[0].label, "Auto");
     let optimize = &models[0].options[0];

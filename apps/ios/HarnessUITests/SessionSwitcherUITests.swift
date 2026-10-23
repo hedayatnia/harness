@@ -48,6 +48,6 @@ final class SessionSwitcherUITests: XCTestCase {
         // Jumping swaps the session: one Back returns Home.
         XCTAssertTrue(app.buttons["session-switcher"].waitForExistence(timeout: 10))
         app.navigationBars.buttons.element(boundBy: 0).tap()
-        XCTAssertTrue(app.buttons["home-status-all"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["home-group-by"].waitForExistence(timeout: 5))
     }
 }

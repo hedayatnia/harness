@@ -2486,6 +2486,21 @@ unsafe fn is_ime_input_source_active() -> bool {
     }
 }
 
+/// Key presses that waited at least this long for the main thread are logged:
+/// a content-free trace of a UI stall, with how long input sat queued.
+const LATE_KEY_EVENT_LOG_AFTER: Duration = Duration::from_secs(1);
+
+/// How long `native_event` waited between AppKit recording it and this
+/// dispatch. Both clocks are seconds of system uptime, which stops during
+/// sleep, so a sleep never reads as a wait.
+unsafe fn native_event_age(native_event: id) -> Option<Duration> {
+    let recorded: f64 = unsafe { msg_send![native_event, timestamp] };
+    let process_info: id = unsafe { msg_send![class!(NSProcessInfo), processInfo] };
+    let now: f64 = unsafe { msg_send![process_info, systemUptime] };
+    let age = now - recorded;
+    (recorded > 0.0 && age.is_finite() && age >= 0.0).then(|| Duration::from_secs_f64(age))
+}
+
 extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: bool) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
@@ -2497,10 +2512,20 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
         return NO;
     };
 
+    let age = unsafe { native_event_age(native_event) };
+    if let (PlatformInput::KeyDown(_), Some(age)) = (&event, age)
+        && age >= LATE_KEY_EVENT_LOG_AFTER
+    {
+        log::warn!(
+            "key press reached the app {:.1}s after it was pressed; the main thread was blocked",
+            age.as_secs_f64()
+        );
+    }
+
     let run_callback = |event: PlatformInput| -> BOOL {
         let mut callback = window_state.as_ref().lock().event_callback.take();
         let handled: BOOL = if let Some(callback) = callback.as_mut() {
-            !callback(event).propagate as BOOL
+            gpui::with_input_event_age(age, || !callback(event).propagate as BOOL)
         } else {
             NO
         };

@@ -205,6 +205,7 @@ pub mod graff_bundle;
 mod graff_beta;
 pub(crate) mod executable;
 pub mod install;
+pub mod interrupt_reason;
 pub(crate) mod jsonrpc;
 pub mod mock;
 mod model_context;

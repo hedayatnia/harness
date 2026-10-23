@@ -35,7 +35,6 @@ import androidx.compose.ui.unit.dp
 import harness.codegraff.android.WorkspaceState
 import harness.codegraff.android.model.Chat
 import harness.codegraff.android.model.ChatIndicator
-import harness.codegraff.android.model.HomeStatusFilter
 import harness.codegraff.android.model.sortActive
 import harness.codegraff.android.theme.opacity
 import harness.codegraff.android.theme.Theme
@@ -72,9 +71,6 @@ class JuggledSessions(state: WorkspaceState) {
 
     fun others(chatId: String?): List<Chat> = chats.filter { it.id != chatId }
 
-    fun count(filter: HomeStatusFilter, excluding: String?): Int =
-        others(excluding).count { filter.matches(indicator(it)) }
-
     companion object {
         /** A session called this recently stays even once it's idle. */
         const val RECENT_WINDOW_MS = 3L * 60 * 60 * 1000
@@ -86,8 +82,7 @@ private const val MAX_DOTS = 6
 
 /**
  * Floating glass pill: one status dot per juggled session, in order, with the open one ringed.
- * Home adds "2 need you · 1 running"; the session screen keeps just the dots, sharing the
- * bottom with the composer.
+ * On the session screen it shares the bottom with the composer.
  */
 @Composable
 fun SessionSwitcherPill(state: WorkspaceState, current: String?, compact: Boolean, modifier: Modifier = Modifier) {
@@ -96,8 +91,7 @@ fun SessionSwitcherPill(state: WorkspaceState, current: String?, compact: Boolea
     var showSheet by remember { mutableStateOf(false) }
     val haptics = rememberHaptics()
     val p = Theme.palette
-    val summary = summaryText(juggled, current)
-    val description = "${juggled.others(current).size} other sessions" + (summary?.let { ", $it" } ?: "")
+    val description = "${juggled.others(current).size} other sessions"
 
     AnimatedVisibility(hasOthers, modifier, enter = fadeIn() + scaleIn(initialScale = 0.9f), exit = fadeOut() + scaleOut(targetScale = 0.9f)) {
         Row(
@@ -123,7 +117,6 @@ fun SessionSwitcherPill(state: WorkspaceState, current: String?, compact: Boolea
                 val extra = juggled.chats.size - shown.size
                 if (extra > 0) Text("+$extra", style = sans(12f, FontWeight.Medium), color = p.textMuted)
             }
-            if (!compact && summary != null) Text(summary, style = sans(14f, FontWeight.Medium), color = p.text)
         }
     }
     if (showSheet) SessionSwitcherSheet(state, current) { showSheet = false }
@@ -142,16 +135,6 @@ private fun StatusMark(indicator: ChatIndicator) {
             Box(Modifier.size(7.dp).background(p.warning, CircleShape))
         ChatIndicator.Idle -> Box(Modifier.size(7.dp).background(p.ink(0.25f), CircleShape))
     }
-}
-
-private fun summaryText(juggled: JuggledSessions, current: String?): String? {
-    val needsYou = juggled.count(HomeStatusFilter.Attention, current)
-    val running = juggled.count(HomeStatusFilter.Running, current)
-    val parts = buildList {
-        if (needsYou > 0) add("$needsYou need you")
-        if (running > 0) add("$running running")
-    }
-    return parts.takeIf { it.isNotEmpty() }?.joinToString(" · ")
 }
 
 /** The pill's list: the juggled sessions in the same order, the open one marked. Picking a row jumps there. */

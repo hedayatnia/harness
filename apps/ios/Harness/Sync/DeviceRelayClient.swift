@@ -319,14 +319,18 @@ actor DeviceRelayClient {
     /// suits interactive calls (the engine itself caps folder listing at 6s);
     /// attachment uploads pass longer ones (first chunk 90s for a cold dial,
     /// commit 150s to outlast the cross-device assemble — desktop state.ts).
+    /// `retry: false` for a call that must not run twice (a create): a link that drops after
+    /// the request went out would otherwise send it again.
     func call<Response: Decodable>(method: String, params: [String: Any],
-                                   timeoutSeconds: UInt64 = 10) async throws -> Response {
-        for attempt in 0..<3 {
+                                   timeoutSeconds: UInt64 = 10,
+                                   retry: Bool = true) async throws -> Response {
+        let attempts = retry ? 3 : 1
+        for attempt in 0..<attempts {
             do {
                 return try await callOnce(method: method, params: params,
                                           timeoutSeconds: timeoutSeconds)
             } catch let error as RelayError {
-                guard attempt < 2 else { throw error }
+                guard attempt < attempts - 1 else { throw error }
                 switch error {
                 case .hostOffline, .notConnected:
                     teardown(error: error)

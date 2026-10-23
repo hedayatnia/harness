@@ -26,6 +26,8 @@ struct HomeView: View {
     @State private var pendingNewSession: NewSessionTarget?
     @State private var showSettings = false
     @State private var showProfile = false
+    /// A session whose Delete is waiting on its confirmation.
+    @State private var pendingDelete: Chat?
     // "" = All. Sticky across launches; falls back to All if the space is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
     // Start with Time each launch; a saved grouping can hide recent sessions
@@ -34,7 +36,6 @@ struct HomeView: View {
     @AppStorage("homeCollapsedGroups") private var collapsedGroupsRaw = ""
     // Not persisted: a filter left on across launches reads as lost sessions.
     @State private var searchText = ""
-    @State private var statusFilter: HomeStatusFilter = .all
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     private var selectedSpace: Space? {
@@ -60,8 +61,11 @@ struct HomeView: View {
         showSplitOffer = splitSuggestion.shouldOffer(context, now: Date().timeIntervalSince1970)
     }
 
+    /// The split the offer would turn on for this window: Auto when it is wide, Stacked on a phone in portrait.
+    private var offeredSplit: PhoneSplit { SplitSuggestion.offeredMode(for: containerSize) ?? .auto }
+
     private func answerSplitOffer(tryIt: Bool) {
-        if tryIt { phoneSplitRaw = PhoneSplit.auto.rawValue }
+        if tryIt { phoneSplitRaw = offeredSplit.rawValue }
         splitSuggestion.markShown(at: Date().timeIntervalSince1970)
         splitSuggestion.save()
         showSplitOffer = false
@@ -128,13 +132,104 @@ struct HomeView: View {
                                    toggleList: two ? nil : { toggleList() })
     }
 
+    // MARK: Stacked split (the phone split's stacked shape)
+
+    /// The pane below the open session in a stacked split, like the desktop's ⌘D: its path, which starts empty
+    /// (the session list, to pick another session) and holds the session picked there. Nil while the list
+    /// shares the screen instead.
+    @State private var stackedSecond: [Route]?
+    /// Which stacked pane's composer has the keyboard; that pane keeps the room above it.
+    @State private var stackedFocus: SplitPanes.Pane?
+
+    private var stackedSplitAvailable: Bool { phoneArrangement?.axis == .stacked }
+
+    /// ⌘D for the stacked split: the session list below the open session, to open another one there.
+    private func openStackedSplit() {
+        stackedSecond = []
+    }
+
+    /// The upper pane's session, which the lower pane's list leaves out.
+    private var stackedPrimaryChat: String? {
+        guard case .chat(let id) = path.first else { return nil }
+        return id
+    }
+
+    /// A new session for the upper pane's project, in the lower pane.
+    private func newStackedSession() {
+        guard let id = stackedPrimaryChat, let chat = model.chat(id: id) else { return }
+        let destination: NewSessionDestination = if let space = chat.spaceId {
+            .project(spaceId: space)
+        } else {
+            .projectless(deviceId: chat.deviceId)
+        }
+        stackedSecond = [.newSession(destination)]
+    }
+
+    /// × on the lower pane: back to one session, with the list above it.
+    private func closeStackedSecondary() {
+        stackedSecond = nil
+        stackedFocus = nil
+    }
+
+    /// × on the upper pane: the lower pane's session takes its place; with only the lower pane's list open,
+    /// both go and the list comes back.
+    private func closeStackedPrimary() {
+        let second = stackedSecond ?? []
+        stackedSecond = nil
+        stackedFocus = nil
+        path = second
+    }
+
+    /// Offered on a session alone in the stacked split's detail; nil everywhere else.
+    private var stackedSplitAction: (() -> Void)? {
+        guard stackedSplitAvailable, stackedSecond == nil, case .chat = path.first else { return nil }
+        return { openStackedSplit() }
+    }
+
+    private var stackedSecondPath: Binding<[Route]> {
+        // Back out of the lower pane's session returns to its list; × closes the pane.
+        Binding(get: { stackedSecond ?? [] }, set: { next in
+            if stackedSecond != nil { stackedSecond = next }
+        })
+    }
+
+    /// Two panes stacked, each its own navigation stack with its own bar and an ×. The lower pane opens on the
+    /// session list (Home's rows); closing either pane leaves one, and the list comes back above it.
+    private var stackedPanes: some View {
+        VStack(spacing: 0) {
+            primaryStack
+                .frame(maxHeight: stackedFocus == .secondary ? Self.stackedPeek : .infinity)
+                .environment(\.stackedComposerFocus) { stackedFocus = $0 ? .primary : (stackedFocus == .primary ? nil : stackedFocus) }
+            Rectangle().fill(Theme.textFaint.opacity(0.25)).frame(height: 0.5)
+            NavigationStack(path: stackedSecondPath) {
+                StackedSessionPicker(excluding: stackedPrimaryChat,
+                                     pick: { stackedSecond = [.chat($0)] },
+                                     newSession: stackedPrimaryChat == nil ? nil : { newStackedSession() },
+                                     close: { closeStackedSecondary() })
+                    .navigationDestination(for: Route.self) { route in
+                        destination(route, in: stackedSecondPath)
+                            .environment(\.stackedClose) { closeStackedSecondary() }
+                    }
+            }
+            .frame(maxHeight: stackedFocus == .primary ? Self.stackedPeek : .infinity)
+            .environment(\.stackedComposerFocus) { stackedFocus = $0 ? .secondary : (stackedFocus == .secondary ? nil : stackedFocus) }
+        }
+        .animation(Motion.collapse, value: stackedFocus)
+    }
+
+    /// What the other stacked pane keeps while one is typing: its bar and the last rows.
+    private static let stackedPeek: CGFloat = 150
+
     private var primaryStack: some View {
         NavigationStack(path: $path) {
             SplitDetailPlaceholder()
                 // On each destination, not on the stack: a value set outside the stack did not reach the
                 // pushed session, so its header never saw the split controls.
                 .navigationDestination(for: Route.self) { route in
-                    destination(route).environment(\.splitScreen, controls(for: .primary))
+                    destination(route)
+                        .environment(\.splitScreen, controls(for: .primary))
+                        .environment(\.stackedSplit, stackedSplitAction)
+                        .environment(\.stackedClose, stackedSecond == nil ? nil : { closeStackedPrimary() })
                 }
         }
     }
@@ -165,8 +260,11 @@ struct HomeView: View {
                     primaryStack
                 }
                 .navigationSplitViewStyle(.balanced)
+            } else if stackedSplitAvailable, stackedSecond != nil, !path.isEmpty {
+                stackedPanes
             } else if let arrangement = phoneArrangement {
-                PhoneSplitContainer(arrangement: arrangement, selection: selectedChatId) {
+                PhoneSplitContainer(arrangement: arrangement, selection: selectedChatId,
+                                    detailRoute: path.first.map(AnyHashable.init), hasDetail: !path.isEmpty) {
                     NavigationStack { sidebar }
                 } detail: {
                     primaryStack
@@ -174,7 +272,7 @@ struct HomeView: View {
             } else {
                 NavigationStack(path: $path) {
                     sidebar
-                        .navigationDestination(for: Route.self, destination: destination)
+                        .navigationDestination(for: Route.self) { destination($0) }
                 }
             }
         }
@@ -186,6 +284,10 @@ struct HomeView: View {
         .onChange(of: phoneSplitRaw) { refreshSplitOffer() }
         .onAppear { refreshSplitOffer() }
         .environment(\.switchToSession, switchTo)
+        .onChange(of: path) { _, next in
+            // Backing out of the upper stacked pane promotes the lower one into its place.
+            if next.isEmpty, stackedSecond != nil { closeStackedPrimary() }
+        }
         .onChange(of: splitLayout) { _, isSplit in
             // Opening or closing a foldable swaps the stack and the split. The
             // split's detail column shows one route, a phone stack can hold
@@ -204,16 +306,21 @@ struct HomeView: View {
         }
     }
 
-    @ViewBuilder
     private func destination(_ route: Route) -> some View {
+        destination(route, in: $path)
+    }
+
+    /// `stack`: the navigation path this screen lives in (the lower stacked pane has its own).
+    @ViewBuilder
+    private func destination(_ route: Route, in stack: Binding<[Route]>) -> some View {
         Group {
             switch route {
-            case .space(let id): SpaceView(spaceId: id, path: $path)
+            case .space(let id): SpaceView(spaceId: id, path: stack)
             // Compact: a pager host, so the open session swipes to its
             // neighbours. The split layout keeps its own sidebar selection.
             case .chat(let id):
                 if splitLayout { SessionView(chatId: id) } else { SessionPagerHost(chatId: id) }
-            case .newSession(let destination): NewSessionView(destination: destination, path: $path)
+            case .newSession(let destination): NewSessionView(destination: destination, path: stack)
             }
         }
         // Tap to the page it opened.
@@ -260,13 +367,19 @@ struct HomeView: View {
     }
 
     private var sidebar: some View {
-        List {
-            sessionsSection
-            // The desktop's archived shelf sits under the active list,
-            // scoped by the same space filter and search. Archived sessions
-            // are never running or waiting, so a status filter hides it.
-            if statusFilter == .all {
+        ScrollViewReader { proxy in
+            List {
+                sessionsSection
+                // The desktop's archived shelf sits under the active list,
+                // scoped by the same space filter and search.
                 ArchivedSection(spaceId: selectedSpace?.id, query: searchText, path: sidebarPath)
+            }
+            // In a split the list shrinks as the session opens below it, and the opened row was left cut in
+            // half at the divider. Once the panes settle, bring the whole row into view.
+            .task(id: selectedChatId) {
+                guard let id = selectedChatId else { return }
+                try? await Task.sleep(for: .milliseconds(400))
+                withAnimation(Motion.collapse) { proxy.scrollTo(id) }
             }
         }
         // In the phone split the field sits in the pane's own bar: the floating one overlaps the rows of a
@@ -274,6 +387,7 @@ struct HomeView: View {
         .searchable(text: $searchText,
                     placement: phoneArrangement == nil ? .automatic : .navigationBarDrawer(displayMode: .always),
                     prompt: "Search sessions")
+        .sessionDeleteConfirmation(pending: $pendingDelete, onDelete: delete)
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 10)
         .contentMargins(.top, 2, for: .scrollContent)
@@ -567,12 +681,11 @@ struct HomeView: View {
 
     @ViewBuilder private var sessionsSection: some View {
         let scoped = selectedSpace.map { model.chats(in: $0.id) } ?? model.overviewChats
-        let chats = HomeFilter.apply(scoped, query: searchText, status: statusFilter,
-                                     indicator: model.indicator(for:), names: model.homeFilterNames)
+        let chats = HomeFilter.apply(scoped, query: searchText, names: model.homeFilterNames)
         let grouping = HomeGroupBy(rawValue: groupByRaw) ?? .none
         if showSplitOffer {
             Section {
-                SplitOfferBanner(tryIt: { answerSplitOffer(tryIt: true) },
+                SplitOfferBanner(mode: offeredSplit, tryIt: { answerSplitOffer(tryIt: true) },
                                  notNow: { answerSplitOffer(tryIt: false) })
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -582,21 +695,19 @@ struct HomeView: View {
         }
         if !scoped.isEmpty {
             Section {
-                HStack(spacing: 6) {
-                    HomeStatusChips(selection: $statusFilter, counts: statusCounts(scoped))
-                    groupPill
-                }
+                groupPill
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 6, trailing: 16))
             }
             .listSectionSeparator(.hidden)
             // What's running or waiting, above the history. Hidden while
-            // searching or filtering so it never competes with a query.
+            // searching so it never competes with a query.
             let now = NowStrip.active(in: scoped, model: model)
             // Not in the phone split: the list beside the open session already shows what is running or
             // waiting, and the cards would take most of a narrow pane.
-            if statusFilter == .all, searchText.isEmpty, !now.isEmpty, phoneArrangement == nil {
+            if searchText.isEmpty, !now.isEmpty, phoneArrangement == nil {
                 Section {
                     NowStrip(chats: now) { open(.chat($0)) }
                         .listRowBackground(Color.clear)
@@ -608,7 +719,7 @@ struct HomeView: View {
         }
         if chats.isEmpty {
             // A search can still hit the archived shelf below.
-            let archivedHit = statusFilter == .all && !searchText.isEmpty
+            let archivedHit = !searchText.isEmpty
                 && !model.archivedMatches(in: selectedSpace?.id, query: searchText).isEmpty
             if !archivedHit {
                 Section {
@@ -651,17 +762,6 @@ struct HomeView: View {
         }
     }
 
-    private func statusCounts(_ chats: [Chat]) -> [HomeStatusFilter: Int] {
-        var counts: [HomeStatusFilter: Int] = [:]
-        for chat in chats {
-            let indicator = model.indicator(for: chat)
-            for filter in HomeStatusFilter.allCases where filter.matches(indicator) {
-                counts[filter, default: 0] += 1
-            }
-        }
-        return counts
-    }
-
     /// Collapsed section ids, persisted (comma-separated).
     private var collapsedGroups: Set<String> {
         Set(collapsedGroupsRaw.split(separator: ",").map(String.init))
@@ -698,7 +798,25 @@ struct HomeView: View {
                 Label("Archive", systemImage: "archivebox")
             }
             .tint(Theme.surfaceRaised)
+            // No destructive role: SwiftUI would slide the row out before the
+            // confirmation is answered.
+            Button {
+                pendingDelete = chat
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+            .tint(Theme.danger)
+            .accessibilityIdentifier("session-delete")
         }
+    }
+
+    /// The confirmed Delete: gone from the list, and from the detail if it
+    /// was showing there.
+    private func delete(_ chat: Chat) {
+        withAnimation(Motion.resort) {
+            model.delete(chatId: chat.id)
+        }
+        path.removeAll { $0 == .chat(chat.id) }
     }
 }
 
@@ -749,7 +867,8 @@ struct ChatRow: View {
     /// spinner too — no fake progress on a send that hasn't left.
     private func sendBadge(_ state: SendState) -> (label: String, color: Color)? {
         switch state {
-        case .failed: return ("Failed", Theme.danger)
+        case .failed: return ("Not delivered", Theme.danger)
+        case .waiting: return ("Waiting", Theme.warning)
         case .queued: return ("Queued", Theme.warning)
         case .sending: return nil
         }
@@ -839,7 +958,30 @@ struct ChatRow: View {
     }
 }
 
+/// The desktop's "Delete session?" dialog, word for word.
+enum SessionDeletion {
+    static let title = "Delete session?"
+
+    static func message(title: String) -> String {
+        "\u{201C}\(title)\u{201D} will be permanently deleted. This can\u{2019}t be undone."
+    }
+}
+
 extension View {
+    /// Ask before a row's Delete goes through; `pending` is the session asked about.
+    func sessionDeleteConfirmation(pending: Binding<Chat?>, onDelete: @escaping (Chat) -> Void) -> some View {
+        alert(SessionDeletion.title,
+              isPresented: Binding(get: { pending.wrappedValue != nil },
+                                   set: { if !$0 { pending.wrappedValue = nil } }),
+              presenting: pending.wrappedValue) { chat in
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { onDelete(chat) }
+                .accessibilityIdentifier("session-delete-confirm")
+        } message: { chat in
+            Text(SessionDeletion.message(title: chat.displayTitle))
+        }
+    }
+
     func sessionPinAction(chat: Chat, model: AppModel) -> some View {
         swipeActions(edge: .leading, allowsFullSwipe: true) {
             let pinned = model.isPinned(chatId: chat.id)

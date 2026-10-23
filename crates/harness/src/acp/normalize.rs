@@ -500,11 +500,12 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                 .iter()
                 .find_map(|key| update.get(*key).and_then(Value::as_u64))
                 .filter(|n| *n > 0);
+            let mut events = Vec::new();
             if tokens.is_some() || window.is_some() {
-                vec![AgentEvent::ContextUsage { tokens, window }]
-            } else {
-                Vec::new()
+                events.push(AgentEvent::ContextUsage { tokens, window });
             }
+            events.extend(context_savings(update));
+            events
         }
         "config_option_update" => match update.get("configOptions").and_then(Value::as_array) {
             Some(options) => {
@@ -548,6 +549,14 @@ fn resolved_result(update: &Value, id: String) -> Option<AgentEvent> {
         output: tool_output(update),
         diff: tool_diff(update),
     })
+}
+
+/// graff's `_meta["codegraff/savings"]` on its context meter: what it kept
+/// out of the model's context so far. A malformed object yields nothing.
+fn context_savings(update: &Value) -> Option<AgentEvent> {
+    let meta = update.pointer("/_meta/codegraff~1savings")?;
+    let savings: harness_proto::ContextSavings = serde_json::from_value(meta.clone()).ok()?;
+    Some(AgentEvent::ContextSavings { savings })
 }
 
 /// graff's `_meta["graff/view"]` on a finished tool: the page it saved, as
@@ -807,6 +816,42 @@ mod tests {
         ));
         // A bare status-less update with no content stays silent.
         assert!(map_update(&json!({"sessionUpdate": "tool_call_update", "toolCallId": "spawn-1"})).is_empty());
+    }
+
+    #[test]
+    fn graff_savings_ride_its_context_meter() {
+        let events = map_update(&json!({
+            "sessionUpdate": "usage_update",
+            "used": 40_000,
+            "size": 200_000,
+            "_meta": {"codegraff/savings": {
+                "handleBytes": 96_000, "compactedTokens": 78_000, "cacheReadTokens": 4_000
+            }},
+        }));
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ContextUsage {
+                    tokens: Some(40_000),
+                    window: Some(200_000),
+                },
+                AgentEvent::ContextSavings {
+                    savings: harness_proto::ContextSavings {
+                        handle_bytes: 96_000,
+                        compacted_tokens: 78_000,
+                        cache_read_tokens: 4_000,
+                    },
+                },
+            ]
+        );
+        // Another agent's meter, or a malformed object, carries no savings.
+        let plain = map_update(&json!({"sessionUpdate": "usage_update", "used": 1, "size": 2}));
+        assert_eq!(plain.len(), 1);
+        let bad = map_update(&json!({
+            "sessionUpdate": "usage_update", "used": 1, "size": 2,
+            "_meta": {"codegraff/savings": "lots"},
+        }));
+        assert_eq!(bad.len(), 1);
     }
 
     #[test]

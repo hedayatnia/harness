@@ -1,7 +1,11 @@
 package harness.codegraff.android.ui.newsession
 
-import androidx.compose.runtime.produceState
-import harness.codegraff.android.model.RepoRef
+import androidx.compose.runtime.key
+import harness.codegraff.android.model.DeviceCatalog
+import harness.codegraff.android.model.ModelInfo
+import harness.codegraff.android.model.modelSelection
+import harness.codegraff.android.ui.components.CatalogLoad
+import harness.codegraff.android.ui.components.rememberDeviceCatalog
 import harness.codegraff.android.model.HostNotice
 
 import android.net.Uri
@@ -102,13 +106,9 @@ fun NewSessionScreen(
     var showHostPicker by remember { mutableStateOf(false) }
     var showPicker by remember { mutableStateOf(false) }
     var showTraitPicker by remember { mutableStateOf(false) }
-    var optionPicker by remember { mutableStateOf<harness.codegraff.android.model.ModelOptionInfo?>(null) }
     var showRefPicker by remember { mutableStateOf(false) }
     var showCheckoutPicker by remember { mutableStateOf(false) }
     var attachments by remember { mutableStateOf(listOf<StagedAttachment>()) }
-    val optionSelections = remember { mutableStateMapOf<String, String>() }
-    var selectedRef by rememberSaveable { mutableStateOf<String?>(null) }
-    var checkoutKind by rememberSaveable { mutableStateOf(CheckoutKind.Local) }
 
     val effective = if (destination is NewSessionDestination.Projectless && selectedHostId != null) {
         NewSessionDestination.Projectless(selectedHostId!!)
@@ -122,27 +122,47 @@ fun NewSessionScreen(
         is NewSessionDestination.Project -> space?.displayName ?: "Project unavailable"
         is NewSessionDestination.Projectless -> "No project"
     }
-    // The project's branches, from the computer it lives on.
-    val refs by produceState(emptyList<RepoRef>(), space?.id, space?.path, space?.gitDetected) {
-        value = space?.let { model.listRefs(it) }.orEmpty()
-    }
-    if (selectedRef == null && refs.isNotEmpty()) selectedRef = (refs.firstOrNull { it.current } ?: refs.first()).name
+    val refreshKey = state.connected to deviceId?.let(state::hostStatus)
+    val refContext = listOf(space?.deviceId, space?.id, space?.path, space?.gitDetected)
+    var pickedRef by rememberSaveable(refContext) { mutableStateOf<String?>(null) }
+    var checkoutKind by rememberSaveable(refContext) { mutableStateOf(CheckoutKind.Local) }
+    val refLoad = rememberDeviceCatalog(refContext, refreshKey,
+        initial = { space?.let(model::cachedRefs) ?: DeviceCatalog() },
+        fetch = { space?.let { model.listRefs(it) } ?: DeviceCatalog(emptyList(), isLive = true) },
+    )
+    val refs = refLoad.catalog.items
+    val selectedRef = pickedRef ?: (refs.firstOrNull { it.current } ?: refs.firstOrNull())?.name
     val selectedRefRow = refs.firstOrNull { it.name == selectedRef }
+    val refUnavailable = refLoad.catalog.isLive && selectedRef != null && selectedRefRow == null
 
     val harness = harnessPref.value
-    // The catalog source is the computer that will run the session; the static catalog stands in until it answers.
-    val harnesses by produceState(HarnessCatalog.harnesses, deviceId) { value = deviceId?.let { model.listHarnesses(it) } ?: HarnessCatalog.harnesses }
-    val models by produceState(HarnessCatalog.models(harness), deviceId, harness) {
-        value = deviceId?.let { model.listModels(it, harness) } ?: HarnessCatalog.models(harness)
+    var optionPicker by remember(deviceId, harness, modelPref.value) { mutableStateOf<harness.codegraff.android.model.ModelOptionInfo?>(null) }
+    val optionSelections = remember(deviceId, harness, modelPref.value) { mutableStateMapOf<String, String>() }
+    val harnessLoad = rememberDeviceCatalog(deviceId, refreshKey,
+        initial = { deviceId?.let(model::cachedHarnesses) ?: DeviceCatalog() },
+        fetch = { deviceId?.let { model.listHarnesses(it) } ?: DeviceCatalog(emptyList(), isLive = true) },
+    )
+    val harnesses = harnessLoad.catalog.items
+    // Load each offered agent rather than giving unopened sections fabricated static models.
+    val catalogLoads = mutableMapOf<String, CatalogLoad<ModelInfo>>()
+    (listOf(harness) + harnesses.map { it.id }).distinct().forEach { agent ->
+        key(deviceId, agent) {
+            catalogLoads[agent] = rememberDeviceCatalog(deviceId to agent, refreshKey,
+                initial = { deviceId?.let { model.cachedModels(it, agent) } ?: DeviceCatalog() },
+                fetch = { deviceId?.let { model.listModels(it, agent) } ?: DeviceCatalog(emptyList(), isLive = true) },
+            )
+        }
     }
-    val selectedModel = HarnessCatalog.resolveExisting(modelPref.value, models) ?: models.firstOrNull() ?: HarnessCatalog.defaultModel(harness)
-    val reasoning = if (selectedModel.reasoningLevels.isEmpty()) null
-    else reasoningPref.value.takeIf { it in selectedModel.reasoningLevels } ?: HarnessCatalog.defaultReasoning(selectedModel)
+    val selection = modelSelection(harness, modelPref.value, reasoningPref.value, catalogLoads.getValue(harness).catalog, harnessLoad.catalog)
+    val selectedModel = selection.model
+    val reasoning = selection.reasoning
 
     val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(8)) { uris: List<Uri> ->
         attachments = attachments + uris.map { StagedAttachment(it.toString(), it.lastPathSegment ?: "Photo", it) }
     }
-    val canSend = deviceId != null && (draft.trim().isNotEmpty() || attachments.isNotEmpty())
+    val hostUnavailable = state.synced && state.executionDevices.none { it.id == deviceId }
+    val selectionReady = deviceId != null && !hostUnavailable && selection.canSend && !refUnavailable
+    val canSend = selectionReady && (draft.trim().isNotEmpty() || attachments.isNotEmpty())
 
     fun send() {
         val device = deviceId ?: return
@@ -241,9 +261,20 @@ fun NewSessionScreen(
                     .background(p.warning.opacity(0.1f), RoundedCornerShape(12.dp)).padding(horizontal = 14.dp, vertical = 8.dp),
             )
         }
+        if ((deviceId != null && hostUnavailable) || selection.unavailable || refUnavailable) {
+            Text(
+                when {
+                    hostUnavailable -> "The selected device is no longer available. Select another device."
+                    refUnavailable -> "The selected ref is no longer available. Select another ref."
+                    else -> "The selected agent or model is not available on this device. Select another model."
+                },
+                style = sans(12f), color = p.warning,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp),
+            )
+        }
         ComposerShell(
             draft = draft, onDraftChange = { draft = it },
-            placeholder = "Do anything…", sendEnabled = deviceId != null, showStop = false,
+            placeholder = "Do anything…", sendEnabled = selectionReady, showStop = false,
             alwaysExpanded = true, onSend = ::send,
             modifier = Modifier.padding(bottom = 8.dp),
             attachments = attachments,
@@ -262,7 +293,11 @@ fun NewSessionScreen(
     if (showPicker) {
         ModelPickerSheet(
             harness = harness, modelId = selectedModel.id, reasoning = reasoning, lockedHarness = false,
-            harnesses = harnesses, catalogs = mapOf(harness to models),
+            harnesses = harnesses, catalogs = catalogLoads.mapValues { it.value.catalog.items },
+            loading = harnessLoad.loading || catalogLoads.values.any { it.loading },
+            confirmedHarnesses = harnessLoad.catalog.isLive,
+            confirmedCatalogs = catalogLoads.filterValues { it.catalog.isLive }.keys,
+            onRetry = { harnessLoad.retry(); catalogLoads.values.forEach { it.retry() } },
             onPick = { h, picked, r -> harnessPref.set(h); modelPref.set(picked.id); reasoningPref.set(r ?: "") },
             onDismiss = { showPicker = false },
         )
@@ -272,8 +307,8 @@ fun NewSessionScreen(
         ModelOptionPickerSheet(option, HarnessCatalog.selectedChoice(option, optionSelections[option.id]).id, { optionSelections[option.id] = it }) { optionPicker = null }
     }
     if (showRefPicker) {
-        RefPickerSheet(refs, selectedRef, onPick = { row ->
-            selectedRef = row.name
+        RefPickerSheet(refs, selectedRef, loading = refLoad.loading, confirmed = refLoad.catalog.isLive, onRetry = refLoad::retry, onPick = { row ->
+            pickedRef = row.name
             if (row.worktreePath != null) checkoutKind = CheckoutKind.Local
         }) { showRefPicker = false }
     }
@@ -282,7 +317,7 @@ fun NewSessionScreen(
             // Dropping back to Local with a plain non-current ref picked drops the pick: the current branch takes over.
             if (kind == CheckoutKind.Local && checkoutKind == CheckoutKind.NewWorktree && selectedRefRow != null &&
                 selectedRefRow.worktreePath == null && !selectedRefRow.current
-            ) selectedRef = refs.firstOrNull { it.current }?.name
+            ) pickedRef = refs.firstOrNull { it.current }?.name
             checkoutKind = kind
         }) { showCheckoutPicker = false }
     }

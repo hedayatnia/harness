@@ -100,23 +100,41 @@ fun NewSpaceSheet(state: WorkspaceState, model: AppModel, onCreated: (String) ->
     val selectedDevice = deviceId ?: devices.firstOrNull()?.id
     var path by remember(selectedDevice) { mutableStateOf<String?>(null) }
     var currentIsRepo by remember(selectedDevice) { mutableStateOf(false) }
-    // Asked of the computer over the relay; the last listing stays up while the next one loads.
-    var listing by remember(selectedDevice) { mutableStateOf<FolderListing?>(null) }
-    var loading by remember(selectedDevice) { mutableStateOf(false) }
-    var error by remember(selectedDevice) { mutableStateOf<String?>(null) }
+    // A new path/host clears the old actionable listing synchronously, before its request starts.
+    var listing by remember(selectedDevice, path) { mutableStateOf<FolderListing?>(null) }
+    var loading by remember(selectedDevice, path) { mutableStateOf(true) }
+    var error by remember(selectedDevice, path) { mutableStateOf<String?>(null) }
+    var retry by remember(selectedDevice, path) { mutableStateOf(0) }
     var creating by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    LaunchedEffect(selectedDevice, path) {
+    LaunchedEffect(selectedDevice, path, retry, state.connected, selectedDevice?.let(state::hostStatus)) {
         val device = selectedDevice ?: return@LaunchedEffect
         loading = true
         error = null
         val result = model.listFolders(device, path)
         loading = false
         if (result != null) listing = result
-        else if (listing == null) error = "Couldn't reach ${state.deviceName(device)}. Make sure it's online."
+        else { listing = null; error = "Couldn't reach ${state.deviceName(device)}. Make sure it's online." }
     }
 
     HarnessSheet("New space", onDismiss) {
+        // Keep host switching available even when the current host's folders cannot load.
+        Row(
+            Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 6.dp, bottom = 14.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            devices.forEach { device ->
+                val selected = device.id == selectedDevice
+                Row(
+                    Modifier.height(48.dp).clip(CircleShape).background(if (selected) p.ink(0.15f) else p.ink(0.05f), CircleShape)
+                        .clickable(role = Role.Tab) { deviceId = device.id }.padding(horizontal = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    Box(Modifier.size(6.dp).background(if (state.deviceOnline(device.id)) p.statusCompleted.opacity(0.9f) else p.ink(0.18f), CircleShape))
+                    Text(device.name, style = sans(13f, FontWeight.Medium), color = if (selected) p.text else p.textMuted)
+                }
+            }
+        }
         if (devices.isEmpty()) {
             Column(Modifier.fillMaxWidth().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 GlyphView(Glyph.Monitor, 30.dp, p.textFaint, strokeWidth = 1.2f)
@@ -125,28 +143,14 @@ fun NewSpaceSheet(state: WorkspaceState, model: AppModel, onCreated: (String) ->
             }
         } else if (listing == null) {
             Column(Modifier.fillMaxWidth().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                error?.let { Text(it, style = sans(13f), color = p.danger, textAlign = TextAlign.Center) } ?: MiniSpinner()
+                error?.let {
+                    Text("$it Tap to retry.", style = sans(13f), color = p.danger, textAlign = TextAlign.Center,
+                        modifier = Modifier.clickable(role = Role.Button) { retry++ }.padding(12.dp))
+                } ?: MiniSpinner()
             }
         } else {
             val listing = listing!!
             Column(Modifier.fillMaxWidth().heightIn(max = 620.dp)) {
-                // Device tabs.
-                Row(
-                    Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 6.dp, bottom = 14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    devices.forEach { device ->
-                        val selected = device.id == selectedDevice
-                        Row(
-                            Modifier.height(48.dp).clip(CircleShape).background(if (selected) p.ink(0.15f) else p.ink(0.05f), CircleShape)
-                                .clickable(role = Role.Tab) { deviceId = device.id }.padding(horizontal = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp),
-                        ) {
-                            Box(Modifier.size(6.dp).background(if (state.deviceOnline(device.id)) p.statusCompleted.opacity(0.9f) else p.ink(0.18f), CircleShape))
-                            Text(device.name, style = sans(13f, FontWeight.Medium), color = if (selected) p.text else p.textMuted)
-                        }
-                    }
-                }
                 // Breadcrumb.
                 Row(Modifier.padding(horizontal = 20.dp).padding(bottom = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     val canUp = listing.parent != null
@@ -200,7 +204,7 @@ fun NewSpaceSheet(state: WorkspaceState, model: AppModel, onCreated: (String) ->
                 val name = listing.path.trimEnd('/').substringAfterLast('/')
                 Box(Modifier.background(p.surfaceDialog.opacity(0.94f)).padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 6.dp)) {
                     SheetPrimaryButton(if (name.isEmpty()) "Use this folder" else "Use “$name”") {
-                        if (creating) return@SheetPrimaryButton
+                        if (creating || loading || (state.synced && devices.none { it.id == selectedDevice })) return@SheetPrimaryButton
                         creating = true
                         scope.launch {
                             // The git flag the engine stamped when we descended into this folder; the host re-checks it.

@@ -4,7 +4,7 @@
 
 <p align="center">आपकी मशीनों पर चलने वाले कोडिंग एजेंटों के लिए एक नेटिव कार्यक्षेत्र।</p>
 
-<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · हिन्दी · <a href="README.thai.md">ไทย</a> · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
+<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · <a href="README.es.md">Español</a> · हिन्दी · <a href="README.thai.md">ไทย</a> · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
 
 Harness एक डेस्कटॉप इंटरफ़ेस में **CodeGraff (graff)**, Claude Code, Codex,
 Cursor, Devin, Grok, Hermes, Pi, OpenCode और Antigravity को साथ लाता है। बिना

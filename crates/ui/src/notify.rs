@@ -15,6 +15,9 @@
 //!   focus the installed app rather than the dev binary — acceptable for a
 //!   dev-only path. Machines without Harness installed fall back to
 //!   `osascript`, attributed to Script Editor (cosmetics only).
+//!   A session chime for a background banner is attached as the
+//!   notification's sound (the bundled WAV, by file name), so Focus and the
+//!   app's notification settings apply to it ([`post_with_chime`]).
 //! - Linux: `notify-send` (libnotify's CLI, present on every mainstream
 //!   desktop).
 //! - Windows: no-op for now — toasts require a registered AppUserModelID
@@ -31,10 +34,30 @@ const DISABLE_ENV: &str = "HARNESS_DISABLE_NOTIFICATIONS";
 /// a background thread. Silently a no-op when disabled or no notifier is
 /// available.
 pub fn post(title: &str, body: &str, chat_id: Option<&str>) {
+    post_with_chime(title, body, chat_id, None);
+}
+
+/// Whether this platform's notifications can carry a session chime
+/// ([`post_with_chime`]); see `sound::plan_alert`.
+pub(crate) const CARRIES_CHIME: bool = cfg!(target_os = "macos");
+
+/// [`post`], with `chime` played by the notification itself, so the system's
+/// Focus / Do Not Disturb and per-app sound settings apply to it. Returns
+/// whether the chime was attached; when false (banner disabled, no native
+/// center, chime file missing from the bundle) the caller plays it locally
+/// so the alert is never silently dropped. With `chime: None` the return
+/// value is meaningless.
+pub(crate) fn post_with_chime(
+    title: &str,
+    body: &str,
+    chat_id: Option<&str>,
+    chime: Option<crate::sound::Sound>,
+) -> bool {
     if std::env::var_os(DISABLE_ENV).is_some() {
-        return;
+        return false;
     }
-    post_impl(title, body, chat_id);
+    let chime = chime.filter(|_| !crate::sound::disabled_by_env());
+    post_impl(title, body, chat_id, chime)
 }
 
 /// Route banner clicks: `handler` receives the clicked banner's chat id.
@@ -48,10 +71,17 @@ pub fn on_click(handler: impl Fn(String) + 'static) {
 }
 
 #[cfg(target_os = "macos")]
-fn post_impl(title: &str, body: &str, chat_id: Option<&str>) {
-    if post_user_notification(title, body, chat_id) {
-        return;
+fn post_impl(
+    title: &str,
+    body: &str,
+    chat_id: Option<&str>,
+    chime: Option<crate::sound::Sound>,
+) -> bool {
+    if let Some(attached) = post_user_notification(title, body, chat_id, chime) {
+        return attached;
     }
+    // The osascript banner is attributed to Script Editor, whose Focus and
+    // sound settings aren't Harness's: leave the chime to the caller.
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
         applescript_escape(body),
@@ -69,6 +99,7 @@ fn post_impl(title: &str, body: &str, chat_id: Option<&str>) {
             Err(err) => tracing::debug!(error = %err, "osascript unavailable"),
         }
     });
+    false
 }
 
 /// The identity banners are attributed to — the packaged app's bundle id
@@ -80,24 +111,28 @@ const MACOS_BUNDLE_ID: &std::ffi::CStr = c"harness.codegraff.app";
 #[cfg(target_os = "macos")]
 const CHAT_ID_KEY: &std::ffi::CStr = c"chatId";
 
-/// Deliver through the app's notification center; false when the process has
+/// Deliver through the app's notification center. `None` when the process has
 /// no bundle (dev runs — `defaultUserNotificationCenter` is nil there) and
-/// the installed-app identity can't be adopted either.
+/// the installed-app identity can't be adopted either; otherwise whether
+/// `chime` was attached as the notification's sound.
 #[cfg(target_os = "macos")]
-fn post_user_notification(title: &str, body: &str, chat_id: Option<&str>) -> bool {
+fn post_user_notification(
+    title: &str,
+    body: &str,
+    chat_id: Option<&str>,
+    chime: Option<crate::sound::Sound>,
+) -> Option<bool> {
     use objc::runtime::{Class, Object};
     use objc::{class, msg_send, sel, sel_impl};
     // Defensive lookup (not `class!`, which panics if the class is ever
     // dropped from Foundation) — the deprecated API's one real removal risk.
-    let Some(center_class) = Class::get("NSUserNotificationCenter") else {
-        return false;
-    };
+    let center_class = Class::get("NSUserNotificationCenter")?;
     let (Ok(title), Ok(body), Ok(chat_id)) = (
         std::ffi::CString::new(title.replace('\0', "")),
         std::ffi::CString::new(body.replace('\0', "")),
         chat_id.map(std::ffi::CString::new).transpose(),
     ) else {
-        return false;
+        return None;
     };
     unsafe {
         let mut center: *mut Object = msg_send![center_class, defaultUserNotificationCenter];
@@ -105,7 +140,7 @@ fn post_user_notification(title: &str, body: &str, chat_id: Option<&str>) -> boo
             center = msg_send![center_class, defaultUserNotificationCenter];
         }
         if center.is_null() {
-            return false;
+            return None;
         }
         // Idempotent: the delegate is a leaked singleton (the center holds it
         // weakly), re-set on every post in case another center appeared.
@@ -119,8 +154,32 @@ fn post_user_notification(title: &str, body: &str, chat_id: Option<&str>) -> boo
         if let Some(chat_id) = chat_id {
             tag_chat(note, &chat_id);
         }
+        let attached = chime.is_some_and(|chime| attach_chime(note, chime));
         let _: () = msg_send![center, deliverNotification: note];
         let _: () = msg_send![note, release];
+        Some(attached)
+    }
+}
+
+/// Set `note`'s sound to the bundled chime file. False (no sound set) when
+/// the running bundle doesn't ship the file — an unbundled dev run, say — so
+/// the caller plays it locally instead of losing it.
+#[cfg(target_os = "macos")]
+unsafe fn attach_chime(note: *mut objc::runtime::Object, chime: crate::sound::Sound) -> bool {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    let Ok(name) = std::ffi::CString::new(chime.bundle_file_name()) else {
+        return false;
+    };
+    unsafe {
+        let ns_name: *mut Object = msg_send![class!(NSString), stringWithUTF8String: name.as_ptr()];
+        let bundle: *mut Object = msg_send![class!(NSBundle), mainBundle];
+        let nil: *mut Object = std::ptr::null_mut();
+        let path: *mut Object = msg_send![bundle, pathForResource: ns_name ofType: nil];
+        if path.is_null() {
+            return false;
+        }
+        let _: () = msg_send![note, setSoundName: ns_name];
     }
     true
 }
@@ -312,7 +371,12 @@ fn applescript_escape(text: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn post_impl(title: &str, body: &str, _chat_id: Option<&str>) {
+fn post_impl(
+    title: &str,
+    body: &str,
+    _chat_id: Option<&str>,
+    _chime: Option<crate::sound::Sound>,
+) -> bool {
     let (title, body) = (title.to_string(), body.to_string());
     std::thread::spawn(move || {
         // `--` ends option parsing: session titles are model-generated, so a
@@ -328,10 +392,18 @@ fn post_impl(title: &str, body: &str, _chat_id: Option<&str>) {
             Err(err) => tracing::debug!(error = %err, "notify-send unavailable"),
         }
     });
+    false
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn post_impl(_title: &str, _body: &str, _chat_id: Option<&str>) {}
+fn post_impl(
+    _title: &str,
+    _body: &str,
+    _chat_id: Option<&str>,
+    _chime: Option<crate::sound::Sound>,
+) -> bool {
+    false
+}
 
 #[cfg(test)]
 mod tests {
@@ -346,6 +418,23 @@ mod tests {
         );
         // Raw newlines would end the AppleScript statement mid-literal.
         assert_eq!(applescript_escape("two\nlines\r\n"), "two lines  ");
+    }
+
+    /// Outside an app bundle the chime file can't be resolved: the note gets
+    /// no sound and the caller is told to play it locally, so a background
+    /// chime is never lost.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_chime_missing_from_the_bundle_is_not_attached() {
+        use objc::runtime::Object;
+        use objc::{class, msg_send, sel, sel_impl};
+        unsafe {
+            let note: *mut Object = msg_send![class!(NSUserNotification), new];
+            assert!(!attach_chime(note, crate::sound::Sound::Done));
+            let name: *mut Object = msg_send![note, soundName];
+            assert!(name.is_null());
+            let _: () = msg_send![note, release];
+        }
     }
 
     #[cfg(target_os = "macos")]

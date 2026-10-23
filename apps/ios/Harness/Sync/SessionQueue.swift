@@ -91,6 +91,7 @@ extension SessionStore {
             var text: String?
             var baseTextHash: String?
             var expiresAtMs: Int64?
+            var attachments: [String]?
         }
         guard !queueActionsPending.contains(id),
               queue.contains(where: { $0.id == id }), let relay = hostRelayClient() else {
@@ -116,7 +117,8 @@ extension SessionStore {
                     leaseId: leaseId,
                     text: reply.text ?? "",
                     baseTextHash: baseTextHash,
-                    expiresAtMs: expiresAtMs
+                    expiresAtMs: expiresAtMs,
+                    attachments: reply.attachments
                 ))
             case "locked": return .locked
             default: return .missing
@@ -143,10 +145,12 @@ extension SessionStore {
         }
     }
 
-    func finishQueuedEdit(_ lease: QueueEditLease, action: String,
-                          text: String? = nil) async -> QueueEditFinishResult {
-        struct Reply: Decodable { var outcome: String }
-        guard let relay = hostRelayClient() else { return .unavailable }
+    /// `FinishQueuedMessageEdit` params. `attachments` nil leaves the row's
+    /// list alone; a list (even empty) replaces it on commit, which is how
+    /// the desktop saves a queued message's images (crates/ui/src/queue.rs).
+    nonisolated static func finishQueuedEditParams(chatId: String, lease: QueueEditLease,
+                                                   action: String, text: String? = nil,
+                                                   attachments: [String]? = nil) -> [String: Any] {
         var params: [String: Any] = [
             "chatId": chatId,
             "id": lease.rowId,
@@ -155,9 +159,24 @@ extension SessionStore {
             "expectedTextHash": lease.baseTextHash,
         ]
         if let text { params["text"] = text }
+        if let attachments { params["attachments"] = attachments }
+        return params
+    }
+
+    func finishQueuedEdit(_ lease: QueueEditLease, action: String,
+                          text: String? = nil) async -> QueueEditFinishResult {
+        await finishQueuedEdit(lease, params: Self.finishQueuedEditParams(
+            chatId: chatId, lease: lease, action: action, text: text))
+    }
+
+    func finishQueuedEdit(_ lease: QueueEditLease, params: [String: Any]) async -> QueueEditFinishResult {
+        struct Reply: Decodable { var outcome: String }
+        guard let relay = hostRelayClient() else { return .unavailable }
         do {
+            // Attachments ride on a commit, so give it the desktop's 30s.
             let reply: Reply = try await relay.call(
-                method: "FinishQueuedMessageEdit", params: params
+                method: "FinishQueuedMessageEdit", params: params,
+                timeoutSeconds: params["attachments"] == nil ? 10 : 30
             )
             switch reply.outcome {
             case "committed", "cancelled", "discarded", "released": return .finished
@@ -171,6 +190,27 @@ extension SessionStore {
             )
             return .unavailable
         }
+    }
+
+    /// Demo mode has no host to commit a protected edit, so the attachments
+    /// editor writes the row in place, the way the host's
+    /// `finish_queued_edit_with_attachments` does: same map, same slot, only
+    /// `text` and `attachments` change.
+    @discardableResult
+    func applyQueuedAttachmentsLocally(id: String, text: String, attachments: [String]) -> Bool {
+        let list = doc.getMovableList(id: "queue")
+        guard let index = queueIndex(of: id, in: list),
+              let row = list.get(index: UInt32(index))?.asLoroMap() else { return false }
+        do {
+            try row.insert(key: "text", v: text)
+            try row.insert(key: "attachments", v: LoroValue.fromJSON(attachments))
+            try row.insert(key: "editedAt", v: nowMs())
+            doc.commit()
+        } catch {
+            return false
+        }
+        refreshQueue()
+        return true
     }
 
     /// Move a row to `to`, clamped to the queue. Same slot is a no-op.

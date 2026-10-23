@@ -57,12 +57,13 @@ final class PhoneSplitUITests: XCTestCase {
         XCTAssertLessThan(listButton(app).frame.maxY, header(app).frame.minY, "the list sits above the session")
     }
 
-    private func launchRollout(_ half: String, onboardingSeen: Bool) -> XCUIApplication {
+    private func launchRollout(_ half: String, onboardingSeen: Bool,
+                               chat: String = "chat-tabs") -> XCUIApplication {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
         Thread.sleep(forTimeInterval: 1)
         let app = XCUIApplication()
-        app.launchArguments = ["-demo", "-sethomefilter", "", "-route", "chat:chat-tabs", "-phoneSplit", "stacked",
+        app.launchArguments = ["-demo", "-sethomefilter", "", "-route", "chat:\(chat)", "-phoneSplit", "stacked",
                                "-rollout.stackedSplitDrag", half,
                                "-onboarding.stackedSplitDrag.seen", onboardingSeen ? "YES" : "NO"]
         app.launch()
@@ -110,6 +111,50 @@ final class PhoneSplitUITests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.8)
         XCTAssertTrue(listButton(app).isHittable, "tapping the icon brings the list back")
         XCTAssertEqual(handle.label, "Hide the session list")
+    }
+
+    /// Back from a session that had the whole screen returns to the list, not to an empty pane with the
+    /// list folded away.
+    func testBackFromAFullScreenSessionReturnsToTheList() {
+        let app = launchRollout("on", onboardingSeen: true)
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        let handle = app.buttons["stacked-split-handle"]
+        XCTAssertTrue(handle.waitForExistence(timeout: 5), "no split handle")
+        let start = handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let top = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08))
+        start.press(forDuration: 0.1, thenDragTo: top)
+        Thread.sleep(forTimeInterval: 0.8)
+        XCTAssertFalse(listButton(app).isHittable, "the session has the screen")
+
+        // The session's own Back: the folded list keeps a navigation bar of its own.
+        let headerY = header(app).frame.midY
+        let back = app.navigationBars.buttons.allElementsBoundByIndex.first {
+            $0.isHittable && abs($0.frame.midY - headerY) < 30 && $0.frame.maxX < header(app).frame.minX
+        }
+        XCTAssertNotNil(back, "no Back button beside the session header")
+        back?.tap()
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-back-to-list")
+        XCTAssertFalse(header(app).exists, "the session closed")
+        XCTAssertTrue(listButton(app).isHittable, "Back returns to the list")
+    }
+
+    /// Typing an answer to a question gives the session the screen above the keyboard, as the composer
+    /// does, so the answer field is not hidden behind the keyboard.
+    func testTypingAnAnswerGivesTheSessionTheScreen() {
+        let app = launchRollout("on", onboardingSeen: true, chat: "chat-picker")
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        XCTAssertTrue(listButton(app).isHittable, "the list starts open")
+        let answer = app.textFields["Or type your own answer"]
+        XCTAssertTrue(answer.waitForExistence(timeout: 5), "no question panel")
+        answer.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5), "the keyboard came up")
+        answer.typeText("both, but local first")
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-question-typing")
+        XCTAssertFalse(listButton(app).isHittable, "the list gets out of the way")
+        XCTAssertTrue(answer.isHittable, "the answer field is above the keyboard")
+        XCTAssertLessThan(answer.frame.maxY, app.keyboards.firstMatch.frame.minY)
     }
 
     func testDraggingTheStackedHandleDownGivesTheListTheScreenAndItsIconBringsTheSessionBack() {
@@ -218,9 +263,124 @@ final class PhoneSplitUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Pick a session, or start one with +"].exists, "the split stays off")
     }
 
-    func testNoOfferWithoutRoomEvenWhileJuggling() {
+    /// Upright, the offer is the stacked split: trying it keeps the list above the next session opened.
+    func testPortraitOffersTheStackedSplit() {
         let app = launchJuggling(orientation: .portrait)
-        XCTAssertTrue(app.buttons["new-session"].waitForExistence(timeout: 10), "Home did not load")
-        XCTAssertFalse(offer(app).waitForExistence(timeout: 2), "a portrait phone has no room, so nothing to offer")
+        XCTAssertTrue(offer(app).waitForExistence(timeout: 10), "juggling in portrait should offer the stacked split")
+        attachScreenshot(named: "split-offer-portrait")
+        app.buttons["split-offer-try"].tap()
+        XCTAssertFalse(offer(app).waitForExistence(timeout: 2), "the offer goes away once answered")
+        app.staticTexts["Tool group header colors"].firstMatch.tap()
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        XCTAssertTrue(listButton(app).isHittable, "the list stays on screen above the session")
+        XCTAssertLessThan(listButton(app).frame.maxY, header(app).frame.minY, "the list sits above the session")
+    }
+
+    /// With the stacked split on and nothing open, the list has the whole screen: no empty placeholder below it,
+    /// at launch and after Back from a session.
+    private func nothingOpenGivesTheListTheScreen(_ half: String) {
+        let app = launchRollout(half, onboardingSeen: true)
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        let headerY = header(app).frame.midY
+        let back = app.navigationBars.buttons.allElementsBoundByIndex.first {
+            $0.isHittable && abs($0.frame.midY - headerY) < 30 && $0.frame.maxX < header(app).frame.minX
+        }
+        XCTAssertNotNil(back, "no Back button beside the session header")
+        back?.tap()
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-nothing-open-\(half)")
+        XCTAssertTrue(listButton(app).isHittable, "Back returns to the list")
+        XCTAssertFalse(app.staticTexts["Pick a session, or start one with +"].isHittable,
+                       "no empty placeholder below the list")
+        XCTAssertFalse(app.buttons["stacked-split-handle"].exists, "no handle with nothing below it")
+    }
+
+    func testWithNothingOpenTheListHasTheScreen() { nothingOpenGivesTheListTheScreen("on") }
+    func testWithNothingOpenTheListHasTheScreenWithoutTheHandle() { nothingOpenGivesTheListTheScreen("off") }
+
+    /// With nothing open, the list has the whole screen. A new session opened from "+" used to land in the
+    /// detail below it and stay folded away, so "+" looked like it did nothing.
+    func testNewSessionFromAFullScreenListOpensBelowIt() {
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        Thread.sleep(forTimeInterval: 1)
+        let app = XCUIApplication()
+        app.launchArguments = ["-demo", "-sethomefilter", "", "-phoneSplit", "stacked",
+                               "-rollout.stackedSplitDrag", "on", "-onboarding.stackedSplitDrag.seen", "YES"]
+        app.launch()
+        XCTAssertTrue(listButton(app).waitForExistence(timeout: 10), "the list is on screen")
+        listButton(app).tap()
+        let project = app.buttons["new-session-space-space-harness"]
+        XCTAssertTrue(project.waitForExistence(timeout: 5), "the project picker opened")
+        project.tap()
+        let context = app.descendants(matching: .any)["new-session-context"]
+        XCTAssertTrue(context.waitForExistence(timeout: 5), "the new session opened")
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-new-session-from-list")
+        XCTAssertTrue(context.isHittable, "the new session is on screen, not folded away below the list")
+    }
+
+    /// The lower pane's list has Home's archived shelf too, and an archived session opens there.
+    func testTheLowerPaneOffersArchivedSessions() {
+        let app = launchRollout("on", onboardingSeen: true)
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        let split = app.buttons["stacked-split-open"]
+        XCTAssertTrue(split.waitForExistence(timeout: 5), "the session offers a split")
+        XCTAssertTrue(split.label.contains("below"), "the split button says what it does")
+        split.tap()
+
+        let picker = app.descendants(matching: .any)["stacked-session-picker"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 5), "the session list opened below")
+        let archived = picker.buttons.matching(NSPredicate(format: "label CONTAINS %@", "OKLCH conversion drift")).firstMatch
+        for _ in 0..<3 where !archived.isHittable { picker.swipeUp() }
+        XCTAssertTrue(archived.isHittable, "the archived shelf is in the list")
+        attachScreenshot(named: "stacked-picker-archived")
+        archived.tap()
+
+        let headers = app.descendants(matching: .any).matching(identifier: "session-header")
+        XCTAssertTrue(headers.element(boundBy: 1).waitForExistence(timeout: 5), "the archived session opened below")
+    }
+
+    /// ⌘D on the phone: a session alone in the stacked split opens the session list below it (Home's rows).
+    /// Picking one shows both sessions; × closes either pane.
+    func testStackedSplitPicksAnExistingSessionBelowAndEitherPaneCloses() {
+        let app = launchRollout("on", onboardingSeen: true)
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        let split = app.buttons["stacked-split-open"]
+        XCTAssertTrue(split.waitForExistence(timeout: 5), "the session offers a split")
+        split.tap()
+
+        let picker = app.descendants(matching: .any)["stacked-session-picker"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 5), "the session list opened below")
+        let other = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Streaming veil")).firstMatch
+        XCTAssertTrue(other.waitForExistence(timeout: 5), "the list shows the other sessions")
+        XCTAssertEqual(picker.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Tool group header")).count, 0,
+                       "the open session is not offered again")
+        attachScreenshot(named: "stacked-picker")
+        other.tap()
+
+        let headers = app.descendants(matching: .any).matching(identifier: "session-header")
+        XCTAssertTrue(headers.element(boundBy: 1).waitForExistence(timeout: 5), "two sessions are on screen")
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-two-sessions")
+        XCTAssertFalse(app.buttons["stacked-split-open"].exists, "two panes at most")
+        let closes = app.buttons.matching(identifier: "stacked-pane-close")
+        XCTAssertEqual(closes.count, 2, "each pane has its own ×")
+
+        // × on the lower pane: back to the first session with the list above.
+        closes.element(boundBy: 1).tap()
+        Thread.sleep(forTimeInterval: 0.8)
+        XCTAssertEqual(headers.count, 1, "one session left")
+        XCTAssertTrue(listButton(app).isHittable, "the list is back above it")
+
+        // Split again, pick, then × on the upper pane: the lower session takes its place.
+        app.buttons["stacked-split-open"].tap()
+        XCTAssertTrue(other.waitForExistence(timeout: 5))
+        other.tap()
+        XCTAssertTrue(headers.element(boundBy: 1).waitForExistence(timeout: 5))
+        closes.element(boundBy: 0).tap()
+        Thread.sleep(forTimeInterval: 0.8)
+        XCTAssertEqual(headers.count, 1, "one session left")
+        XCTAssertTrue(header(app).label.contains("Streaming veil"), "the lower session moved up: \(header(app).label)")
     }
 }

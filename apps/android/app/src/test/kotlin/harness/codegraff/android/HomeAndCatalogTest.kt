@@ -1,14 +1,12 @@
 package harness.codegraff.android
 
 import harness.codegraff.android.model.Chat
-import harness.codegraff.android.model.ChatIndicator
 import harness.codegraff.android.model.HarnessCatalog
 import harness.codegraff.android.model.HomeFilter
 import harness.codegraff.android.model.HomeFilterNames
 import harness.codegraff.android.model.HomeGroup
 import harness.codegraff.android.model.HomeGroupBy
 import harness.codegraff.android.model.HomeGrouping
-import harness.codegraff.android.model.HomeStatusFilter
 import harness.codegraff.android.model.MessageEntry
 import harness.codegraff.android.model.MessagePart
 import harness.codegraff.android.model.MessageRole
@@ -31,18 +29,26 @@ class HomeAndCatalogTest {
     fun everyWordOfTheQueryHasToMatchSomewhere() {
         val chats = listOf(chat("a", "Fix veil", "s1", "d1"), chat("b", "Fix deploy", "s2", "d2"), chat("c", "Unrelated"))
         val names = { c: Chat -> HomeFilterNames(if (c.spaceId == "s1") "harness" else "edge", if (c.deviceId == "d1") "studio" else "vps") }
-        val found = HomeFilter.apply(chats, "harness studio", HomeStatusFilter.All, { ChatIndicator.Idle }, names)
+        val found = HomeFilter.apply(chats, "  HARNESS\tstudio  ", names)
         assertEquals(listOf("a"), found.map { it.id })
-        assertEquals(3, HomeFilter.apply(chats, "", HomeStatusFilter.All, { ChatIndicator.Idle }, names).size)
+        assertEquals(3, HomeFilter.apply(chats, "", names).size)
     }
 
     @Test
-    fun statusFiltersMatchTheirIndicators() {
-        assertTrue(HomeStatusFilter.Attention.matches(ChatIndicator.Completed))
-        assertTrue(HomeStatusFilter.Attention.matches(ChatIndicator.AwaitingInput))
-        assertTrue(!HomeStatusFilter.Attention.matches(ChatIndicator.Working))
-        assertTrue(HomeStatusFilter.Running.matches(ChatIndicator.Working))
-        assertTrue(!HomeStatusFilter.Running.matches(ChatIndicator.Idle))
+    fun searchMatchesEveryFieldAndPreservesInputOrder() {
+        val chats = listOf(
+            chat("title", "Needle in title"),
+            chat("preview", "Preview").copy(lastMessagePreview = "needle in message"),
+            chat("branch", "Branch", branch = "fix/needle"),
+            chat("folder", "Folder").copy(cwd = "/work/needle/"),
+            chat("project", "Project", space = "s1"),
+            chat("device", "Device", device = "d2"),
+            chat("unrelated", "Other"),
+        )
+        val names = { c: Chat -> HomeFilterNames(if (c.spaceId == "s1") "Needle project" else null, if (c.deviceId == "d2") "Needle host" else "studio") }
+        assertEquals(chats.dropLast(1), HomeFilter.apply(chats, "needle", names))
+        assertEquals(chats, HomeFilter.apply(chats, " \t ", names))
+        assertTrue(HomeFilter.apply(chats, "needle missing", names).isEmpty())
     }
 
     @Test

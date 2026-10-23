@@ -8,6 +8,8 @@ struct SpaceView: View {
     @Environment(AppModel.self) private var model
     let spaceId: String
     @Binding var path: [Route]
+    /// A session whose Delete is waiting on its confirmation.
+    @State private var pendingDelete: Chat?
 
     private var space: Space? {
         model.spaces.first { $0.id == spaceId }
@@ -36,9 +38,24 @@ struct SpaceView: View {
                         Label("Archive", systemImage: "archivebox")
                     }
                     .tint(Theme.surfaceRaised)
+                    // No destructive role: SwiftUI would slide the row out
+                    // before the confirmation is answered.
+                    Button {
+                        pendingDelete = chat
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                    .tint(Theme.danger)
+                    .accessibilityIdentifier("session-delete")
                 }
             }
             ArchivedSection(spaceId: spaceId, path: $path)
+        }
+        .sessionDeleteConfirmation(pending: $pendingDelete) { chat in
+            withAnimation(Motion.resort) {
+                model.delete(chatId: chat.id)
+            }
+            path.removeAll { $0 == .chat(chat.id) }
         }
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 10)
@@ -128,9 +145,8 @@ struct NewSpaceSheet: View {
     let onCreated: (String) -> Void
 
     @State private var deviceId: String?
-    @State private var listing: FolderListing?
-    @State private var loading = false
-    @State private var error: String?
+    @State private var browser = FolderBrowserState()
+    @State private var navigationTask: Task<Void, Never>?
     @State private var creating = false
     @State private var query = ""
 
@@ -139,7 +155,21 @@ struct NewSpaceSheet: View {
     }
 
     private var selectedDeviceId: String? {
-        deviceId ?? devices.first?.id
+        if let deviceId {
+            // A removed host must not leave its folders usable, or silently
+            // redirect creation to a different computer.
+            return devices.contains { $0.id == deviceId } ? deviceId : nil
+        }
+        return devices.first?.id
+    }
+
+    private var listing: FolderListing? {
+        browser.selection(for: selectedDeviceId)?.listing
+    }
+
+    private var loading: Bool { browser.isLoading }
+    private var error: String? {
+        browser.deviceId == selectedDeviceId ? browser.error : nil
     }
 
     var body: some View {
@@ -193,8 +223,17 @@ struct NewSpaceSheet: View {
             // Hold on to the computer the sheet opened on: falling back to "the
             // first device" let a re-sorted device list switch computers and
             // reload the listing from the top while someone was browsing.
-            if deviceId == nil { deviceId = selectedDeviceId }
-            await load(path: nil)
+            guard !Task.isCancelled else { return }
+            let host = selectedDeviceId
+            if deviceId == nil { deviceId = host }
+            navigationTask?.cancel()
+            browser.selectDevice(host)
+            guard let request = browser.begin(path: nil) else { return }
+            await load(request)
+        }
+        .onDisappear {
+            navigationTask?.cancel()
+            browser.cancelPendingRequest()
         }
     }
 
@@ -206,10 +245,12 @@ struct NewSpaceSheet: View {
                 ForEach(devices) { device in
                     let selected = device.id == selectedDeviceId
                     Button {
-                        guard deviceId != device.id else { return }
+                        guard !creating, selectedDeviceId != device.id else { return }
                         UISelectionFeedbackGenerator().selectionChanged()
+                        navigationTask?.cancel()
+                        browser.selectDevice(device.id)
                         deviceId = device.id
-                        listing = nil
+                        query = ""
                     } label: {
                         HStack(spacing: 7) {
                             Circle()
@@ -225,6 +266,7 @@ struct NewSpaceSheet: View {
                         .background(selected ? ink(0.15) : ink(0.05), in: Capsule())
                     }
                     .buttonStyle(.plain)
+                    .disabled(creating)
                 }
             }
         }
@@ -234,8 +276,7 @@ struct NewSpaceSheet: View {
         HStack(spacing: 10) {
             Button {
                 if let parent = listing?.parent {
-                    currentIsRepo = false
-                    Task { await load(path: parent) }
+                    navigate(path: parent, isRepo: false)
                 }
             } label: {
                 Image(systemName: "chevron.left")
@@ -245,7 +286,7 @@ struct NewSpaceSheet: View {
                     .background(ink(0.06), in: Circle())
             }
             .buttonStyle(.plain)
-            .disabled(listing?.parent == nil)
+            .disabled(listing?.parent == nil || creating)
 
             Text(listing?.path ?? " ")
                 .font(Theme.mono(12))
@@ -309,8 +350,7 @@ struct NewSpaceSheet: View {
         Button {
             guard let base = listing?.path else { return }
             let child = base.hasSuffix("/") ? base + entry.name : "\(base)/\(entry.name)"
-            currentIsRepo = entry.isRepo
-            Task { await load(path: child) }
+            navigate(path: child, isRepo: entry.isRepo)
         } label: {
             HStack(spacing: 12) {
                 LineIconView(entry.isRepo ? .folderWithFiles : .folder, size: 16,
@@ -338,13 +378,14 @@ struct NewSpaceSheet: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(SheetRowButtonStyle())
+        .disabled(creating)
     }
 
     private var useFolderButton: some View {
         let name = (listing?.path as NSString?)?.lastPathComponent ?? ""
         return SheetPrimaryButton(
             title: creating ? "Creating…" : (name.isEmpty ? "Use this folder" : "Use “\(name)”"),
-            enabled: listing != nil && !creating && !loading
+            enabled: browser.creationTarget(for: selectedDeviceId) != nil && !creating
         ) {
             create()
         }
@@ -369,29 +410,35 @@ struct NewSpaceSheet: View {
 
     // MARK: Data
 
-    private func load(path: String?) async {
-        guard let selectedDeviceId else { return }
-        loading = true
-        error = nil
-        let result = await model.listFolders(deviceId: selectedDeviceId, path: path)
-        loading = false
-        if let result {
-            withAnimation(Motion.fadeQuick) {
-                listing = result
-            }
-        } else if listing == nil {
-            error = "Couldn't reach \(model.deviceName(selectedDeviceId)). Make sure it's online."
+    private func navigate(path: String, isRepo: Bool) {
+        guard !creating, browser.deviceId == selectedDeviceId,
+              let request = browser.begin(path: path, isRepo: isRepo) else { return }
+        navigationTask?.cancel()
+        navigationTask = Task { await load(request) }
+    }
+
+    private func load(_ request: FolderBrowserState.Request) async {
+        guard !Task.isCancelled else {
+            browser.finish(request, listing: nil, currentDeviceId: selectedDeviceId,
+                           cancelled: true, failureMessage: "")
+            return
+        }
+        let result = await model.listFolders(deviceId: request.deviceId, path: request.path)
+        withAnimation(Motion.fadeQuick) {
+            _ = browser.finish(request, listing: result, currentDeviceId: selectedDeviceId,
+                           cancelled: Task.isCancelled,
+                           failureMessage: "Couldn't open that folder on \(model.deviceName(request.deviceId)). Make sure it's online.")
         }
     }
 
     private func create() {
-        guard let selectedDeviceId, let listing else { return }
+        guard !creating, let target = browser.creationTarget(for: selectedDeviceId) else { return }
         creating = true
-        // Initial git flag = the isRepo the engine stamped when we descended
-        // into this folder; the owning device's SpacesSync re-verifies anyway.
+        // Capture host, path and Git metadata from the same successful listing,
+        // rather than combining a current host with an earlier host's reply.
         Task {
-            let id = await model.createSpace(deviceId: selectedDeviceId,
-                                             path: listing.path, gitDetected: currentIsRepo)
+            let id = await model.createSpace(deviceId: target.deviceId,
+                                             path: target.listing.path, gitDetected: target.isRepo)
             creating = false
             if let id {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -400,8 +447,4 @@ struct NewSpaceSheet: View {
             }
         }
     }
-
-    /// isRepo of the folder we're currently inside (set on descend; cleared
-    /// when navigating up or switching device — unknowable there).
-    @State private var currentIsRepo = false
 }

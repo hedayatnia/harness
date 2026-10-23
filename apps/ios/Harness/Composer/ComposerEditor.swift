@@ -5,11 +5,50 @@ import UniformTypeIdentifiers
 /// A stable native editor keeps marked text, selection, and keyboard ownership
 /// in one place. Sending commits and clears this same text storage synchronously.
 @MainActor
-final class ComposerEditorController: NSObject, UITextViewDelegate {
+final class ComposerEditorController: NSObject, UITextViewDelegate, UITextDropDelegate {
     weak var view: UITextView?
     var textChanged: (String) -> Void = { _ in }
     var focusChanged: (Bool) -> Void = { _ in }
     private var applying = false
+    var attachmentDraft: AttachmentDraft?
+
+    // UITextView owns a native drop interaction which wins over SwiftUI's
+    // session-wide target. Route images to attachments, never into text storage.
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           proposalForDrop drop: UITextDropRequest) -> UITextDropProposal {
+        let providers = drop.dropSession.items.map(\.itemProvider)
+        guard providers.contains(where: AttachmentDraft.supports), let attachmentDraft else {
+            return drop.suggestedProposal
+        }
+        let proposal = UITextDropProposal(operation: attachmentDraft.canImport ? .copy : .cancel)
+        proposal.dropPerformer = .delegate
+        proposal.dropProgressMode = .custom
+        return proposal
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           willPerformDrop drop: UITextDropRequest) {
+        let providers = drop.dropSession.items.map(\.itemProvider)
+        guard providers.contains(where: AttachmentDraft.supports) else { return }
+        attachmentDraft?.targeted = false
+        attachmentDraft?.receive(providers)
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           dropSessionDidUpdate session: UIDropSession) {
+        attachmentDraft?.targeted = session.items.contains { AttachmentDraft.supports($0.itemProvider) }
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           dropSessionDidExit session: UIDropSession) {
+        attachmentDraft?.targeted = false
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           dropSessionDidEnd session: UIDropSession) {
+        attachmentDraft?.targeted = false
+    }
+
 
     func commit() {
         guard let view else { return }
@@ -101,6 +140,7 @@ struct ComposerEditor: UIViewRepresentable {
     let placeholder: String
     let maxLines: Int
     let controller: ComposerEditorController
+    var attachmentDraft: AttachmentDraft? = nil
     var onModifiedSubmit: () -> Void = {}
     var onPasteImages: (([Data]) -> Void)? = nil
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -115,6 +155,7 @@ struct ComposerEditor: UIViewRepresentable {
         view.accessibilityIdentifier = "composer-input"
         view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         view.delegate = controller
+        view.textDropDelegate = controller
         controller.view = view
         return view
     }
@@ -122,6 +163,7 @@ struct ComposerEditor: UIViewRepresentable {
     func updateUIView(_ view: UITextView, context: Context) {
         (view as? ComposerTextView)?.modifiedSubmit = onModifiedSubmit
         (view as? ComposerTextView)?.pasteImages = onPasteImages
+        controller.attachmentDraft = attachmentDraft
         controller.textChanged = { if text != $0 { text = $0 } }
         controller.focusChanged = { if focused != $0 { focused = $0 } }
         view.font = UIFontMetrics(forTextStyle: .body).scaledFont(

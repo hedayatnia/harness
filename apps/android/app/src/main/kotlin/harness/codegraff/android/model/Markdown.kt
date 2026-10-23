@@ -2,7 +2,8 @@ package harness.codegraff.android.model
 
 // A small markdown reader for transcript text: paragraphs, headings, bullet and
 // numbered lists, fenced code, block quotes, tables, rules, and the inline marks
-// agents use most (`code`, **bold**, *italic*, ~~strike~~, [links](url)). Unterminated
+// agents use most (`code`, **bold**, *italic*, ~~strike~~, [links](url), and math
+// as readable Unicode, see MathText). Unterminated
 // marks stay literal, so a half-streamed reply never flickers into the wrong shape.
 
 data class MdSpan(
@@ -141,6 +142,24 @@ fun parseInline(s: String): List<MdSpan> {
             val end = s.indexOf('`', i + 1)
             if (end > i + 1) { flush(); out += MdSpan(s.substring(i + 1, end), code = true); i = end + 1; continue }
         }
+        if (c == '\\' || c == '$') {
+            val math = MathText.spanAt(s, i)
+            if (math != null) {
+                val text = MathText.toUnicode(math.latex)
+                if (math.display) {
+                    // Display math takes a line of its own.
+                    while (plain.endsWith(" ")) plain.setLength(plain.length - 1)
+                    flush()
+                    val atLineStart = out.isEmpty() || out.last().text.endsWith("\n")
+                    out += MdSpan((if (atLineStart) "" else "\n") + text + "\n")
+                    i = math.end
+                    while (i < s.length && s[i] == ' ') i++
+                } else {
+                    flush(); out += MdSpan(text); i = math.end
+                }
+                continue
+            }
+        }
         if (c == '[') {
             val m = linkRe.find(s.substring(i))
             if (m != null) {
@@ -174,5 +193,11 @@ fun parseInline(s: String): List<MdSpan> {
         i++
     }
     flush()
+    // Display math at the end leaves a line break with nothing after it.
+    out.lastOrNull()?.takeIf { it.text.endsWith("\n") }?.let { last ->
+        val trimmed = last.text.trimEnd('\n')
+        out[out.lastIndex] = last.copy(text = trimmed)
+        if (trimmed.isEmpty()) out.removeAt(out.lastIndex)
+    }
     return out
 }

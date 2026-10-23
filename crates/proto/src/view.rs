@@ -445,25 +445,26 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
 }
 
 /// A parent's control of its subagents, as drivers name them (codex collab
-/// tools, graff background agents): "Wait for agent 1[: <title>]" reads
-/// "Waiting on <title>" (or "agent 1" until the spawn is known), not the
-/// generic "Tool · Wait for agent 1".
+/// tools, graff background agents): waits always read "Waiting on subagent".
+/// Worker IDs and task titles remain in the call for routing and linked tabs,
+/// rather than exposing implementation details in the wait chip.
 fn agent_control(name: &str) -> Option<(&'static str, String)> {
-    let target = |rest: &str| {
-        rest.split_once(": ")
-            .map_or(rest, |(_, title)| title)
-            .to_owned()
-    };
-    if let Some(rest) = name.strip_prefix("Wait for ") {
-        return Some(("Waiting on", target(rest)));
+    if name.starts_with("Wait for ") {
+        return Some(("Waiting on", "subagent".into()));
     }
-    if let Some(rest) = name.strip_prefix("Message agent") {
-        return Some(("Message", target(&format!("agent{rest}"))));
+    for (prefix, label) in [
+        ("Message agent", "Message"),
+        ("Resume agent", "Resume"),
+        ("Close agent", "Close"),
+    ] {
+        if name == prefix || name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with(' ')) {
+            return Some((label, "subagent".into()));
+        }
     }
     match name {
-        "Send agent message" => Some(("Message", "agent".into())),
-        "Resume agent" => Some(("Resume", "agent".into())),
-        "Close agent" => Some(("Close", "agent".into())),
+        "agent_output" => Some(("Waiting on", "subagent".into())),
+        "Send agent message" | "agent_message" => Some(("Message", "subagent".into())),
+        "subagent_resume" => Some(("Resume", "subagent".into())),
         "Load tools" => Some(("Load", "tools".into())),
         _ => None,
     }

@@ -80,9 +80,11 @@ enum PhoneSplit: String, CaseIterable, Identifiable {
 
     /// The pane actually shown. Typing in the session's composer gives the session the screen above the
     /// keyboard, whatever the handle's rest; the rest comes back when the composer lets the keyboard go
-    /// (sending puts it away).
-    static func shownPane(resting: StackedPane, composerFocused: Bool) -> StackedPane {
-        composerFocused ? .session : resting
+    /// (sending puts it away). With nothing open in the detail the list has the screen, whatever the rest:
+    /// the detail would only be an empty placeholder, half the screen or all of it.
+    static func shownPane(resting: StackedPane, composerFocused: Bool, hasDetail: Bool = true) -> StackedPane {
+        guard hasDetail else { return .list }
+        return composerFocused ? .session : resting
     }
 
     /// Height the session keeps below a stacked list: its header, a few rows and the composer.
@@ -125,6 +127,11 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
     let arrangement: PhoneSplit.Arrangement
     /// The session the detail shows: opening one from a list that has the screen brings the split back.
     var selection: String? = nil
+    /// What the detail shows (its first route). Opening anything from a list that has the screen, not only a
+    /// session, brings the split back: a new session opened there stayed folded away below the list.
+    var detailRoute: AnyHashable? = nil
+    /// Whether the detail shows anything (a session, a project, a new session), not its empty placeholder.
+    var hasDetail = true
     @ViewBuilder var list: List
     @ViewBuilder var detail: Detail
     @State private var availableHeight: CGFloat = .infinity
@@ -160,8 +167,9 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
     private var stacked: some View {
         // The list's height in the split (the keyboard can shrink it) and with the whole screen.
         let open = PhoneSplit.stackedListHeight(extent: arrangement.listExtent, available: availableHeight)
-        let full = availableHeight.isFinite ? max(availableHeight - Self.handleFolded, open) : open
-        let shown = PhoneSplit.shownPane(resting: dragEnabled ? pane : .split, composerFocused: composerFocused)
+        let full = availableHeight.isFinite ? max(availableHeight - (hasDetail ? Self.handleFolded : 0), open) : open
+        let shown = PhoneSplit.shownPane(
+            resting: dragEnabled ? pane : .split, composerFocused: composerFocused, hasDetail: hasDetail)
         let resting = PhoneSplit.stackedListHeight(for: shown, open: open, full: full)
         let height = dragEnabled ? PhoneSplit.draggedListHeight(resting: resting, drag: drag, extent: full) : resting
         // Mid-drag the handle is a plain grabber; at rest it shows the way back to a folded pane.
@@ -176,10 +184,21 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
             list.frame(height: height)
                 .clipped()
                 // The clip stops the list's own background at the split's top edge, so the status bar above
-                // it showed the session's lighter color. While the list is on screen it colors the status bar.
-                .background(height > 0 ? Theme.surface : Theme.bg, ignoresSafeAreaEdges: .top)
+                // it showed the session's lighter color. While the list is on screen it colors the status bar,
+                // and with nothing open below it the home indicator's strip too.
+                .background(height > 0 ? Theme.surface : Theme.bg, ignoresSafeAreaEdges: hasDetail ? .top : .vertical)
                 .accessibilityHidden(height == 0)
-            if dragEnabled {
+                .overlay(alignment: .bottom) {
+                    // Above the handle, pointing down at it, so the session's own bar stays in view.
+                    if showDragOnboarding {
+                        StackedDragOnboarding { finishOnboarding() }
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 6)
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    }
+                }
+            // Nothing open: no handle and no divider, the list goes to the bottom of the screen.
+            if hasDetail, dragEnabled {
                 StackedSplitHandle(state: handleState, action: tapHandle)
                     .gesture(
                         DragGesture(minimumDistance: 4, coordinateSpace: .global)
@@ -195,7 +214,7 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
                                 setPane(next)
                             }
                     )
-            } else {
+            } else if hasDetail {
                 Rectangle().fill(Theme.textFaint.opacity(0.25)).frame(height: 0.5)
             }
             detail.frame(minHeight: 0, maxHeight: .infinity)
@@ -205,27 +224,24 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
                     guard focused != composerFocused else { return }
                     withAnimation(reduceMotion ? nil : Motion.collapse) { composerFocused = focused }
                 }
-                .overlay(alignment: .top) {
-                    if showDragOnboarding {
-                        StackedDragOnboarding { finishOnboarding() }
-                            .padding(.horizontal, 16)
-                            .padding(.top, 6)
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-                }
         }
+        .animation(reduceMotion ? nil : Motion.collapse, value: hasDetail)
         // Above the keyboard: this is the height the two panes share right now.
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { availableHeight = $0 }
         .onChange(of: selection) { _, chat in
             // Picking a session from a list that has the screen opens it in the split.
             if chat != nil, pane == .list { setPane(.split) }
         }
+        .onChange(of: detailRoute) { _, route in
+            if route != nil, pane == .list { setPane(.split) }
+        }
+        .onChange(of: hasDetail) { _, shown in
+            // Back from the last screen in the detail returns to the list; the next session opens in the split.
+            if !shown { setPane(.list) } else { introduceHandle() }
+        }
         .onAppear {
             FeatureUsage.record(.splitShown, for: .stackedSplitDrag)
-            if dragEnabled, !FeatureOnboarding.hasSeen(.stackedSplitDrag) {
-                showDragOnboarding = true
-                FeatureUsage.record(.onboardingShown, for: .stackedSplitDrag)
-            }
+            introduceHandle()
         }
     }
 
@@ -241,6 +257,8 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
     }
 
     private func setPane(_ next: PhoneSplit.StackedPane) {
+        // A fold with nothing open would rest on an empty screen: the list takes it instead.
+        let next = next == .session && !hasDetail ? .list : next
         if next != pane {
             let event: FeatureUsageEvent = switch next {
             case .session: .folded
@@ -259,6 +277,13 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
+    /// The one-time callout, once there is a session below the handle to give the screen to.
+    private func introduceHandle() {
+        guard dragEnabled, hasDetail, !showDragOnboarding, !FeatureOnboarding.hasSeen(.stackedSplitDrag) else { return }
+        showDragOnboarding = true
+        FeatureUsage.record(.onboardingShown, for: .stackedSplitDrag)
+    }
+
     /// The callout goes for good on "Got it" or on the first drag: either way the person has met the handle.
     private func finishOnboarding() {
         FeatureOnboarding.markSeen(.stackedSplitDrag)
@@ -267,7 +292,7 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
     }
 }
 
-/// The one-time introduction to the stacked split's handle, pointing up at it.
+/// The one-time introduction to the stacked split's handle, pointing down at it.
 private struct StackedDragOnboarding: View {
     let dismiss: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -275,11 +300,6 @@ private struct StackedDragOnboarding: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Points at the handle just above.
-            Image(systemName: "arrowtriangle.up.fill")
-                .font(.system(size: 12))
-                .foregroundStyle(Theme.surfaceRaised)
-                .offset(y: 3)
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
                     .font(.system(size: 18, weight: .semibold))
@@ -307,6 +327,11 @@ private struct StackedDragOnboarding: View {
             .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 14))
             .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Theme.border, lineWidth: 1))
             .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
+            // Points at the handle just below.
+            Image(systemName: "arrowtriangle.down.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.surfaceRaised)
+                .offset(y: -3)
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("stacked-drag-onboarding")

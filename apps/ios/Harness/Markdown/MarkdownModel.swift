@@ -63,12 +63,16 @@ struct TopBlock: Hashable {
 enum MarkdownParser {
     /// Parse a complete markdown source into top-level blocks.
     static func parse(_ source: String) -> [TopBlock] {
-        let document = Document(parsing: source)
-        return document.children.compactMap { child in
+        // Math spans would read as escaped punctuation, so they're parsed as
+        // tokens and come back as readable math (MathText).
+        let (protected, formulas) = MathText.protect(source)
+        let document = Document(parsing: protected)
+        let blocks: [TopBlock] = document.children.compactMap { child in
             guard let block = convertBlock(child) else { return nil }
             let line = child.range?.lowerBound.line ?? 1
             return TopBlock(startLine: line, block: block)
         }
+        return MathText.restore(blocks, formulas)
     }
 
     private static func convertBlock(_ markup: Markup) -> MDBlock? {

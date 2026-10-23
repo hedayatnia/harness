@@ -245,6 +245,15 @@ struct CheckoutChangeRequestParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MergeChangeRequestParams {
+    cwd: String,
+    #[serde(default)]
+    branch: Option<String>,
+    number: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SwitchRefParams {
     /// The checkout to switch — a session's cwd (main folder or worktree).
     repo_path: String,
@@ -617,7 +626,13 @@ enum MutateParams {
     #[serde(rename_all = "camelCase")]
     SetChatHost { chat_id: String, device_id: String },
     #[serde(rename_all = "camelCase")]
-    SetChatArchived { chat_id: String, archived: bool },
+    SetChatArchived {
+        chat_id: String,
+        archived: bool,
+        /// Automatic close requests retain their intent time across RPC delay.
+        #[serde(default)]
+        archive_requested_at: Option<i64>,
+    },
     /// Change one pin without replacing another device's edits.
     #[serde(rename_all = "camelCase")]
     ChangeSidebarPin {
@@ -834,6 +849,24 @@ impl EngineRpc {
             }
         }
         self.file_search_root(p).await
+    }
+
+    /// Kept off the dispatcher's stack: `gh` runs three subprocesses here.
+    #[inline(never)]
+    fn merge_change_request(
+        &self,
+        params: serde_json::Value,
+    ) -> futures::future::BoxFuture<'_, Result<RpcReply, RpcError>> {
+        Box::pin(async move {
+            let p: MergeChangeRequestParams = parse_params(params)?;
+            let cwd = self.change_request_root(&p.cwd).await?;
+            let result = self
+                .change_requests
+                .merge(&cwd, p.branch.as_deref(), p.number)
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            RpcReply::value(&result)
+        })
     }
 
     /// Accept only a checkout already named by a local chat or contained in a
@@ -1103,11 +1136,18 @@ impl EngineRpc {
                 .set_chat_host(&chat_id, &device_id)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatArchived { chat_id, archived } => self
-                .workspace
-                .set_chat_archived(&chat_id, archived)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatArchived { chat_id, archived, archive_requested_at } => {
+                match archive_requested_at.filter(|_| archived) {
+                    Some(at) => self.workspace.archive_chat_at(&chat_id, at),
+                    None => self.workspace.set_chat_archived(&chat_id, archived),
+                }
+                .map_err(failed)?;
+                // A person's restore lets peer mail held while archived out (#498).
+                if !archived {
+                    self.doc_host.kick_queue(&chat_id);
+                }
+                Ok(())
+            }
             MutateParams::ChangeSidebarPin { change } => {
                 self.workspace.change_sidebar_pin(&change).map_err(failed)
             }
@@ -1335,6 +1375,7 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_WORKSPACE_GIT_STATUS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
+            | methods::MERGE_CHANGE_REQUEST
             | methods::GET_CHECKOUT_DIFF
             | methods::DISCARD_WORKING_TREE
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
@@ -1644,6 +1685,9 @@ impl RpcService for EngineRpc {
                 .handle(method, params)
                 .await;
         }
+        if method == methods::MERGE_CHANGE_REQUEST {
+            return self.merge_change_request(params).await;
+        }
         match method {
             methods::CODEGRAFF_SIGN_IN => {
                 let auth = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir());
@@ -1694,8 +1738,20 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&sandboxes)
             }
             methods::CODEGRAFF_CREATE_SANDBOX => {
+                let size = params
+                    .get("size")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|size| !size.is_empty());
                 let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
-                    .create_sandbox()
+                    .create_sandbox(size)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&sandbox)
+            }
+            methods::CODEGRAFF_CREATE_TEMPORARY_SANDBOX => {
+                let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .create_temporary_sandbox()
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&sandbox)
@@ -1710,9 +1766,32 @@ impl RpcService for EngineRpc {
                     Some("start") => auth.start_sandbox(id).await,
                     Some("stop") => auth.stop_sandbox(id).await,
                     Some("delete") => auth.delete_sandbox(id).await,
+                    Some("keep-running-on") => {
+                        auth.set_sandbox_keep_running(id, true).await.map(drop)
+                    }
+                    Some("keep-running-off") => {
+                        auth.set_sandbox_keep_running(id, false).await.map(drop)
+                    }
                     _ => Err("unknown sandbox action".into()),
                 }
                 .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CODEGRAFF_GITHUB_RUNNERS => {
+                let runners = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runners()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&runners)
+            }
+            methods::CODEGRAFF_GITHUB_RUNNER_ACTION => {
+                let action: crate::codegraff_auth::RunnerAction =
+                    serde_json::from_value(params.clone())
+                        .map_err(|e| RpcError::Failed(format!("bad GitHub CI action: {e}")))?;
+                crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runner_action(action)
+                    .await
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::ROOM_REQUEST => {
@@ -1991,16 +2070,28 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Prompts first: watch_queue's publish then fills both.
+                let prompts = handle.watch_pending_prompts();
                 let rx = handle.watch_queue();
                 Ok(RpcReply::Stream(
-                    futures::stream::unfold((rx, true), |(mut rx, first)| async move {
-                        if !first {
-                            rx.changed().await.ok()?;
-                        }
-                        let items = rx.borrow_and_update().clone();
-                        let value = serde_json::json!({ "items": items });
-                        Some((value, (rx, false)))
-                    })
+                    futures::stream::unfold(
+                        (rx, prompts, true),
+                        |(mut rx, mut prompts, first)| async move {
+                            if !first {
+                                tokio::select! {
+                                    changed = rx.changed() => changed.ok()?,
+                                    changed = prompts.changed() => changed.ok()?,
+                                }
+                            }
+                            let items = rx.borrow_and_update().clone();
+                            let pending = prompts.borrow_and_update().clone();
+                            let value = serde_json::json!({
+                                "items": items,
+                                "pendingPrompts": pending,
+                            });
+                            Some((value, (rx, prompts, false)))
+                        },
+                    )
                     .boxed(),
                 ))
             }

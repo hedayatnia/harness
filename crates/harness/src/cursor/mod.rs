@@ -95,6 +95,10 @@ pub struct CursorHarness {
     kill_grace: Duration,
     /// Credential-scoped successful catalog, with bounded refresh and backoff.
     pub(crate) models_cache: catalog::Catalog,
+    /// Models whose catalog default is a Max Mode variant, from the latest
+    /// discovery. Their defaults are never sent: the backend can reject the
+    /// very variant the catalog marks default while the bare id runs.
+    max_mode_defaults: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Default for CursorHarness {
@@ -104,6 +108,7 @@ impl Default for CursorHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             models_cache: catalog::Catalog::default(),
+            max_mode_defaults: Default::default(),
         }
     }
 }
@@ -177,11 +182,37 @@ impl CursorHarness {
                 .ok_or_else(|| {
                     HarnessError::Protocol("cursor models probe returned no catalog".into())
                 })?;
+            *self
+                .max_mode_defaults
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = max_mode_default_ids(&items);
             Ok::<_, HarnessError>(map_model_items(&items))
         };
         tokio::time::timeout(Duration::from_secs(15), run)
             .await
             .map_err(|_| HarnessError::Protocol("cursor models probe timed out".into()))?
+    }
+
+    /// The catalog that supplies omitted parameter defaults. The picker has
+    /// normally loaded it already, so a run never waits on a refresh; only a
+    /// cold catalog is fetched. A failed fetch yields none (bare SDK ids), and
+    /// Max Mode defaults are left out (bare ids, as before).
+    async fn catalog_for_defaults(&self) -> Vec<Model> {
+        let mut models = match self
+            .model_context()
+            .ok()
+            .flatten()
+            .and_then(|context| self.models_cache.cached_for(context.key()))
+        {
+            Some(models) => models,
+            None => self.models().await.unwrap_or_default(),
+        };
+        let max_mode = self
+            .max_mode_defaults
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        models.retain(|model| !max_mode.contains(&model.id));
+        models
     }
 
     /// (program, args) for the shim process: the test override, or node
@@ -291,9 +322,18 @@ impl Harness for CursorHarness {
 
     async fn run(
         &self,
-        request: RunRequest,
+        mut request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        // Plus requires explicit defaults, but catalog outages must not block
+        // existing SDK runs.
+        let catalog = self.catalog_for_defaults().await;
+        fill_catalog_defaults(
+            &catalog,
+            request.model.as_deref(),
+            &mut request.model_options,
+        );
+
         let lease = if self.executable.is_none() {
             Some(state::Lease::acquire(&state::state_root(), request.resume.as_deref()).await?)
         } else {
@@ -376,6 +416,52 @@ impl Harness for CursorHarness {
         })
         .boxed())
     }
+}
+
+/// Send every parameter the user left implicit as the account catalog's
+/// default — the value the picker shows. Cursor resolves a bare model id
+/// server-side, which on some plans (Plus) is a variant the account cannot
+/// run, while the catalog's credential-scoped default is one it can.
+fn fill_catalog_defaults(
+    catalog: &[Model],
+    model: Option<&str>,
+    options: &mut serde_json::Map<String, Value>,
+) {
+    let Some(model) = model.and_then(|id| catalog.iter().find(|m| m.id == id)) else {
+        return;
+    };
+    for option in &model.options {
+        // Legacy sessions carry the pre-discovery `optimizeFor`, which the
+        // shim translates; its catalog twin must not ride beside it.
+        if option.id == "optimize_for" && options.contains_key("optimizeFor") {
+            continue;
+        }
+        options
+            .entry(option.id.clone())
+            .or_insert_with(|| Value::String(option.default_choice.clone()));
+    }
+}
+
+/// Catalog items whose default variant is a Max Mode variant.
+fn max_mode_default_ids(items: &Value) -> std::collections::HashSet<String> {
+    items
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|item| {
+            item.get("variants")
+                .and_then(Value::as_array)
+                .and_then(|variants| {
+                    variants
+                        .iter()
+                        .find(|v| v.get("isDefault").and_then(Value::as_bool) == Some(true))
+                })
+                .and_then(|v| v.get("isMaxMode").and_then(Value::as_bool))
+                == Some(true)
+        })
+        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect()
 }
 
 /// `Cursor.models.list()` items → picker models. Item shape (1.0.28

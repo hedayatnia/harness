@@ -60,8 +60,44 @@
       "name": "Harness cloud"
     }
   ],
+  "personalSizes": {
+    "sizes": [
+      {
+        "id": "standard",
+        "cpu": 2,
+        "memoryGiB": 4,
+        "diskGiB": 40,
+        "pricePerHourMicroUsd": 100000,
+        "default": true
+      },
+      {
+        "id": "large",
+        "cpu": 4,
+        "memoryGiB": 8,
+        "diskGiB": 40,
+        "pricePerHourMicroUsd": 200000
+      }
+    ]
+  },
   "plans": {
+    "createTemporary": [
+      {
+        "method": "POST",
+        "path": "/v1/sandboxes",
+        "body": {
+          "provider": "auto",
+          "ephemeral": true,
+          "name": "Temporary sandbox",
+          "autoStopMinutes": 30,
+          "labels": { "harness-purpose": "temporary" }
+        }
+      }
+    ],
     "create": [
+      {
+        "method": "GET",
+        "path": "/v1/sandboxes/personal-sizes"
+      },
       {
         "method": "POST",
         "path": "/v1/sandboxes",
@@ -69,7 +105,35 @@
           "provider": "fleet",
           "persistent": true,
           "name": "Harness cloud",
-          "autoStopMinutes": 30
+          "autoStopMinutes": 30,
+          "keepRunning": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/v1/sandboxes/{id}/harness",
+        "body": {
+          "deviceName": "{deviceName}"
+        }
+      }
+    ],
+    "createLarge": [
+      {
+        "method": "GET",
+        "path": "/v1/sandboxes/personal-sizes"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/sandboxes",
+        "body": {
+          "provider": "fleet",
+          "persistent": true,
+          "name": "Harness cloud",
+          "autoStopMinutes": 30,
+          "keepRunning": true,
+          "cpu": 4,
+          "memory": 8,
+          "disk": 40
         }
       },
       {
@@ -87,7 +151,11 @@
       },
       {
         "method": "POST",
-        "path": "/v1/sandboxes/{id}/start"
+        "path": "/v1/sandboxes/{id}/start",
+        "body": {
+          "leaseSeconds": 1800,
+          "keepRunning": true
+        }
       },
       {
         "method": "POST",
@@ -116,6 +184,24 @@
         "path": "/v1/sandboxes/{id}/stop"
       }
     ],
+    "keepRunningOn": [
+      {
+        "method": "POST",
+        "path": "/v1/sandboxes/{id}/keep-running",
+        "body": {
+          "enabled": true
+        }
+      }
+    ],
+    "keepRunningOff": [
+      {
+        "method": "POST",
+        "path": "/v1/sandboxes/{id}/keep-running",
+        "body": {
+          "enabled": false
+        }
+      }
+    ],
     "delete": [
       {
         "method": "DELETE",
@@ -125,7 +211,8 @@
     "retry": "A /harness call that fails with error type harness_start_failed is repeated once; nothing else is retried.",
     "neverCalled": [
       "/codegraff"
-    ]
+    ],
+    "sizesNote": "A create first reads GET /v1/sandboxes/personal-sizes. The create body adds cpu, memory and disk (GiB) of the chosen size (the default one when none is picked). When that read fails (404 on gateways without sizes), the create body is exactly as before: no cpu, memory or disk. createLarge is the call sequence for size id \"large\" with personalSizes above; create is the sequence against a gateway whose personal-sizes answers 404."
   },
   "now": 1790856000,
   "rows": [
@@ -139,6 +226,102 @@
         "expiresAt": "2026-10-01T12:24:00Z"
       },
       "title": "Harness cloud ab12",
+      "detail": "Running · Harness ready · pauses in 24 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "deviceName": "Harness cloud ab12",
+        "expiresAt": "2026-10-01T12:24:00Z",
+        "keepRunning": true,
+        "renewError": null
+      },
+      "title": "Harness cloud ab12",
+      "detail": "Running · Harness ready · keeps running until you turn it off",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:04:00Z",
+        "keepRunning": false,
+        "renewError": "insufficient_credit"
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · Harness ready · Out of credit — pauses in 4 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:04:00Z",
+        "keepRunning": false,
+        "renewError": "key_budget"
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · Harness ready · Key budget reached — pauses in 4 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:04:00Z",
+        "keepRunning": false,
+        "renewError": "fleet_unavailable"
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · Harness ready · Couldn't renew — pauses in 4 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:04:00Z",
+        "keepRunning": true,
+        "renewError": "something_new"
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · Harness ready · Couldn't renew — pauses in 4 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:24:00Z",
+        "keepRunning": false
+      },
+      "title": "Cloud sandbox",
       "detail": "Running · Harness ready · pauses in 24 min",
       "canStart": false,
       "canStop": true,
@@ -224,7 +407,7 @@
         "expiresAt": "2026-10-01T12:24:00Z"
       },
       "title": "Harness cloud ab12",
-      "detail": "Paused",
+      "detail": "Paused — memory and files kept",
       "canStart": true,
       "canStop": false,
       "startLabel": "Start"
@@ -290,6 +473,94 @@
       "canStart": false,
       "canStop": false,
       "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "deviceName": "Harness cloud ab12",
+        "expiresAt": "2026-10-01T12:24:00Z",
+        "keepRunning": true,
+        "renewError": null,
+        "cpu": 2,
+        "memoryGiB": 4,
+        "diskGiB": 40,
+        "pricePerHourMicroUsd": 100000
+      },
+      "title": "Harness cloud ab12",
+      "detail": "Running · 2 vCPU · 4 GB · $0.10/h · keeps running until you turn it off",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:04:00Z",
+        "keepRunning": false,
+        "renewError": "insufficient_credit",
+        "cpu": 4,
+        "memoryGiB": 8,
+        "pricePerHourMicroUsd": 200000
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · 4 vCPU · 8 GB · $0.20/h · Out of credit — pauses in 4 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": false,
+        "keepRunning": true,
+        "cpu": 2,
+        "memoryGiB": 4,
+        "pricePerHourMicroUsd": 100000
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · Harness not set up · 2 vCPU · 4 GB · $0.10/h · keeps running until you turn it off",
+      "canStart": true,
+      "canStop": true,
+      "startLabel": "Set up Harness"
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "keepRunning": true,
+        "pricePerHourMicroUsd": 125000
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · $0.125/h · keeps running until you turn it off",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "paused",
+        "harness": true,
+        "cpu": 2,
+        "memoryGiB": 4,
+        "pricePerHourMicroUsd": 100000
+      },
+      "title": "Cloud sandbox",
+      "detail": "Paused — memory and files kept",
+      "canStart": true,
+      "canStop": false,
+      "startLabel": "Start"
     }
   ],
   "errors": [
@@ -357,5 +628,157 @@
       "sentence": "CodeGraff couldn't create the sandbox."
     }
   ],
-  "rowsNote": "startLabel is pinned only for rows that can be started; it is null where there is no start button."
+  "rowsNote": "startLabel is pinned only for rows that can be started; it is null where there is no start button.",
+  "keepRunningNote": "Sandboxes created or woken from Harness keep running: the gateway renews their window (autoStopMinutes long) and bills per second from Codegraff credit until they are turned off (stop, a pause) or a renewal fails. Views may carry keepRunning (missing = false) and renewError (missing = null); a renewError means the sandbox pauses when its current window ends.",
+  "rates": [
+    {
+      "microUsd": 100000,
+      "text": "$0.10/h"
+    },
+    {
+      "microUsd": 200000,
+      "text": "$0.20/h"
+    },
+    {
+      "microUsd": 125000,
+      "text": "$0.125/h"
+    },
+    {
+      "microUsd": 1500000,
+      "text": "$1.50/h"
+    },
+    {
+      "microUsd": 5000,
+      "text": "$0.005/h"
+    },
+    {
+      "microUsd": 0,
+      "text": "$0.00/h"
+    }
+  ],
+  "sizeChoices": [
+    {
+      "size": {
+        "id": "standard",
+        "cpu": 2,
+        "memoryGiB": 4,
+        "diskGiB": 40,
+        "pricePerHourMicroUsd": 100000,
+        "default": true
+      },
+      "title": "Standard",
+      "detail": "2 vCPU · 4 GB · 40 GB · $0.10/h"
+    },
+    {
+      "size": {
+        "id": "large",
+        "cpu": 4,
+        "memoryGiB": 8,
+        "diskGiB": 40,
+        "pricePerHourMicroUsd": 200000
+      },
+      "title": "Large",
+      "detail": "4 vCPU · 8 GB · 40 GB · $0.20/h"
+    }
+  ],
+  "summaries": [
+    {
+      "sandboxes": [
+        {
+          "id": "cnd_1",
+          "provider": "fleet",
+          "state": "running",
+          "harness": true,
+          "keepRunning": true,
+          "pricePerHourMicroUsd": 100000
+        }
+      ],
+      "label": "Cloud sandbox running · $0.10/h",
+      "detail": "Billed per second until you turn it off",
+      "tooltip": "Cloud sandbox running · $0.10/h — billed per second"
+    },
+    {
+      "sandboxes": [
+        {
+          "id": "cnd_1",
+          "provider": "fleet",
+          "state": "running",
+          "harness": true,
+          "keepRunning": true,
+          "pricePerHourMicroUsd": 100000
+        },
+        {
+          "id": "cnd_2",
+          "provider": "fleet",
+          "state": "running",
+          "harness": true,
+          "keepRunning": true,
+          "pricePerHourMicroUsd": 100000
+        }
+      ],
+      "label": "2 cloud sandboxes running · $0.20/h",
+      "detail": "Billed per second until you turn it off",
+      "tooltip": "2 cloud sandboxes running · $0.20/h — billed per second"
+    },
+    {
+      "sandboxes": [
+        {
+          "id": "cnd_1",
+          "provider": "fleet",
+          "state": "running",
+          "harness": true,
+          "keepRunning": true,
+          "pricePerHourMicroUsd": 100000
+        },
+        {
+          "id": "cnd_2",
+          "provider": "fleet",
+          "state": "running",
+          "harness": true,
+          "keepRunning": true
+        }
+      ],
+      "label": "2 cloud sandboxes running",
+      "detail": "Billed per second until you turn it off",
+      "tooltip": "2 cloud sandboxes running — billed per second"
+    },
+    {
+      "sandboxes": [
+        {
+          "id": "cnd_1",
+          "provider": "fleet",
+          "state": "running",
+          "harness": true,
+          "keepRunning": true
+        }
+      ],
+      "label": "Cloud sandbox running",
+      "detail": "Billed per second until you turn it off",
+      "tooltip": "Cloud sandbox running — billed per second"
+    },
+    {
+      "sandboxes": [
+        {
+          "id": "cnd_1",
+          "provider": "fleet",
+          "state": "running",
+          "harness": true,
+          "keepRunning": true,
+          "pricePerHourMicroUsd": 200000
+        },
+        {
+          "id": "cnd_2",
+          "provider": "fleet",
+          "state": "paused",
+          "harness": true,
+          "keepRunning": true,
+          "pricePerHourMicroUsd": 100000
+        }
+      ],
+      "label": "Cloud sandbox running · $0.20/h",
+      "detail": "Billed per second until you turn it off",
+      "tooltip": "Cloud sandbox running · $0.20/h — billed per second"
+    }
+  ],
+  "ratesNote": "Views may carry cpu, memoryGiB, diskGiB and pricePerHourMicroUsd (all missing on older gateways; a missing price may be filled from the personal size with the same cpu and memory). A running row with a machine or price drops \"Harness ready\" and says \"<cpu> vCPU · <memory> GB · <rate>\". The strip label adds the summed hourly rate of every running or starting sandbox, only when each of them has a price."
 }

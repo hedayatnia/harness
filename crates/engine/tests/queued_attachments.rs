@@ -337,3 +337,77 @@ async fn run_attachments_outside_uploads_never_reach_the_harness() {
     assert_eq!(got, [inside.to_string()], "only the upload survives");
     core.shutdown().await;
 }
+
+/// #415: a message queued while an earlier prompt waits for its attachment
+/// follows that prompt. The agent is idle meanwhile, and the queue used to
+/// take that as its turn and jump ahead.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_message_waits_behind_a_prompt_waiting_for_its_attachment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(AckHarness));
+    let core = EngineCore::assemble(
+        &tmp.path().join("data"),
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .expect("engine core assembles");
+    let client = harness_rpc::memory_client(core.rpc_service());
+    client
+        .call(
+            harness_rpc::methods::MUTATE,
+            serde_json::json!({ "op": "createChat", "chatId": CHAT, "deviceId": core.device_id }),
+        )
+        .await
+        .expect("createChat");
+    core.workspace
+        .rename_chat(CHAT, "Pre-titled")
+        .expect("rename chat");
+
+    core.doc_host
+        .queue_command(CHAT, run_payload("msg-first", "pending://att-2/shot.png"))
+        .expect("queue run command");
+    core.doc_host
+        .queue_message(CHAT, "and then this", Vec::new())
+        .expect("queue follow-up");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        complete_assistant_count(&core),
+        0,
+        "nothing runs ahead of the prompt"
+    );
+    let queue = core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .read_queue()
+        .unwrap();
+    assert_eq!(queue.len(), 1, "the follow-up stays queued behind it");
+
+    client
+        .call(
+            harness_rpc::methods::UPLOAD_CHUNK,
+            serde_json::json!({ "uploadId": "att-2", "seq": 0, "data": BASE64.encode(b"png") }),
+        )
+        .await
+        .expect("upload chunk");
+    client
+        .call(
+            harness_rpc::methods::UPLOAD_COMMIT,
+            serde_json::json!({ "uploadId": "att-2", "fileName": "shot.png" }),
+        )
+        .await
+        .expect("upload commit");
+
+    wait_for(|| complete_assistant_count(&core) == 2, "both turns to run").await;
+    let users: Vec<String> = entries(&core)
+        .iter()
+        .filter(|e| e.role == MessageRole::User)
+        .map(|e| e.id.clone())
+        .collect();
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0], "msg-first", "the waiting prompt ran first");
+    core.shutdown().await;
+}

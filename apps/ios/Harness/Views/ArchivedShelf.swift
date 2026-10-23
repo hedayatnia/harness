@@ -17,6 +17,8 @@ struct ArchivedSection: View {
     var spaceId: String?
     /// Home's search text; archived sessions are searchable too.
     var query: String = ""
+    /// A session to leave out: the one already open above the stacked split's lower pane.
+    var excluding: String? = nil
     @Binding var path: [Route]
 
     // spaces.rs INITIAL/PAGE. Both session-transient, like the desktop's.
@@ -28,7 +30,7 @@ struct ArchivedSection: View {
     private static let rowInsets = EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12)
 
     var body: some View {
-        let archived = model.archivedMatches(in: spaceId, query: query)
+        let archived = model.archivedMatches(in: spaceId, query: query).filter { $0.id != excluding }
         if !archived.isEmpty {
             Section {
                 header(count: archived.count)

@@ -16,23 +16,17 @@ final class HomeFilterUITests: XCTestCase {
         app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title))
     }
 
-    func testStatusChipsNarrowTheList() {
-        let running = app.buttons["home-status-running"]
-        XCTAssertTrue(running.waitForExistence(timeout: 10))
-        let before = app.cells.count
-
-        running.tap()
-        XCTAssertLessThan(app.cells.count, before)
-        XCTAssertFalse(app.staticTexts["home-empty"].exists)
-
-        // Tapping the active chip again clears it.
-        running.tap()
-        XCTAssertEqual(app.cells.count, before)
-
-        app.buttons["home-status-attention"].tap()
-        XCTAssertLessThan(app.cells.count, before)
-        app.buttons["home-status-all"].tap()
-        XCTAssertEqual(app.cells.count, before)
+    func testHomeHasNoStatusFiltersOrAggregateStatusLine() {
+        XCTAssertTrue(app.buttons["home-group-by"].waitForExistence(timeout: 10))
+        for id in ["home-status-all", "home-status-attention", "home-status-running"] {
+            XCTAssertFalse(app.buttons[id].exists)
+        }
+        let aggregateStatus = NSPredicate(format: "label MATCHES %@",
+                                          ".*[0-9]+ (need you|running).*")
+        XCTAssertEqual(app.staticTexts.matching(aggregateStatus).count, 0)
+        // Status-driven cards still work; only the filters and totals are gone.
+        XCTAssertTrue(app.buttons["now-card-chat-veil"].exists)
+        XCTAssertTrue(app.buttons["now-card-chat-picker"].exists)
     }
 
     /// Opening a session and coming back must not lose what was typed: the query is

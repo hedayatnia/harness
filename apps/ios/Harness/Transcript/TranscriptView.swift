@@ -174,8 +174,11 @@ struct TranscriptView: View {
             case .inputChip(let header, let resolved):
                 InputChipView(header: header, resolved: resolved)
             case .errorChip(let message, let reauth):
+                // A host-typed failure keeps its reconnect controls. Plain text that reads as signed out or
+                // out of usage is labelled, and says where to sign in: the phone has no sign-in for these.
+                let problem = reauth == nil ? RunErrors.providerProblem(message) : nil
                 VStack(alignment: .leading, spacing: 8) {
-                    ErrorChipView(message: message)
+                    ErrorChipView(message: message, problem: problem, hostName: hostName)
                     if let reauth {
                         reauthControls(reauth, row: row, earlier: earlier)
                     }
@@ -757,8 +760,13 @@ struct ToolChipRow: View {
 /// Restacked like the desktop chip: the message wraps below the header
 /// instead of truncating, since the useful part of a provider or adapter
 /// error is rarely in its first few words.
+///
+/// A refusal that signing in fixes (signed out, a usage limit) is labelled so,
+/// like the desktop card, with where to sign in below the message.
 struct ErrorChipView: View {
     let message: String
+    var problem: ProviderProblem? = nil
+    var hostName = "the execution device"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -768,9 +776,10 @@ struct ErrorChipView: View {
                     .foregroundStyle(Theme.dangerSoft.opacity(0.8))
                     .frame(width: 20, height: 20)
                     .background(Theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-                Text("Error")
+                Text(problem?.label ?? "Error")
                     .font(Theme.sans(12, weight: .medium))
                     .foregroundStyle(Theme.text)
+                    .accessibilityIdentifier("error-chip-label")
                 Spacer(minLength: 0)
             }
             Text(message)
@@ -780,6 +789,15 @@ struct ErrorChipView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
                 .padding(.leading, 28)
+            if let problem {
+                Text(problem.hint(hostName: hostName))
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.dangerSoft.opacity(0.9))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 28)
+                    .accessibilityIdentifier("error-chip-hint")
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)

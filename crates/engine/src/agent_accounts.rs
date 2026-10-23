@@ -1964,7 +1964,30 @@ impl AgentAccounts {
             // claude-swap's primitive: update the Keychain item in place — but only
             // when no credentials FILE exists (the file wins when present).
             if !self.inner.config.claude_creds_file().exists() {
-                return keychain::write_credentials(&json).await;
+                match keychain::write_credentials(&json).await {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        // Claude Code reads the Keychain first and its
+                        // credentials file whenever the Keychain holds
+                        // nothing. With no item there, the file is Claude
+                        // Code's own fallback when the Keychain can't be used
+                        // (writes refused, e.g. an engine outside the login
+                        // session): a failed write must not leave the CLI
+                        // signed out. An item we can't update would shadow
+                        // the file, so then say how to recover instead.
+                        if keychain::has_item().await {
+                            return Err(EngineError::Other(format!(
+                                "macOS Keychain wouldn't update the Claude Code login, so it \
+                                 can't be switched here. Run `claude` in a terminal and sign \
+                                 in with /login, then refresh. ({err})"
+                            )));
+                        }
+                        tracing::warn!(
+                            error = %err,
+                            "Keychain write failed; using Claude Code's credentials file"
+                        );
+                    }
+                }
             }
         }
         std::fs::create_dir_all(&self.inner.config.claude_config_dir)?;
@@ -2296,8 +2319,24 @@ mod keychain {
 
     const EXEC_TIMEOUT: Duration = Duration::from_secs(15);
 
+    // Tests stand a fake `security` in (never a real Keychain). Per thread:
+    // a `#[tokio::test]` runs on one thread, so other tests never see it.
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static SECURITY_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn security_bin() -> std::path::PathBuf {
+        #[cfg(test)]
+        if let Some(path) = SECURITY_OVERRIDE.with(|path| path.borrow().clone()) {
+            return path;
+        }
+        std::path::PathBuf::from("security")
+    }
+
     async fn exec(args: &[&str]) -> (bool, String, String) {
-        let run = tokio::process::Command::new("security")
+        let run = tokio::process::Command::new(security_bin())
             .args(args)
             .stdin(std::process::Stdio::null())
             .output();
@@ -2346,6 +2385,14 @@ mod keychain {
                 Some("The Claude Code Keychain entry could not be parsed.".into()),
             ),
         }
+    }
+
+    /// Whether a Claude Code Keychain item exists (no secret is read, so this
+    /// needs no authorization).
+    pub(super) async fn has_item() -> bool {
+        exec(&["find-generic-password", "-s", KEYCHAIN_SERVICE])
+            .await
+            .0
     }
 
     pub(super) async fn write_credentials(json: &str) -> Result<(), EngineError> {
@@ -2905,6 +2952,78 @@ fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Keychain the engine can't use (the search and the write both
+    /// refused, as from an engine outside the login session) must not leave
+    /// Claude Code signed out: the login lands in its credentials file,
+    /// Claude Code's own fallback. An item it can't update would shadow that
+    /// file, so then it errs with the way out.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn claude_login_falls_back_to_the_file_when_the_keychain_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let security = home.join("security");
+        let item = home.join("item-exists");
+        std::fs::write(
+            &security,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 find-generic-password) [ -f '{}' ] && exit 0; exit 44 ;;\n\
+                 add-generic-password) echo 'security: SecKeychainItemCreateFromContent (<default>): Unable to obtain authorization for this operation.' >&2; exit 1 ;;\n\
+                 esac\nexit 1\n",
+                item.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+        keychain::SECURITY_OVERRIDE.with(|path| *path.borrow_mut() = Some(security));
+
+        let config = AgentAccountsConfig {
+            data_dir: home.join("data"),
+            claude_config_dir: home.join("claude"),
+            claude_config_file: home.join("claude.json"),
+            codex_home: home.join("codex"),
+            cursor_sdk_auth_file: home.join("cursor.json"),
+            graff_home: home.to_path_buf(),
+        };
+        let accounts = AgentAccounts::new(config.clone());
+        let creds =
+            serde_json::json!({ "claudeAiOauth": { "accessToken": "a", "refreshToken": "r" } });
+
+        accounts
+            .write_claude_credentials(&creds)
+            .await
+            .expect("falls back to the file");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.claude_creds_file()).unwrap()).unwrap();
+        assert_eq!(written, creds);
+        assert_eq!(
+            std::fs::metadata(config.claude_creds_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            accounts.read_claude_credentials().await.0,
+            Some(creds.clone())
+        );
+
+        std::fs::remove_file(config.claude_creds_file()).unwrap();
+        std::fs::write(&item, "").unwrap();
+        let err = accounts.write_claude_credentials(&creds).await.unwrap_err();
+        assert!(err.to_string().contains("/login"), "{err}");
+        assert!(
+            !config.claude_creds_file().exists(),
+            "no file the Keychain item would shadow"
+        );
+
+        keychain::SECURITY_OVERRIDE.with(|path| *path.borrow_mut() = None);
+    }
 
     #[test]
     fn recoveries_only_join_on_the_same_route_and_account() {

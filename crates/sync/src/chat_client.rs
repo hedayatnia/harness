@@ -48,9 +48,22 @@ const PROBE_QUIET_DEFAULT: Duration = Duration::from_secs(900);
 /// picks up where the bytes stopped). Sized for MAX_CHECKPOINT_BYTES over
 /// the 1.2 Mbps links this design exists for.
 const CHECKPOINT_FETCH_DEADLINE: Duration = Duration::from_secs(300);
-/// Re-push cadence after a `quota` rejection (server window is 60 s; pending
-/// batches must not wait for the next enqueue/probe to retry).
+/// Re-push cadence after a `quota` rejection that carries no `retryAfterMs`
+/// (server window is 60 s; pending batches must not wait for the next
+/// enqueue/probe to retry).
 const QUOTA_RETRY: Duration = Duration::from_secs(5);
+/// The server's push window for one device in one chat (`chat-room.ts`): no
+/// quota backoff needs to wait longer than one window.
+const QUOTA_WINDOW: Duration = Duration::from_secs(60);
+/// Longest wait a server `retryAfterMs` hint can impose.
+const QUOTA_HINT_CAP: Duration = Duration::from_secs(120);
+/// Unacked pushes one session (or one HTTPS sync cycle) puts on the wire at a
+/// time. Replaying a whole outbox at once (20k+ rows after a runaway turn,
+/// #344) kept the actor in its send loop while the room's replies piled up
+/// unread, until the pump's lease ended the session and the next one
+/// replayed the outbox again: the chat's rows never applied, and every push
+/// the room refused still counted against its window.
+const MAX_PUSHES_IN_FLIGHT: usize = 32;
 /// Client-side push cap: the DO's per-row cap (`chat-log.ts MAX_ROW_BYTES`,
 /// 1 MiB) minus frame-overhead headroom. The headroom matters: the runtime
 /// closes WS messages at 1 MiB BEFORE the DO runs, so a payload within a
@@ -278,17 +291,23 @@ struct Shared {
     refresh_requested: u64,
     refresh_completed: u64,
     pending: VecDeque<PendingPush>,
+    /// Batch ids this socket session sent and the room hasn't answered yet,
+    /// at most [`MAX_PUSHES_IN_FLIGHT`]. Cleared when a session starts, so a
+    /// reconnect replays the durable outbox with the same batch ids.
+    in_flight: HashSet<String>,
     /// Last hello/probe view of the server log (checkpoint-policy inputs).
     server: Option<wire::StateHeader>,
     /// Set by a transient (`quota`) rejection: re-push at this instant
     /// instead of waiting for the next enqueue/probe/reconnect.
     retry_at: Option<tokio::time::Instant>,
-    /// True while draining a quota-rejected queue. Retry ticks then probe
-    /// with the HEAD batch only (a full-queue replay would itself consume
-    /// the server's quota window — N pending × 12 ticks/window livelocks
-    /// past N≈25), and each ack immediately re-arms the clock until the
-    /// queue empties.
+    /// True from a `quota` rejection until the room acks a push again. Only
+    /// pushes wait: rows, acks and pulls keep flowing. Retry ticks probe
+    /// with the HEAD batch only, and the first ack reopens the push window.
     quota_blocked: bool,
+    /// Refused probes since the last ack: without a server `retryAfterMs`
+    /// hint the head probe backs off ([`quota_retry_delay`]) instead of
+    /// retrying on a fixed 5 s clock.
+    quota_strikes: u32,
     /// A row/ack arrived with `seq > cursor + 1`: rows exist that this
     /// client never received (live broadcast outran the backfill — the
     /// mid-join race). The cursor must NOT skip the hole (skipped rows'
@@ -373,6 +392,14 @@ fn apply_cursor_amnesty(
     }
 }
 
+/// The contiguity rule for a ROW at `seq`: the cursor claims every row up to
+/// it is in the doc, so it only walks. `None` is a gap: the bytes are still
+/// imported, but the cursor holds and a backfill repair is due. Pinned for
+/// every client by `protocol/chat2-vectors.json`.
+pub fn next_row_cursor(cursor: u64, seq: u64) -> Option<u64> {
+    (seq <= cursor.saturating_add(1)).then(|| cursor.max(seq))
+}
+
 fn apply_remote_row(
     shared: &Mutex<Shared>,
     sink: &dyn ChatDocSink,
@@ -382,12 +409,13 @@ fn apply_remote_row(
 ) {
     let cursor = {
         let mut shared = lock(shared);
-        if seq > shared.cursor.saturating_add(1) {
-            shared.gap_repair = true;
-            shared.row_gap_generation = shared.row_gap_generation.wrapping_add(1);
-            shared.cursor
-        } else {
-            shared.cursor.max(seq)
+        match next_row_cursor(shared.cursor, seq) {
+            Some(next) => next,
+            None => {
+                shared.gap_repair = true;
+                shared.row_gap_generation = shared.row_gap_generation.wrapping_add(1);
+                shared.cursor
+            }
         }
     };
     // Import may fire document subscriptions, so never hold the client lock
@@ -437,6 +465,63 @@ pub struct ChatStatsSnapshot {
     /// Times a hello found the server behind our cursor (room reset/wiped).
     /// Nonzero means the host owes the room a re-seed checkpoint.
     pub server_resets: u64,
+}
+
+/// Delay before the next head probe after `strikes` consecutive refused
+/// probes. With the room's `retryAfterMs` hint: that wait, bounded to
+/// [`BACKOFF_BASE`]..=[`QUOTA_HINT_CAP`], plus up to an eighth (at most 2 s)
+/// as jitter. Without one (an edge older than #344): [`QUOTA_RETRY`],
+/// doubling up to [`QUOTA_WINDOW`], plus up to a quarter as jitter. An ack
+/// resets the strikes.
+fn quota_retry_delay(strikes: u32, hint: Option<Duration>) -> Duration {
+    if let Some(hint) = hint {
+        let base = hint.clamp(BACKOFF_BASE, QUOTA_HINT_CAP);
+        return base + retry_jitter((base / 8).min(Duration::from_secs(2)));
+    }
+    let base = QUOTA_RETRY
+        .saturating_mul(1 << strikes.min(5))
+        .min(QUOTA_WINDOW);
+    base + retry_jitter(base / 4)
+}
+
+/// The room refused a push for quota: hold pushes (only pushes) until the
+/// retry clock. A window's worth of in-flight pushes refused together is one
+/// verdict, so only a refusal with no retry pending adds a strike.
+fn note_quota_refusal(shared: &mut Shared, hint: Option<Duration>) {
+    let now = tokio::time::Instant::now();
+    if shared.quota_blocked && shared.retry_at.is_some_and(|at| at > now) {
+        return;
+    }
+    shared.quota_blocked = true;
+    shared.retry_at = Some(now + quota_retry_delay(shared.quota_strikes, hint));
+    shared.quota_strikes = shared.quota_strikes.saturating_add(1);
+}
+
+/// The room accepted a push, so its window has room again: reopen the
+/// push window and forget the backoff.
+fn note_push_accepted(shared: &mut Shared, batch_id: &str) {
+    shared.pending.retain(|p| p.batch_id != batch_id);
+    shared.in_flight.remove(batch_id);
+    if shared.quota_blocked {
+        shared.quota_blocked = false;
+        shared.retry_at = None;
+    }
+    shared.quota_strikes = 0;
+}
+
+/// Classify an HTTP 429 from `POST /chat2/{id}/rows`. The room's JSON body
+/// carries `retryAfterMs`; the `Retry-After` header (whole seconds) is the
+/// fallback. Transports return this so the client waits out the window.
+pub fn quota_refusal(retry_after_header: Option<&str>, body: &[u8]) -> SyncError {
+    let from_body = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["retryAfterMs"].as_u64());
+    let from_header = retry_after_header
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| secs.saturating_mul(1000));
+    SyncError::RateLimited {
+        retry_after_ms: from_body.or(from_header),
+    }
 }
 
 fn retry_jitter(max: Duration) -> Duration {
@@ -1041,6 +1126,7 @@ impl Actor {
             let mut shared = lock(&self.shared);
             shared.replaying_gap = false;
             shared.rows_req_outstanding = false;
+            shared.in_flight.clear();
         }
         let cursor = lock(&self.shared).cursor;
         let hello = wire::encode(
@@ -1159,9 +1245,9 @@ impl Actor {
         // batchId dedupe makes replays no-ops and rows are CRDT-commutative,
         // so a message written on a dead network flushes ~2 RTTs after the
         // socket lands instead of waiting out a whole checkpoint download +
-        // backfill ("typing works even when load doesn't").
-        let mut in_flight = HashSet::new();
-        if !self.push_pending(&mut pipe, &mut in_flight).await {
+        // backfill ("typing works even when load doesn't"). At most
+        // MAX_PUSHES_IN_FLIGHT go now; acks open the window for the rest.
+        if !self.push_pending(&mut pipe).await {
             return SessionEnd::Reconnect;
         }
         let mut buffered: Vec<wire::WireFrame> = Vec::new();
@@ -1296,6 +1382,10 @@ impl Actor {
         if !self.maybe_repair_gap(&mut pipe, &mut gap_repairs).await {
             return SessionEnd::Reconnect;
         }
+        // Acks read during the catch-up opened push slots.
+        if !self.push_pending(&mut pipe).await {
+            return SessionEnd::Reconnect;
+        }
         loop {
             // Serialize wake reads with gap repair. An older ROWS_DONE must
             // never acknowledge a newer wake, even when wakes coalesce.
@@ -1356,7 +1446,12 @@ impl Actor {
                     } else {
                         None
                     };
+                    let acked = frame.kind == frame_type::ACK;
                     if !self.handle_frame(frame) {
+                        return SessionEnd::Reconnect;
+                    }
+                    // An ack frees a push slot (and may end a quota hold).
+                    if acked && !self.push_pending(&mut pipe).await {
                         return SessionEnd::Reconnect;
                     }
                     if let Some(done) = refreshed_head
@@ -1377,7 +1472,7 @@ impl Actor {
                     }
                 }
                 _ = self.nudge_rx.recv() => {
-                    if !self.push_pending(&mut pipe, &mut in_flight).await {
+                    if !self.push_pending(&mut pipe).await {
                         return SessionEnd::Reconnect;
                     }
                 }
@@ -1406,9 +1501,9 @@ impl Actor {
                     tracing::info!("chat2: redial requested");
                     return SessionEnd::Reconnect;
                 }
-                // Transient (quota) rejection: probe with the HEAD batch on
-                // a short clock (see `Shared::quota_blocked`); acks re-arm
-                // the clock so the queue drains one-per-grant.
+                // Transient (quota) rejection: probe with the HEAD batch once
+                // the room's window should have reopened (see
+                // `Shared::quota_blocked`); its ack reopens the push window.
                 _ = tokio::time::sleep_until(retry_at) => {
                     lock(&self.shared).retry_at = None;
                     if !self.push_head(&mut pipe).await {
@@ -1451,7 +1546,14 @@ impl Actor {
 
     /// Send only the queue's head batch — the quota-probe path.
     async fn push_head(&self, pipe: &mut BinPipe) -> bool {
-        let push = lock(&self.shared).pending.front().cloned();
+        let push = {
+            let mut shared = lock(&self.shared);
+            let push = shared.pending.front().cloned();
+            if let Some(push) = &push {
+                shared.in_flight.insert(push.batch_id.clone());
+            }
+            push
+        };
         let Some(push) = push else { return true };
         if !ensure_durable(&self.shared, self.sink.as_ref(), &push) {
             return false;
@@ -1486,7 +1588,19 @@ impl Actor {
         let busy = self.sync_busy.clone();
         let amnesty = self.cursor_amnesty_done.clone();
         let task = tokio::spawn(async move {
-            let batches: Vec<PendingPush> = lock(&shared).pending.iter().cloned().collect();
+            // Bounded per cycle so the pull below never waits behind an
+            // outbox; during a quota hold, only the head probes, and only
+            // once the room's window should have reopened.
+            let batches: Vec<PendingPush> = {
+                let sh = lock(&shared);
+                let now = tokio::time::Instant::now();
+                let limit = match (sh.quota_blocked, sh.retry_at) {
+                    (true, Some(at)) if at > now => 0,
+                    (true, _) => 1,
+                    (false, _) => MAX_PUSHES_IN_FLIGHT,
+                };
+                sh.pending.iter().take(limit).cloned().collect()
+            };
             for push in batches {
                 if !ensure_durable(&shared, sink.as_ref(), &push) {
                     break;
@@ -1498,7 +1612,7 @@ impl Actor {
                             {
                                 let mut sh = lock(&shared);
                                 if sink.acknowledge_update(b).is_ok() {
-                                    sh.pending.retain(|p| p.batch_id != b);
+                                    note_push_accepted(&mut sh, b);
                                 }
                                 // Contiguity rule (see handle_frame ACK): an
                                 // own-push ack proves the server has rows up
@@ -1514,6 +1628,17 @@ impl Actor {
                                 let _ = events.send(ChatEvent::Applied);
                             }
                         }
+                    }
+                    Err(SyncError::RateLimited { retry_after_ms }) => {
+                        tracing::warn!(
+                            retry_after_ms,
+                            "chat2: http push refused for quota; pushes wait, pulls continue"
+                        );
+                        note_quota_refusal(
+                            &mut lock(&shared),
+                            retry_after_ms.map(Duration::from_millis),
+                        );
+                        break;
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "chat2: http push failed; will retry");
@@ -1724,22 +1849,32 @@ impl Actor {
         pipe.tx.send(req).await.is_ok()
     }
 
-    async fn push_pending(&self, pipe: &mut BinPipe, in_flight: &mut HashSet<String>) -> bool {
+    /// Top the session's push window up to [`MAX_PUSHES_IN_FLIGHT`] unacked
+    /// batches, oldest first. New edits never retransmit a slow-to-ack
+    /// batch; a reconnect replays the durable outbox with the same batch ids.
+    async fn push_pending(&self, pipe: &mut BinPipe) -> bool {
         let batches: Vec<PendingPush> = {
-            let shared = lock(&self.shared);
-            // New edits must not retransmit every slow-to-ack batch. Keep
-            // this set local to the session so a reconnect still replays
-            // the durable outbox with exactly the same batch IDs.
-            in_flight.retain(|id| shared.pending.iter().any(|p| &p.batch_id == id));
+            let mut shared = lock(&self.shared);
             if shared.quota_blocked {
-                return true;
-            } // push_head owns quota retries
-            shared
-                .pending
+                return true; // push_head owns quota retries
+            }
+            let Shared {
+                pending, in_flight, ..
+            } = &mut *shared;
+            if in_flight.len() >= MAX_PUSHES_IN_FLIGHT {
+                // Self-heal: drop ids retired from the outbox by a path that
+                // didn't answer through this session (an HTTPS ack).
+                in_flight.retain(|id| pending.iter().any(|p| &p.batch_id == id));
+            }
+            let room = MAX_PUSHES_IN_FLIGHT.saturating_sub(in_flight.len());
+            let batches: Vec<PendingPush> = pending
                 .iter()
                 .filter(|p| !in_flight.contains(&p.batch_id))
+                .take(room)
                 .cloned()
-                .collect()
+                .collect();
+            in_flight.extend(batches.iter().map(|p| p.batch_id.clone()));
+            batches
         };
         for push in batches {
             if !ensure_durable(&self.shared, self.sink.as_ref(), &push) {
@@ -1755,7 +1890,6 @@ impl Actor {
             if pipe.tx.send(frame).await.is_err() {
                 return false;
             }
-            in_flight.insert(push.batch_id);
         }
         true
     }
@@ -1796,7 +1930,9 @@ impl Actor {
                 };
                 let mut shared = lock(&self.shared);
                 if self.sink.acknowledge_update(&ack.batch_id).is_ok() {
-                    shared.pending.retain(|p| p.batch_id != ack.batch_id);
+                    // The server took a push: its quota window has room
+                    // again; the session loop refills the push window.
+                    note_push_accepted(&mut shared, &ack.batch_id);
                 } else {
                     shared.retry_at = Some(tokio::time::Instant::now() + QUOTA_RETRY);
                 }
@@ -1815,15 +1951,6 @@ impl Actor {
                     shared.cursor = shared.cursor.max(ack.seq);
                 }
                 let cursor = shared.cursor;
-                // Quota drain: each grant immediately probes the next head
-                // batch (one-per-grant, never a full-queue burst).
-                if shared.quota_blocked {
-                    if shared.pending.is_empty() {
-                        shared.quota_blocked = false;
-                    } else {
-                        shared.retry_at = Some(tokio::time::Instant::now());
-                    }
-                }
                 drop(shared);
                 self.sink.advance_cursor(cursor);
                 let _ = self.events.send(ChatEvent::Applied);
@@ -1867,6 +1994,7 @@ impl Actor {
                         let mut shared = lock(&self.shared);
                         let before = shared.pending.len();
                         shared.pending.retain(|p| p.batch_id != batch_id);
+                        shared.in_flight.remove(batch_id);
                         let dropped = before != shared.pending.len();
                         drop(shared);
                         if dropped {
@@ -1880,11 +2008,16 @@ impl Actor {
                         }
                     }
                     // Transient: the quota window passes on its own — keep
-                    // the batch queued and head-probe on a short clock.
+                    // the batch queued and head-probe when the room says the
+                    // window reopens (backing off without a hint). Rows and
+                    // acks keep flowing on this socket meanwhile.
                     "quota" => {
+                        let hint = frame.header["retryAfterMs"]
+                            .as_u64()
+                            .map(Duration::from_millis);
                         let mut shared = lock(&self.shared);
-                        shared.quota_blocked = true;
-                        shared.retry_at = Some(tokio::time::Instant::now() + QUOTA_RETRY);
+                        shared.in_flight.remove(batch_id);
+                        note_quota_refusal(&mut shared, hint);
                     }
                     _ => {}
                 }

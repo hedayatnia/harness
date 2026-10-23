@@ -683,6 +683,9 @@ pub struct App {
 
     pub(crate) actions: Rc<ActionRegistry>,
     pub(crate) active_drag: Option<AnyDrag>,
+    /// Only this window may handle the current native file drag. In-app
+    /// drags remain app-wide and do not set an external owner.
+    pub(crate) external_file_drag_window: Option<WindowId>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
     pub(crate) entities: EntityMap,
@@ -797,6 +800,7 @@ impl App {
                 flushing_effects: false,
                 pending_updates: 0,
                 active_drag: None,
+                external_file_drag_window: None,
                 background_executor,
                 foreground_executor,
                 svg_renderer: SvgRenderer::new(asset_source.clone()),
@@ -1784,6 +1788,17 @@ impl App {
                 cx.window_update_stack.pop();
 
                 if window.removed {
+                    if cx.external_file_drag_window == Some(id) {
+                        cx.external_file_drag_window = None;
+                        if cx.active_drag.as_ref().is_some_and(|drag| {
+                            drag.value.is::<crate::ExternalPaths>()
+                        }) {
+                            cx.active_drag = None;
+                            for window in cx.windows.values_mut().flatten() {
+                                window.refresh();
+                            }
+                        }
+                    }
                     cx.window_handles.remove(&id);
                     cx.windows.remove(id);
                     if let Some(tracked) = cx.tracked_entities.remove(&id) {
@@ -2425,6 +2440,7 @@ impl App {
     pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
         if self.active_drag.is_some() {
             self.active_drag = None;
+            self.external_file_drag_window = None;
             window.refresh();
             true
         } else {

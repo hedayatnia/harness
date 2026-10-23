@@ -44,8 +44,11 @@ const MAX_SIDECAR_BYTES = 4 * 1024 * 1024;
 export const MAX_CHECKPOINT_BYTES = 32 * 1024 * 1024;
 /** Presence beats older than this are swept before relay/stats. */
 const PRESENCE_TTL_MS = 30_000;
-/** Per-device push quota, rolling window (in-memory; resets on hibernation —
- * it exists to contain a runaway client loop, not to meter honest traffic). */
+/** Push quota per device IN THIS CHAT (one ChatRoom per chat, so a device's
+ * other chats keep their own windows), over a fixed window. In-memory; resets
+ * on hibernation — it exists to contain a runaway client loop, not to meter
+ * honest traffic. A refusal carries `retryAfterMs`, the time left in the
+ * window, so clients wait it out instead of guessing (#344). */
 const QUOTA_WINDOW_MS = 60_000;
 const QUOTA_MAX_PUSHES = 300;
 const QUOTA_MAX_BYTES = 8 * 1024 * 1024;
@@ -268,9 +271,12 @@ export class ChatRoom implements DurableObject {
         return json({ error: "too_large" }, 413);
       }
       const payload = new Uint8Array(await request.arrayBuffer());
-      if (!this.admitQuota(device, payload.byteLength)) {
+      const retryAfterMs = this.admitQuota(device, payload.byteLength);
+      if (retryAfterMs !== undefined) {
         this.recordPush(device, false);
-        return json({ error: "quota" }, 429);
+        return json({ error: "quota", retryAfterMs }, 429, {
+          "retry-after": String(Math.ceil(retryAfterMs / 1000))
+        });
       }
       const outcome = appendRow(sql, device, batchId, payload, Date.now());
       if (!outcome.ok) {
@@ -450,9 +456,15 @@ export class ChatRoom implements DurableObject {
       send(ws, FRAME.error, { code: "bad_push", message: "hello first / malformed push", batchId });
       return;
     }
-    if (!this.admitQuota(state.device, payload.byteLength)) {
+    const retryAfterMs = this.admitQuota(state.device, payload.byteLength);
+    if (retryAfterMs !== undefined) {
       this.recordPush(state.device, false);
-      send(ws, FRAME.error, { code: "quota", message: "per-device push quota exceeded", batchId });
+      send(ws, FRAME.error, {
+        code: "quota",
+        message: "push quota exceeded for this chat",
+        batchId,
+        retryAfterMs
+      });
       return;
     }
     const sql = this.ctx.storage.sql;
@@ -515,18 +527,20 @@ export class ChatRoom implements DurableObject {
     }
   }
 
-  /** Rolling per-device quota. True = admitted. */
-  private admitQuota(device: string, bytes: number): boolean {
+  /** Fixed-window quota for one device in this chat. `undefined` = admitted;
+   * otherwise the milliseconds until the window reopens (at least 1). */
+  private admitQuota(device: string, bytes: number): number | undefined {
     const now = Date.now();
     const key = device === "" ? "(unknown)" : device;
     let window = this.quotas.get(key);
-    if (!window || now - window.since > QUOTA_WINDOW_MS) {
+    if (!window || now - window.since >= QUOTA_WINDOW_MS) {
       window = { since: now, pushes: 0, bytes: 0 };
       this.quotas.set(key, window);
     }
     window.pushes += 1;
     window.bytes += bytes;
-    return window.pushes <= QUOTA_MAX_PUSHES && window.bytes <= QUOTA_MAX_BYTES;
+    if (window.pushes <= QUOTA_MAX_PUSHES && window.bytes <= QUOTA_MAX_BYTES) return undefined;
+    return Math.max(1, window.since + QUOTA_WINDOW_MS - now);
   }
 
   private recordPush(device: string, ok: boolean): void {
@@ -599,10 +613,10 @@ const send = (
   }
 };
 
-const json = (value: unknown, status = 200): Response =>
+const json = (value: unknown, status = 200, headers: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json" }
+    headers: { "content-type": "application/json", ...headers }
   });
 
 /** `bytes=N-` (open-ended resume) only; anything fancier is ignored → 200. */

@@ -51,6 +51,8 @@ final class AppConfig: @unchecked Sendable {
     /// A refresh token the edge turned down. Spending it again can only fail (and CodeGraff treats a
     /// replayed token as theft), so it is left alone until a sign-in replaces it.
     private var rejectedRefreshToken: String?
+    /// Unanswered refresh attempts across rounds, so a rejection right after one gets its second try.
+    private let refreshMemory = TokenRefresh.Memory()
     /// Called once when the edge rejects the stored sign-in: the person must sign in again. Set by AppModel.
     var onSessionExpired: (@Sendable () -> Void)? {
         get { lock.withLock { sessionExpiredHandler } }
@@ -150,7 +152,7 @@ final class AppConfig: @unchecked Sendable {
                 let grace = await MainActor.run { BackgroundGrace.begin("harness.refreshToken") }
                 defer { grace.end() }
                 let client = AuthClient(baseURL: edgeURL)
-                let outcome = await TokenRefresh.run {
+                let outcome = await TokenRefresh.run(memory: self.refreshMemory) {
                     try await client.refresh(refreshToken: current.refreshToken, organizationId: orgId)
                 }
                 var token: String?

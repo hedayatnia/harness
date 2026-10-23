@@ -210,6 +210,8 @@ impl Repos {
     /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
         let mut cmd = tokio::process::Command::new("git");
+        // Git hooks may need the user's shell tools.
+        harness_adapters::compose_login_shell_path(&mut cmd);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -282,6 +284,34 @@ impl Repos {
         }
     }
 
+    /// This checkout's `HEAD` reflog, oldest first, as `(unix seconds,
+    /// subject)`. Each linked worktree keeps its own, so it records exactly
+    /// the renames and checkouts that happened in this folder.
+    pub(crate) async fn head_reflog(&self, path: &Path) -> Result<Vec<(i64, String)>, EngineError> {
+        let log = self
+            .git(
+                &[
+                    "reflog",
+                    "show",
+                    "--date=unix",
+                    "--format=%gd%x09%gs",
+                    "HEAD",
+                ],
+                Some(path),
+            )
+            .await?;
+        let mut entries: Vec<(i64, String)> = log
+            .lines()
+            .filter_map(|line| {
+                let (selector, subject) = line.split_once('\t')?;
+                let at = selector.strip_prefix("HEAD@{")?.strip_suffix('}')?;
+                Some((at.parse().ok()?, subject.to_string()))
+            })
+            .collect();
+        entries.reverse();
+        Ok(entries)
+    }
+
     /// Capture the complete source identity after dispatch or an owned checkout change.
     pub(crate) async fn capture_source_context(
         &self,
@@ -327,15 +357,33 @@ impl Repos {
     /// Canonical identity shared by every chat operating in this exact worktree:
     /// `sha256(deviceId ‖ NUL ‖ canonical git dir)`.
     pub async fn checkout_identity(&self, path: &Path) -> Result<CheckoutIdentity, EngineError> {
-        let root = self
-            .git(&["rev-parse", "--show-toplevel"], Some(path))
-            .await?;
-        let git_dir = self
+        // One `rev-parse` for both answers: this runs before every
+        // workspace-file request (the Cmd+K palette's Recent Files included).
+        let out = self
             .git(
-                &["rev-parse", "--path-format=absolute", "--git-dir"],
+                &[
+                    "rev-parse",
+                    "--show-toplevel",
+                    "--path-format=absolute",
+                    "--git-dir",
+                ],
                 Some(path),
             )
             .await?;
+        let mut lines = out.lines();
+        let (root, git_dir) = match (lines.next(), lines.next(), lines.next()) {
+            (Some(root), Some(git_dir), None) => (root.to_owned(), git_dir.to_owned()),
+            // Fallback for a path with a `\n` in its name.
+            _ => (
+                self.git(&["rev-parse", "--show-toplevel"], Some(path))
+                    .await?,
+                self.git(
+                    &["rev-parse", "--path-format=absolute", "--git-dir"],
+                    Some(path),
+                )
+                .await?,
+            ),
+        };
         let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(&root));
         let canonical_git_dir =
             std::fs::canonicalize(&git_dir).unwrap_or_else(|_| PathBuf::from(&git_dir));
@@ -1028,19 +1076,36 @@ impl Repos {
         Some(path.to_string_lossy().into_owned())
     }
 
+    /// Every checkout of the repository at `repo_path`, main one first.
+    /// NUL-terminated so a `\n` in a worktree's path can't forge another entry.
+    async fn worktree_paths(&self, repo_path: &Path) -> Result<Vec<PathBuf>, EngineError> {
+        let out = match self
+            .git(&["worktree", "list", "--porcelain", "-z"], Some(repo_path))
+            .await
+        {
+            Ok(out) => out,
+            // Git before 2.36 has no `-z`.
+            Err(_) => self
+                .git(&["worktree", "list", "--porcelain"], Some(repo_path))
+                .await?
+                .replace('\n', "\0"),
+        };
+        Ok(out
+            .split('\0')
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .collect())
+    }
+
     /// Whether `candidate` is the repository root or one of its linked
-    /// worktrees. Filesystem resolution happens on a disposable thread because
-    /// user-selected paths may be dead mounts.
+    /// worktrees (detached ones included). Filesystem resolution happens on a
+    /// disposable thread because user-selected paths may be dead mounts.
     pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
-        let worktrees: Vec<_> = self
-            .refs(&repo_path)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| row.worktree_path.map(PathBuf::from))
-            .collect();
+        // One `git worktree list` rather than `refs()`, which runs several
+        // git commands to read one column.
+        let worktrees = self.worktree_paths(&repo_path).await.unwrap_or_default();
         disposable_worker("checkout-auth", move || {
             let candidate = std::fs::canonicalize(candidate).ok()?;
             std::iter::once(repo_path)
@@ -2552,6 +2617,130 @@ tmpfs /run tmpfs rw 0 0
                 .await
                 .is_none()
         );
+    }
+
+    async fn fixture_git(cwd: &Path, args: &[&str]) {
+        let output = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .output()
+            .await
+            .expect("git spawns");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_checkout_accepts_every_linked_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        let branch = tmp.path().join("branch");
+        let detached = tmp.path().join("detached");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&root).expect("repo dir");
+        std::fs::create_dir_all(&elsewhere).expect("unrelated dir");
+        fixture_git(&root, &["init", "-q", "-b", "main"]).await;
+        fixture_git(&root, &["commit", "-q", "--allow-empty", "-m", "initial"]).await;
+        fixture_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                &branch.to_string_lossy(),
+            ],
+        )
+        .await;
+        fixture_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &detached.to_string_lossy(),
+            ],
+        )
+        .await;
+        let data = tmp.path().join("data");
+        let repos = Repos::with_worktrees_root(&data, "device", data.join("worktrees"));
+
+        for checkout in [&root, &branch, &detached] {
+            assert_eq!(
+                repos.workspace_checkout(&root, checkout).await,
+                std::fs::canonicalize(checkout).ok(),
+                "{}",
+                checkout.display()
+            );
+        }
+        // A newline in a worktree's path must not smuggle in another entry.
+        #[cfg(unix)]
+        {
+            let forged = tmp
+                .path()
+                .join(format!("forged\nworktree {}", elsewhere.display()));
+            fixture_git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    &forged.to_string_lossy(),
+                ],
+            )
+            .await;
+        }
+        assert!(repos.workspace_checkout(&root, &elsewhere).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn checkout_identity_resolves_root_and_git_dir_in_one_call() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(root.join("nested")).expect("repo dir");
+        fixture_git(&root, &["init", "-q", "-b", "main"]).await;
+        fixture_git(&root, &["commit", "-q", "--allow-empty", "-m", "initial"]).await;
+        fixture_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &linked.to_string_lossy(),
+            ],
+        )
+        .await;
+        let data = tmp.path().join("data");
+        let repos = Repos::with_worktrees_root(&data, "device", data.join("worktrees"));
+
+        let main = repos
+            .checkout_identity(&root.join("nested"))
+            .await
+            .expect("main identity");
+        assert_eq!(main.root, std::fs::canonicalize(&root).unwrap());
+        assert_eq!(
+            main.git_dir,
+            std::fs::canonicalize(root.join(".git")).unwrap()
+        );
+        let worktree = repos
+            .checkout_identity(&linked)
+            .await
+            .expect("linked identity");
+        assert_eq!(worktree.root, std::fs::canonicalize(&linked).unwrap());
+        assert!(worktree.git_dir.starts_with(main.git_dir.join("worktrees")));
+        assert_ne!(main.id, worktree.id);
     }
 
     #[tokio::test]

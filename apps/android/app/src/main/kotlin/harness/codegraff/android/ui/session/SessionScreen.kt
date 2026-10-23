@@ -1,6 +1,7 @@
 package harness.codegraff.android.ui.session
 
-import androidx.compose.runtime.produceState
+import harness.codegraff.android.model.modelSelection
+import harness.codegraff.android.ui.components.rememberDeviceCatalog
 import harness.codegraff.android.model.Connection
 import harness.codegraff.android.model.ConnectivityRules
 import harness.codegraff.android.model.ConnectivityUi
@@ -262,14 +263,20 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
     var attachments by remember(chat.id) { mutableStateOf(listOf<StagedAttachment>()) }
     var showModelPicker by remember { mutableStateOf(false) }
     var showTraitPicker by remember { mutableStateOf(false) }
-    var optionPicker by remember { mutableStateOf<harness.codegraff.android.model.ModelOptionInfo?>(null) }
-
     val harness = chat.config?.harness ?: "claude-code"
-    // The catalog of the computer that runs this session; the static one until it answers.
-    val models by produceState(HarnessCatalog.models(harness), chat.deviceId, harness) { value = model.listModels(chat.deviceId, harness) }
-    val currentModel = HarnessCatalog.resolve(chat.config?.model, models, harness)
-    val currentReasoning = if (currentModel.reasoningLevels.isEmpty()) null
-    else chat.config?.reasoning?.takeIf { it in currentModel.reasoningLevels } ?: HarnessCatalog.defaultReasoning(currentModel)
+    var optionPicker by remember(chat.id, chat.deviceId, harness, chat.config?.model) { mutableStateOf<harness.codegraff.android.model.ModelOptionInfo?>(null) }
+    val refreshKey = state.connected to state.hostStatus(chat.deviceId)
+    val harnessLoad = rememberDeviceCatalog(chat.deviceId, refreshKey,
+        initial = { model.cachedHarnesses(chat.deviceId) },
+        fetch = { model.listHarnesses(chat.deviceId) },
+    )
+    val modelLoad = rememberDeviceCatalog(chat.deviceId to harness, refreshKey,
+        initial = { model.cachedModels(chat.deviceId, harness) },
+        fetch = { model.listModels(chat.deviceId, harness) },
+    )
+    val selection = modelSelection(harness, chat.config?.model, chat.config?.reasoning, modelLoad.catalog, harnessLoad.catalog)
+    val currentModel = selection.model
+    val currentReasoning = selection.reasoning
 
     // The chat's queue: what was typed mid-turn waits here, and a row can be retyped in this composer.
     val queue by remember(chat.id) { model.queueFlow(chat.id) }.collectAsState(initial = model.queue(chat.id))
@@ -395,9 +402,16 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp),
             )
         }
+        if (selection.unavailable) {
+            Text(
+                "The selected agent or model is not available on this device. Select another model.",
+                style = sans(12f), color = Theme.palette.warning,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+            )
+        }
         ComposerShell(
             draft = draft, onDraftChange = { draft = it },
-            sendEnabled = true, showStop = runLive,
+            sendEnabled = editingId != null || selection.canSend, showStop = runLive,
             placeholder = if (editingId == null) "Message" else "Edit queued message",
             sendLabel = when {
                 editingId != null -> "Save queued message"
@@ -410,7 +424,9 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
             onSend = {
                 if (editingId != null) {
                     commitEdit()
-                } else {
+                } else if (selection.canSend) {
+                    // A genuinely unconfigured chat only acquires a default after its device supplies metadata.
+                    if (chat.config?.model.isNullOrBlank()) model.setChatConfig(chat.id, currentModel.id, currentReasoning)
                     model.send(chat.id, draft, attachments.map { it.uri.toString() })
                     draft = ""
                     attachments = emptyList()
@@ -434,7 +450,11 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
     if (showModelPicker) {
         ModelPickerSheet(
             harness = harness, modelId = currentModel.id, reasoning = chat.config?.reasoning,
-            lockedHarness = true, harnesses = emptyList(), catalogs = mapOf(harness to models),
+            lockedHarness = true, harnesses = harnessLoad.catalog.items, catalogs = mapOf(harness to modelLoad.catalog.items),
+            loading = modelLoad.loading || harnessLoad.loading,
+            confirmedHarnesses = harnessLoad.catalog.isLive,
+            confirmedCatalogs = if (modelLoad.catalog.isLive) setOf(harness) else emptySet(),
+            onRetry = { modelLoad.retry(); harnessLoad.retry() },
             onPick = { _, picked, reasoning -> model.setChatConfig(chat.id, picked.id, reasoning) },
             onDismiss = { showModelPicker = false },
         )

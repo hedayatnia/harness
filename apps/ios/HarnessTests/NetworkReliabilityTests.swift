@@ -54,7 +54,9 @@ final class NetworkReliabilityTests: XCTestCase {
                 ? [("pending", Data([1]))] : []
             XCTAssertTrue(DocDisk.saveChat2(doc: LoroDoc(), id: id, cursor: 0,
                                             verified: false, outbox: outbox))
-            let date = Date(timeIntervalSince1970: TimeInterval(index + 1))
+            // Newer than any snapshot another test left in the shared docs
+            // directory, so `keep: 1` keeps this test's newest file.
+            let date = Date().addingTimeInterval(3_600 + TimeInterval(index))
             try FileManager.default.setAttributes([.modificationDate: date],
                                                   ofItemAtPath: DocDisk.chat2URL(for: id).path)
         }
@@ -77,6 +79,24 @@ final class NetworkReliabilityTests: XCTestCase {
             now: .now(), fetchInFlight: false,
             backfillStartedAt: checkpoint, rowPhaseStartedAt: oldRows
         ))
+    }
+
+    /// #344: a quota refusal waits out the room's hint (bounded), and backs
+    /// off without one instead of retrying every 5 s.
+    func testQuotaRetryHonorsTheRoomsHintAndBacksOffWithoutOne() {
+        for (hint, base) in [(UInt64(0), UInt64(250)), (12_500, 12_500), (3_600_000, 120_000)] {
+            for strikes in [0, 7] {
+                let delay = ChatRoomClient.quotaRetryDelayMs(strikes: strikes, hintMs: hint)
+                XCTAssert(delay >= base && delay <= base + min(base / 8, 2_000), "hint \(hint): \(delay)")
+            }
+        }
+        for (strikes, base) in [(0, UInt64(5_000)), (1, 10_000), (3, 40_000), (4, 60_000), (40, 60_000)] {
+            let delay = ChatRoomClient.quotaRetryDelayMs(strikes: strikes, hintMs: nil)
+            XCTAssert(delay >= base && delay <= base + base / 4, "\(strikes) strikes: \(delay)")
+        }
+        XCTAssertEqual(ChatRoomClient.quotaHintMs(["retryAfterMs": 41_250], retryAfterHeader: "42"), 41_250)
+        XCTAssertEqual(ChatRoomClient.quotaHintMs(nil, retryAfterHeader: " 42 "), 42_000)
+        XCTAssertNil(ChatRoomClient.quotaHintMs(["error": "quota"]))
     }
 
     func testChat2Snapshot02LoadsWithEmptyOutbox() throws {
@@ -164,6 +184,104 @@ final class NetworkReliabilityTests: XCTestCase {
         XCTAssertEqual(store.outbox.map(\.bytes), [Data([1]), Data([2])])
         store.retirePush(batchId: "stable-a")
         XCTAssertEqual(store.outbox.map(\.batchId), ["stable-b"])
+    }
+
+    /// #413: missing the delivery grace does not make a send failed. While
+    /// its command is pending and unexpired the host can still run it, so the
+    /// phone says it is waiting. Only when no attempt can run does it read
+    /// Not delivered, and the original send time survives a retry.
+    @MainActor
+    func testUnadoptedSendWaitsForTheHostWhileItsCommandCanStillRun() throws {
+        let id = "waiting-send-\(UUID().uuidString)"
+        let config = AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
+                               userId: "u", orgId: "o", deviceId: "phone",
+                               deviceName: "phone", tokens: nil, devBearer: "u@o")
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        let store = SessionStore(chatId: id, config: config)
+        store.start(holdDial: true)
+        defer { store.stop() }
+        store.sendSteer(prompt: "sent from the phone")
+        let send = try XCTUnwrap(store.pendingSends.first)
+        let tenMinutes = send.started + 10 * 60_000
+        XCTAssertTrue(store.undeliverableSends(now: tenMinutes).isEmpty,
+                      "a pending, unexpired command can still run")
+        XCTAssertEqual(SendState.of(oldestStarted: send.started, undeliverable: false,
+                                    degraded: false, now: send.started + 1_000), .sending)
+        XCTAssertEqual(SendState.of(oldestStarted: send.started, undeliverable: false,
+                                    degraded: false, now: tenMinutes), .waiting)
+        XCTAssertEqual(SendState.of(oldestStarted: send.started, undeliverable: false,
+                                    degraded: true, now: tenMinutes), .queued)
+        // Past its own TTL the host will never drain it.
+        let expired = send.started + 365 * 24 * 3_600_000
+        XCTAssertEqual(store.undeliverableSends(now: expired), [send.messageId])
+        // A retry restarts the grace only; the age shown keeps the send time.
+        store.retryDelivery()
+        XCTAssertEqual(store.pendingSends.first?.at, send.at)
+
+        let attempt = { (status: String, expiresAt: Int64) -> LoroValue in
+            .map(value: [
+                "issuedBy": .string(value: "phone"),
+                "status": .string(value: status),
+                "expiresAt": .i64(value: expiresAt),
+                "payload": .map(value: ["messageId": .string(value: "m1")]),
+            ])
+        }
+        let now: Int64 = 1_000_000
+        // The host rejected it: authoritative, even inside the grace.
+        XCTAssertEqual(SessionStore.undeliverable(
+            pending: ["m1"], commands: [attempt("rejected", now + 60_000)],
+            deviceId: "phone", now: now), ["m1"])
+        XCTAssertEqual(SendState.of(oldestStarted: now, undeliverable: true,
+                                    degraded: false, now: now), .failed)
+        // A re-issued attempt that is still pending makes it live again.
+        XCTAssertTrue(SessionStore.undeliverable(
+            pending: ["m1"],
+            commands: [attempt("rejected", now + 60_000), attempt("pending", now + 60_000)],
+            deviceId: "phone", now: now).isEmpty)
+    }
+
+    /// #413: the run's timer counts the run; the wait before it is shown
+    /// separately, and only when the last prompt started this turn.
+    func testTurnWaitCountsFromThePromptToTheTurnStart() {
+        let entry = { (id: String, role: MessageRole, at: Int64) in
+            MessageEntry(id: id, role: role, parts: [], createdAt: at, deviceId: "phone")
+        }
+        let sent: Int64 = 1_000_000
+        let started = sent + 597_000
+        let prompt = [entry("u1", .user, sent)]
+        XCTAssertEqual(turnWaitSecs(entries: prompt, turnStartedAt: started), 597)
+        XCTAssertEqual(turnWaitSecs(entries: prompt + [entry("a1", .assistant, started + 1_000)],
+                                    turnStartedAt: started), 597)
+        XCTAssertNil(turnWaitSecs(entries: prompt, turnStartedAt: sent + 3_000))
+        XCTAssertNil(turnWaitSecs(entries: prompt, turnStartedAt: nil))
+        XCTAssertNil(turnWaitSecs(entries: prompt + [entry("a0", .assistant, sent + 5_000)],
+                                  turnStartedAt: started))
+    }
+
+    /// #412: the nudge sent with a command can beat the command's row to the
+    /// room. A second nudge goes out once the outbox, that row included, is
+    /// acknowledged.
+    @MainActor
+    func testQueuedCommandNudgesAgainOnceTheOutboxDrains() async throws {
+        let id = "nudge-after-ack-\(UUID().uuidString)"
+        let config = AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
+                               userId: "u", orgId: "o", deviceId: "phone",
+                               deviceName: "phone", tokens: nil, devBearer: "u@o")
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        let store = SessionStore(chatId: id, config: config)
+        store.start(holdDial: true)
+        defer { store.stop() }
+        store.respondInput(requestId: "q1", answers: [])
+        for _ in 0..<20 where !store.nudgeWhenOutboxDrains { await Task.yield() }
+        XCTAssertTrue(store.nudgeWhenOutboxDrains)
+        let batches = store.outbox.map(\.batchId)
+        XCTAssertFalse(batches.isEmpty, "the command's batch is in the outbox before arming")
+        for batch in batches.dropLast() {
+            store.retirePush(batchId: batch)
+            XCTAssertTrue(store.nudgeWhenOutboxDrains, "still waiting on the command's batch")
+        }
+        store.retirePush(batchId: batches.last!)
+        XCTAssertFalse(store.nudgeWhenOutboxDrains, "nudged once the outbox drained")
     }
 
     @MainActor

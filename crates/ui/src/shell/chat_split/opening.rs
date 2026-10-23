@@ -15,6 +15,9 @@ impl Shell {
         if !matches!(self.route, Route::Chat) {
             return;
         }
+        if open.is_some() && existing_chat_selection(open.clone(), self.state.read(cx)).is_none() {
+            return;
+        }
         // A split is always a split, however narrow (Ghostty's rule): ⌘T is
         // the way to a tab. Turning a narrow ⌘D into a tab read as panes
         // jumping into tabs of their own (user report, 2026-09-26).
@@ -39,11 +42,22 @@ impl Shell {
         else {
             return;
         };
+        // Only detach after the split succeeds: refused splits must not
+        // disturb the session's existing location in this or another tab.
+        if let Some(id) = open.as_deref() {
+            for pane in split.panes.iter_mut().filter(|pane| pane.as_deref() == Some(id)) {
+                *pane = None;
+            }
+            for vanished in split.vanished.iter_mut().filter(|pane| pane.as_deref() == Some(id)) {
+                *vanished = None;
+            }
+            self.detach_chat_from_tab_snapshots(id);
+        }
         // The pane left behind keeps its picks, and a fresh canvas starts
         // from them — never from whichever canvas was picked in last.
         split.drafts[split.focus - 1] = Some(draft.clone());
         self.chat_split = Some(split);
-        self.chat_split_selected = None;
+        self.chat_split_selected = open.clone();
         let fresh = open.is_none();
         self.state.update(cx, |s, cx| s.select_chat(open, cx));
         self.adopt_canvas_draft(fresh.then(|| draft.fresh()), cx);

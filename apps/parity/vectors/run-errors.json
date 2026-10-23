@@ -1,0 +1,31 @@
+{
+  "comment": "What a failed run's plain error text means: signedOut (not signed in, signed out, an expired or rejected login) or limitReached (a usage or rate limit), the two that signing in to the agent's provider can fix, or null for anything else. Matching is case-insensitive on substrings, and a curly apostrophe reads as a straight one. Hosted credit, GitHub's own API and Harness's own account are never the provider's problem. A signedOut match wins over limitReached. Provider-typed reauthentication keeps its own card and is not classified here. The desktop (crates/proto/src/run_errors.rs) and the phone (RunErrors.swift) check these same cases.",
+  "labels": {
+    "signedOut": "Signed out",
+    "limitReached": "Limit reached"
+  },
+  "actionLabel": "Log in",
+  "cases": [
+    { "message": "Claude Code isn't signed in. Use Settings → Agents → Sign in.", "expect": "signedOut" },
+    { "message": "Codex isn’t signed in on this computer.", "expect": "signedOut" },
+    { "message": "Authentication failed — sign in to Claude again.", "expect": "signedOut" },
+    { "message": "Invalid API key · Please run /login", "expect": "signedOut" },
+    { "message": "Not logged in · Please run /login", "expect": "signedOut" },
+    { "message": "OAuth token has expired. Please obtain a new token or refresh your existing token.", "expect": "signedOut" },
+    { "message": "Request failed (401) Unauthorized", "expect": "signedOut" },
+    { "message": "Claude usage limit reached — try again after the limit resets.", "expect": "limitReached" },
+    { "message": "Claude 5-hour limit reached — the turn was blocked. Try again after it resets.", "expect": "limitReached" },
+    { "message": "You've hit your usage limit. Upgrade to Pro or try again later.", "expect": "limitReached" },
+    { "message": "429 Too Many Requests", "expect": "limitReached" },
+    { "message": "rate limited (429): quota/billing cap", "expect": "limitReached" },
+    { "message": "Claude is overloaded right now — try again shortly.", "expect": null },
+    { "message": "The selected model isn't available.", "expect": null },
+    { "message": "Your Codegraff credit is used up. Add credit and try again.", "expect": null },
+    { "message": "GitHub API rate limit reached", "expect": null },
+    { "message": "GraphQL: API rate limit exceeded", "expect": null },
+    { "message": "not signed in — run `harness login` on this machine first", "expect": null },
+    { "message": "Harness exited with status 1", "expect": null },
+    { "message": "Listening on port 4012", "expect": null },
+    { "message": "", "expect": null }
+  ]
+}

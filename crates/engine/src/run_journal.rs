@@ -112,6 +112,49 @@ impl RunJournal {
         let _ = std::fs::remove_file(self.attempts_path(chat_id));
     }
 
+    fn restart_path(&self, chat_id: &str) -> PathBuf {
+        self.dir.join(format!("{}.restart", sanitize_id(chat_id)))
+    }
+
+    /// Record work a graceful shutdown (quit, update) is about to cut short, so
+    /// the next boot can pick it back up (#482, #517).
+    pub fn note_restart_resume(&self, chat_id: &str, kind: RestartResume) {
+        if let Err(err) = std::fs::write(self.restart_path(chat_id), kind.as_str()) {
+            tracing::warn!(chat = %chat_id, error = %err, "restart-resume marker write failed");
+        }
+    }
+
+    /// Every chat a graceful shutdown left unfinished, with when it was
+    /// recorded. Consumed: each marker is removed as it is read.
+    pub fn take_restart_resumes(&self) -> Vec<(String, RestartResume, std::time::SystemTime)> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("restart") {
+                continue;
+            }
+            let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let kind = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| RestartResume::parse(s.trim()));
+            let at = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let _ = std::fs::remove_file(&path);
+            if let Some(kind) = kind {
+                out.push((chat_id.to_string(), kind, at));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Append one event; returns its journal seq.
     pub fn append(&self, chat_id: &str, event: &AgentEvent) -> Result<u64, JournalError> {
         let mut open = self.lock();
@@ -307,6 +350,33 @@ fn last_valid_line(path: &Path) -> Result<(Option<(u64, AgentEvent)>, bool), Jou
 /// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an
 /// arbitrary journals directory — profile import copies these files between
 /// profiles without opening a `RunJournal`.
+/// What a graceful shutdown cut short in a chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartResume {
+    /// A turn was running: re-send its prompt on the same harness session.
+    Turn,
+    /// The turn had ended but background work the agent started was still
+    /// running, and stopped with the agent: tell it so it can start again.
+    Background,
+}
+
+impl RestartResume {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::Background => "background",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "turn" => Some(Self::Turn),
+            "background" => Some(Self::Background),
+            _ => None,
+        }
+    }
+}
+
 pub fn journal_paths(dir: &Path, chat_id: &str) -> (PathBuf, PathBuf) {
     let stem = sanitize_id(chat_id);
     (

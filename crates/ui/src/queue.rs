@@ -407,6 +407,7 @@ impl Composer {
         let being_removed = self.queue_removing.contains(&item.id);
         let delivery_blocked = item.delivery_gate.is_some();
         let interaction_blocked = delivery_blocked || being_removed;
+        let agent_message = crate::agent_message::parse(&item.text);
         let text = match &item.delivery_gate {
             Some(QueueDeliveryGate::Editing {
                 owner_device_id, ..
@@ -414,7 +415,14 @@ impl Composer {
             Some(QueueDeliveryGate::ReviewRequired { .. }) if !being_edited => {
                 SharedString::from("Needs review")
             }
-            _ => one_line(&queue_visible_text(&item.text, &item.attachments)),
+            _ => match &agent_message {
+                Some(message) => one_line(&format!(
+                    "Agent message · {}: {}",
+                    message.sender,
+                    queue_visible_text(message.body, &item.attachments),
+                )),
+                None => one_line(&queue_visible_text(&item.text, &item.attachments)),
+            },
         };
 
         let edit_id = item.id.clone();
@@ -423,7 +431,7 @@ impl Composer {
             "edit",
             "Edit",
             icons::PEN,
-            !being_removed,
+            !being_removed && agent_message.is_none(),
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.begin_queue_edit(edit_id.clone(), cx);
@@ -435,7 +443,7 @@ impl Composer {
             "attach",
             "Add images",
             icons::PAPERCLIP,
-            !being_removed && self.can_edit_queue_in_composer(),
+            !being_removed && agent_message.is_none() && self.can_edit_queue_in_composer(),
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.begin_queue_edit_with_picker(attach_id.clone(), true, cx);
@@ -665,8 +673,7 @@ impl Composer {
                         .items_center()
                         .gap(px(3.0))
                         .child(discard)
-                        .child(edit)
-                        .child(attach)
+                        .when(agent_message.is_none(), |el| el.child(edit).child(attach))
                         .child(primary),
                 )
             });
@@ -1314,6 +1321,15 @@ impl Composer {
         {
             return;
         }
+        // Peer coordination must never borrow the human's composer. This
+        // also protects stale click handlers when a queue frame has changed.
+        if self.state.read(cx).queue.iter().any(|item| {
+            item.id == id && crate::agent_message::parse(&item.text).is_some()
+        }) {
+            self.failure = Some("Agent messages stay in the queue, not your composer".into());
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -1447,7 +1463,10 @@ impl Composer {
                         } else { text };
                         let selected_matches = composer.state.read(cx).selected_chat.as_deref()
                             == Some(chat_id.as_str());
-                        if !selected_matches || !composer.can_edit_queue_in_composer() {
+                        if !selected_matches
+                            || !composer.can_edit_queue_in_composer()
+                            || crate::agent_message::parse(&raw_text).is_some()
+                        {
                             // Navigation or another composer action won acquisition. Release
                             // immediately; the expiry/review path is the backup.
                             let params = serde_json::json!({
@@ -1563,6 +1582,13 @@ impl Composer {
                 .insert(self.current_key.clone(), attachments);
         }
         self.restore_question_input(cx);
+        // A question can arrive while this editor owns the composer. Its
+        // AppState notification was intentionally deferred; reconcile after
+        // this cleanup (which can itself run inside on_state_changed).
+        let composer = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = composer.update(cx, |composer, cx| composer.on_state_changed(cx));
+        });
         self.focus_pending = true;
         cx.notify();
     }
@@ -2142,6 +2168,31 @@ mod scroll_tests {
 mod appshot_edit_tests {
     use super::*;
     use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn agent_messages_cannot_take_over_the_human_composer(cx: &mut TestAppContext) {
+        let state = cx.new(|_| crate::state::AppState::new());
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        for header in [
+            "Cleanup (abc12345). Sender chat: abc12345. Relay depth: 1/4. Agent coordination, not a human request.",
+            "Cleanup (abc12345). Reply to it with the Harness `send_message` tool, chat abc12345.",
+        ] {
+            let text = format!("[Message from Harness chat {header}]\n\nClean up after tests.");
+            state.update(cx, |state, _| {
+                state.queue = vec![harness_doc::QueuedMessage::new("peer", text, "host")];
+            });
+            composer.update(cx, |composer, cx| {
+                composer.input.update(cx, |input, cx| input.set_text("My actual draft", cx));
+                composer.begin_queue_edit("peer".into(), cx);
+                assert_eq!(composer.input.read(cx).text(), "My actual draft");
+                assert!(composer.editing_queued.is_none());
+                assert!(composer.queue_edit_pending_id.is_none());
+                assert!(composer.queue_edit_draft.is_none());
+                assert_eq!(composer.failure.as_deref(), Some("Agent messages stay in the queue, not your composer"));
+            });
+            assert_eq!(state.read_with(cx, |state, _| state.queue.len()), 1);
+        }
+    }
 
     #[gpui::test]
     fn restoring_displaced_draft_keeps_appshots_and_new_captures(cx: &mut TestAppContext) {

@@ -1,8 +1,8 @@
 package harness.codegraff.android.model
 
 // Harness and model catalogs: ports of crates/harness's curated static catalogs
-// (HarnessCatalog.swift). The desktop discovers at runtime; the phone mirrors its run
-// device's live catalog and falls back to these. Defaults mirror pickers.rs: the first
+// (HarnessCatalog.swift). Static rows are for demo data and display labels only;
+// runnable choices come from the execution device. Defaults use the first actual
 // catalog row, reasoning high where the ladder has it, else medium/first.
 
 data class HarnessInfo(val id: String, val label: String)
@@ -27,7 +27,7 @@ data class ModelInfo(
 )
 
 object HarnessCatalog {
-    /** Static fallback: the engine's `default_enabled()` pair. The ACP agents appear only through a device's live catalog. */
+    /** Demo agents. A live device's offered agents must always come from its own catalog. */
     val harnesses = listOf(HarnessInfo("claude-code", "Claude Code"), HarnessInfo("codex", "Codex"))
 
     /** Display names for every harness id the fleet can produce. */
@@ -102,7 +102,7 @@ object HarnessCatalog {
             ModelInfo("gpt-5.4-mini", "GPT-5.4-Mini", "Small, fast and capable", codexXhighLadder, codexServiceTier),
             ModelInfo("gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark", "Ultra-fast lightweight coding", codexXhighLadder, codexServiceTier),
         )
-        else -> listOf( // claude-code (mock shares it)
+        "claude-code", "mock" -> listOf(
             ModelInfo("claude-fable-5-1", "Fable 5.1", "Most intelligent model for building agents", fullLadder, listOf(claudeContextWindow)),
             ModelInfo("claude-fable-5", "Fable 5", "Previous generation Fable", fullLadder, listOf(claudeContextWindow)),
             ModelInfo("claude-opus-5", "Opus 5", "Powerful model for complex work", fullLadder, listOf(claudeContextWindow, toggle("fastMode", "Fast Mode"))),
@@ -111,9 +111,10 @@ object HarnessCatalog {
             ModelInfo("claude-sonnet-5", "Sonnet 5", "Balanced speed and intelligence", claudeXhighLadder, listOf(claudeContextWindow)),
             ModelInfo("claude-haiku-4-5", "Haiku 4.5", "Fastest model for everyday tasks", emptyList(), listOf(toggle("thinking", "Thinking"))),
         )
+        else -> emptyList()
     }
 
-    fun defaultModel(harness: String): ModelInfo = models(harness).first()
+    fun defaultModel(harness: String): ModelInfo = resolve(null, models(harness), harness)
 
     /** pickers.rs: High when available, then Medium, then the first level. */
     fun defaultReasoning(model: ModelInfo): String? = when {
@@ -157,8 +158,8 @@ object HarnessCatalog {
     }
 
     fun resolve(modelId: String?, models: List<ModelInfo>, harness: String): ModelInfo {
-        if (modelId == null) return models.firstOrNull() ?: defaultModel(harness)
-        resolveExisting(modelId, models)?.let { return it }
+        if (modelId.isNullOrBlank()) return models.firstOrNull() ?: ModelInfo("", "Select model", null, emptyList())
+        resolveExisting(modelId, models)?.let { return it.copy(id = modelId) }
         return ModelInfo(modelId, curatedLabel(modelId, harness) ?: modelId, null, emptyList())
     }
 

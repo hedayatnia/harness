@@ -446,6 +446,20 @@ impl harness_sync::chat_client::ChatTransport for EdgeChatTransport {
                 .send()
                 .await
                 .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
+            if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                // The room's quota: the client holds pushes (not pulls)
+                // until the window it names reopens (#344).
+                let retry_after = res
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let body = res.bytes().await.unwrap_or_default();
+                return Err(harness_sync::chat_client::quota_refusal(
+                    retry_after.as_deref(),
+                    &body,
+                ));
+            }
             if !res.status().is_success() {
                 return Err(SyncError::Protocol(format!(
                     "chat push http {}",

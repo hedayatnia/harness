@@ -15,7 +15,9 @@ enum RolloutFeature: String, CaseIterable {
     /// Share of installs in the "on" half, 0...100.
     var percentOn: Int {
         switch self {
-        case .stackedSplitDrag: return 50
+        // Everyone: without the handle a stacked split cannot give either pane the screen, and the usage counts
+        // that were to compare the halves never leave the phone.
+        case .stackedSplitDrag: return 100
         }
     }
 }

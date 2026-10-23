@@ -10,12 +10,14 @@ impl Render for SidebarPaneCards {
             let mut strip = shell.render_pane_strip(&theme, cx);
             div()
                 .w(px(shell.settings.sidebar_width))
+                // Give the tab list's percentage scroll cap a definite height.
+                .h(px(600.0))
                 .flex()
                 .flex_col()
                 .children(
                     shell
                         .render_chat_tabs(&theme, &mut strip, cx)
-                        .map(|tabs| div().debug_selector(|| "tabs-header".into()).child(tabs)),
+                        .map(|tabs| div().h_full().debug_selector(|| "tabs-header".into()).child(tabs)),
                 )
                 .children(strip)
         })
@@ -94,24 +96,25 @@ fn assert_pane_cards(cx: &mut gpui::TestAppContext, width: f32, count: usize, ta
         "chat-pane-card-1",
         "chat-pane-card-2",
         "chat-pane-card-3",
+        "chat-pane-card-4",
+        "chat-pane-card-5",
+        "chat-pane-card-6",
+        "chat-pane-card-7",
     ][..count]
         .iter()
         .map(|selector| cx.debug_bounds(selector).unwrap())
         .collect();
-    let two_columns = width - Theme::SPACE_SM * 2.0 >= 198.0;
+    let viewport = shell.read_with(cx, |shell, _| shell.chat_tab_scroll.bounds());
     for (ix, card) in cards.iter().enumerate() {
+        assert!(card.left() >= viewport.left());
+        assert!(card.right() <= viewport.right());
         assert!(card.left() >= px(Theme::SPACE_SM));
         assert!(card.right() <= px(width - Theme::SPACE_SM + 0.5));
         assert_eq!(card.size.width, cards[0].size.width);
-        if two_columns {
-            assert!(card.size.width < px(width / 2.0));
-            if ix % 2 == 1 {
-                assert_eq!(card.top(), cards[ix - 1].top());
-                assert!(card.left() > cards[ix - 1].right());
-            } else if ix > 0 {
-                assert_eq!(card.left(), cards[0].left());
-                assert!(card.top() > cards[ix - 1].bottom());
-            }
+        assert!(card.size.width < px(width / 2.0));
+        if ix % 2 == 1 {
+            assert_eq!(card.top(), cards[ix - 1].top());
+            assert!(card.left() > cards[ix - 1].right());
         } else if ix > 0 {
             assert_eq!(card.left(), cards[0].left());
             assert!(card.top() > cards[ix - 1].bottom());
@@ -121,7 +124,7 @@ fn assert_pane_cards(cx: &mut gpui::TestAppContext, width: f32, count: usize, ta
     cx.simulate_click(cards[0].center(), Default::default());
     cx.run_until_parked();
     shell.read_with(cx, |shell, cx| {
-        assert_eq!(shell.chat_split.as_ref().unwrap().focus, 0);
+        assert_eq!(shell.chat_split.as_ref().unwrap().focus, 0, "cards: {cards:?}, viewport: {viewport:?}");
         assert_eq!(
             shell.state.read(cx).selected_chat.as_deref(),
             Some("pane-0")
@@ -144,6 +147,8 @@ fn sidebar_pane_cards_wrap_without_stretching_last_row(cx: &mut gpui::TestAppCon
 #[gpui::test]
 fn sidebar_pane_cards_fit_narrow_sidebar(cx: &mut gpui::TestAppContext) {
     for tabs in [false, true] {
-        assert_pane_cards(cx, 180.0, 4, tabs);
+        for count in [3, 4, 8] {
+            assert_pane_cards(cx, 180.0, count, tabs);
+        }
     }
 }

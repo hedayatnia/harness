@@ -25,7 +25,9 @@ use harness_rpc::methods;
 
 use crate::codegraff_jobs::{CodegraffJob, job_active, job_summary};
 use crate::codegraff_sandboxes::{
-    CodegraffSandboxes, can_start, can_stop, sandbox_detail, sandbox_title, start_labels,
+    CREATE_COPY, TEMPORARY_COPY, TURN_OFF, TURN_OFF_HINT, can_keep_running, can_start, can_stop,
+    is_temporary, sandbox_detail, sandbox_title, selected_size, size_detail, size_title,
+    start_labels,
 };
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
@@ -350,14 +352,14 @@ pub struct AccountsPage {
     jobs_poll_task: Option<Task<()>>,
     /// Job id with an in-flight Cancel.
     cancelling_job: Option<String>,
-    /// Cloud sandboxes (`None` when signed out; `enabled: false` hides the card).
-    codegraff_sandboxes: Loadable<Option<CodegraffSandboxes>>,
-    sandboxes_task: Option<Task<()>>,
-    /// The sandbox with an in-flight Start / Stop / Delete, and which.
+    /// The sandbox with an in-flight Start / Turn off / Keep running / Delete, and which. The
+    /// list itself lives on [`AppState`], shared with the sidebar strip.
     sandbox_busy: Option<(String, &'static str)>,
     /// Delete asks for a second click.
     sandbox_confirm_delete: Option<String>,
     creating_sandbox: bool,
+    /// The size picked for the next cloud sandbox (`None`: the default one).
+    sandbox_size: Option<String>,
     /// Sign out of Codegraff is in flight.
     codegraff_signing_out: bool,
     /// Account id with an in-flight Switch/Forget.
@@ -406,11 +408,10 @@ impl AccountsPage {
             jobs_task: None,
             jobs_poll_task: None,
             cancelling_job: None,
-            codegraff_sandboxes: Loadable::Idle,
-            sandboxes_task: None,
             sandbox_busy: None,
             sandbox_confirm_delete: None,
             creating_sandbox: false,
+            sandbox_size: None,
             codegraff_signing_out: false,
             busy_account: None,
             graff_logins: Loadable::Idle,
@@ -795,47 +796,38 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// The account's cloud sandboxes. They belong to this device's Codegraff sign-in, so the
-    /// call is never retargeted at another device.
+    /// Re-read the account's cloud sandboxes (kept on [`AppState`], which also keeps them
+    /// fresh while one runs). They belong to this device's Codegraff sign-in, so the call is
+    /// never retargeted at another device.
     fn load_codegraff_sandboxes(&mut self, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |state, cx| state.refresh_cloud_sandboxes(cx));
+    }
+
+    fn create_codegraff_sandbox(&mut self, temporary: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        if matches!(self.codegraff_sandboxes, Loadable::Idle) {
-            self.codegraff_sandboxes = Loadable::Loading;
-        }
-        self.sandboxes_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CODEGRAFF_SANDBOXES, serde_json::json!({}))
-                .await;
-            this.update(cx, |page, cx| {
-                page.codegraff_sandboxes = match result {
-                    Ok(value) => {
-                        match serde_json::from_value::<Option<CodegraffSandboxes>>(value) {
-                            Ok(list) => Loadable::Ready(list),
-                            Err(err) => Loadable::Error(err.to_string()),
-                        }
-                    }
-                    Err(err) => Loadable::Error(err.to_string()),
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    fn create_codegraff_sandbox(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
+        let (method, params) = if temporary {
+            (
+                methods::CODEGRAFF_CREATE_TEMPORARY_SANDBOX,
+                serde_json::json!({}),
+            )
+        } else {
+            // Personal sizing belongs only to persistent Harness devices.
+            let size = self.state.read(cx).cloud_sandboxes().and_then(|list| {
+                selected_size(&list.sizes, self.sandbox_size.as_deref()).map(|s| s.id.clone())
+            });
+            let params = match size {
+                Some(size) => serde_json::json!({ "size": size }),
+                None => serde_json::json!({}),
+            };
+            (methods::CODEGRAFF_CREATE_SANDBOX, params)
         };
         self.creating_sandbox = true;
         self.error = None;
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CODEGRAFF_CREATE_SANDBOX, serde_json::json!({}))
-                .await;
+            let result = engine.client().call(method, params).await;
             this.update(cx, |page, cx| {
                 page.creating_sandbox = false;
                 if let Err(err) = result {
@@ -877,7 +869,8 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// `action`: `start` (wakes a paused sandbox and attaches Harness again), `stop`, `delete`.
+    /// `action`: `start` (wakes a paused sandbox, kept running, and attaches Harness again),
+    /// `stop` (Turn off: a pause), `keep-running-on`, `delete`.
     fn codegraff_sandbox_action(
         &mut self,
         id: String,
@@ -915,9 +908,7 @@ impl AccountsPage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let Loadable::Ready(Some(list)) = &self.codegraff_sandboxes else {
-            return None;
-        };
+        let list = self.state.read(cx).cloud_sandboxes()?.clone();
         if !list.enabled {
             return None;
         }
@@ -928,6 +919,17 @@ impl AccountsPage {
                 .as_ref()
                 .filter(|(id, _)| *id == sandbox.id)
                 .map(|(_, action)| *action);
+            let copy_id = is_temporary(sandbox).then(|| {
+                let id = sandbox.id.clone();
+                widgets::ghost_action(theme)
+                    .id(("codegraff-sandbox-copy-id", ix))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .tooltip(widgets::text_tooltip("Use this ID with sandbox API/tools."))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                    }))
+                    .child("Copy ID")
+            });
             let start = can_start(sandbox).then(|| {
                 let id = sandbox.id.clone();
                 widgets::ghost_action(theme)
@@ -945,11 +947,32 @@ impl AccountsPage {
                         start_labels(sandbox).0
                     })
             });
+            let keep_running = can_keep_running(sandbox).then(|| {
+                let id = sandbox.id.clone();
+                widgets::ghost_action(theme)
+                    .id(("codegraff-sandbox-keep-running", ix))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .tooltip(widgets::text_tooltip(
+                        "Keep it running until you turn it off, billed per second from your Codegraff credit.",
+                    ))
+                    .when(busy.is_some(), |el| el.opacity(0.5))
+                    .when(busy.is_none(), |el| {
+                        el.on_click(cx.listener(move |page, _, _, cx| {
+                            page.codegraff_sandbox_action(id.clone(), "keep-running-on", cx)
+                        }))
+                    })
+                    .child(if busy == Some("keep-running-on") {
+                        "Keeping running…"
+                    } else {
+                        "Keep running"
+                    })
+            });
             let stop = can_stop(sandbox).then(|| {
                 let id = sandbox.id.clone();
                 widgets::ghost_action(theme)
                     .id(("codegraff-sandbox-stop", ix))
                     .hover(|s| widgets::ghost_hover(theme, s))
+                    .tooltip(widgets::text_tooltip(TURN_OFF_HINT))
                     .when(busy.is_some(), |el| el.opacity(0.5))
                     .when(busy.is_none(), |el| {
                         el.on_click(cx.listener(move |page, _, _, cx| {
@@ -957,9 +980,9 @@ impl AccountsPage {
                         }))
                     })
                     .child(if busy == Some("stop") {
-                        "Stopping…"
+                        TURN_OFF.1
                     } else {
-                        "Stop"
+                        TURN_OFF.0
                     })
             });
             let confirming = self.sandbox_confirm_delete.as_deref() == Some(sandbox.id.as_str());
@@ -1010,11 +1033,76 @@ impl AccountsPage {
                                 .child(sandbox_detail(sandbox, now)),
                         ),
                 )
+                .children(copy_id)
                 .children(start)
+                .children(keep_running)
                 .children(stop)
                 .child(delete)
         });
         let creating = self.creating_sandbox;
+        let picked = selected_size(&list.sizes, self.sandbox_size.as_deref()).map(|s| s.id.clone());
+        // Standard / Large with what each is and costs; the default one preselected.
+        let size_choice = (!list.sizes.is_empty()).then(|| {
+            div()
+                .mt(px(8.0))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.0))
+                .children(list.sizes.iter().enumerate().map(|(ix, size)| {
+                    let selected = picked.as_deref() == Some(size.id.as_str());
+                    let id = size.id.clone();
+                    div()
+                        .id(("codegraff-sandbox-size", ix))
+                        .debug_selector(move || format!("codegraff-sandbox-size-{ix}"))
+                        .flex_none()
+                        .min_w(px(180.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(if selected {
+                            theme.accent.opacity(0.6)
+                        } else {
+                            theme.border
+                        })
+                        .bg(if selected {
+                            theme.accent_wash
+                        } else {
+                            crate::theme::ink(0.02)
+                        })
+                        .role(gpui::Role::RadioButton)
+                        .aria_label(SharedString::from(format!(
+                            "{} {}",
+                            size_title(size),
+                            size_detail(size)
+                        )))
+                        .when(!creating, |el| {
+                            el.cursor_pointer()
+                                .hover(|s| s.bg(crate::theme::ink(0.05)))
+                                .on_click(cx.listener(move |page, _, _, cx| {
+                                    page.sandbox_size = Some(id.clone());
+                                    cx.notify();
+                                }))
+                        })
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(12.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(size_title(size))),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(size_detail(size))),
+                        )
+                }))
+        });
         let create = div()
             .id("codegraff-sandbox-create-row")
             .px(px(20.0))
@@ -1038,10 +1126,11 @@ impl AccountsPage {
                             .mt(px(2.0))
                             .text_size(crate::typography::ui_rems(11.5))
                             .text_color(theme.text_muted)
-                            .child(
-                                "A machine that keeps running Harness for you. It shows up in your devices, billed per second from your Codegraff credit.",
-                            ),
-                    ),
+                            .child(format!(
+                                "A machine that runs Harness for you and shows up in your devices. {CREATE_COPY}"
+                            )),
+                    )
+                    .children(size_choice),
             )
             .child(
                 widgets::ghost_action(theme)
@@ -1049,7 +1138,7 @@ impl AccountsPage {
                     .hover(|s| widgets::ghost_hover(theme, s))
                     .when(creating, |el| el.opacity(0.5))
                     .when(!creating, |el| {
-                        el.on_click(cx.listener(|page, _, _, cx| page.create_codegraff_sandbox(cx)))
+                        el.on_click(cx.listener(|page, _, _, cx| page.create_codegraff_sandbox(false, cx)))
                     })
                     .child(if creating { "Creating…" } else { "Create" }),
             );
@@ -1069,7 +1158,49 @@ impl AccountsPage {
                     widgets::section_card(theme)
                         .mt(px(8.0))
                         .children(rows)
-                        .child(create),
+                        .child(create)
+                        .child(
+                            div()
+                                .id("codegraff-temporary-sandbox-create-row")
+                                .px(px(20.0))
+                                .py(px(12.0))
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(widgets::row_title(theme, "Temporary sandbox"))
+                                        .child(
+                                            div()
+                                                .mt(px(2.0))
+                                                .text_size(crate::typography::ui_rems(11.5))
+                                                .text_color(theme.text_muted)
+                                                .child(TEMPORARY_COPY),
+                                        ),
+                                )
+                                .child(
+                                    widgets::ghost_action(theme)
+                                        .id("codegraff-temporary-sandbox-create")
+                                        .hover(|s| widgets::ghost_hover(theme, s))
+                                        .when(creating, |el| el.opacity(0.5))
+                                        .when(!creating, |el| {
+                                            el.on_click(cx.listener(|page, _, _, cx| {
+                                                page.create_codegraff_sandbox(true, cx)
+                                            }))
+                                        })
+                                        .child(if creating {
+                                            "Creating…"
+                                        } else {
+                                            "Create temporary"
+                                        }),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -1219,6 +1350,34 @@ impl AccountsPage {
 
     fn start_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         self.begin_login(harness, None, false, cx);
+    }
+
+    /// A failed run's "Log in": show `target`'s logins and, for an agent with
+    /// a sign-in here (Claude Code, Codex, Cursor), start adding an account.
+    /// Other agents (graff's provider sign-ins among them) just land on the
+    /// page: the chat says which agent, not which of its providers.
+    pub(crate) fn sign_in(
+        &mut self,
+        target: Option<String>,
+        harness: Option<HarnessId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_target_device(target, cx);
+        if let Some(harness) = harness.filter(|harness| {
+            PROVIDERS
+                .iter()
+                .any(|(provider, _, _)| provider == harness)
+        }) {
+            self.start_login(harness, cx);
+        }
+        cx.notify();
+    }
+
+    /// The device whose logins are shown (`None`: this one), and the flow's
+    /// last error, for the shell's "Log in" tests.
+    #[cfg(test)]
+    pub(crate) fn sign_in_state(&self) -> (Option<&str>, Option<&str>) {
+        (self.target_device.as_deref(), self.error.as_deref())
     }
 
     /// graff's own sign-in for one provider (`xai`, `kimi`, `zai`).

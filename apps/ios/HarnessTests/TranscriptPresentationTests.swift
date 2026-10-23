@@ -45,6 +45,34 @@ final class TranscriptPresentationTests: XCTestCase {
         XCTAssertTrue(veil.segments(totalLength: 30).allSatisfy { $0.alpha == 1 })
     }
 
+    func testSubagentControlChipsHideWorkerNumbers() {
+        let cases = [
+            ("Wait for agent 1", "Waiting on"),
+            ("Wait for agent 7: Audit login", "Waiting on"),
+            ("Wait for agents", "Waiting on"),
+            ("agent_output", "Waiting on"),
+            ("Message agent 2", "Message"),
+            ("Message agent 2: Audit login", "Message"),
+            ("Message agent", "Message"),
+            ("Send agent message", "Message"),
+            ("agent_message", "Message"),
+            ("Resume agent", "Resume"),
+            ("Resume agent 3", "Resume"),
+            ("subagent_resume", "Resume"),
+            ("Close agent", "Close"),
+            ("Close agent 4", "Close"),
+        ]
+        for (name, label) in cases {
+            let call = RenderToolCall(tag: "unknown", fields: ["name": name])
+            XCTAssertEqual(call.chipLabel, label, name)
+            XCTAssertEqual(call.chipDetail, "subagent", name)
+            XCTAssertEqual(call.string("name"), name)
+        }
+        let ordinary = RenderToolCall(tag: "unknown", fields: ["name": "Message agentic service"])
+        XCTAssertEqual(ordinary.chipLabel, "Tool")
+        XCTAssertEqual(ordinary.chipDetail, "Message agentic service")
+    }
+
     func testDesktopUserMessageCollapseThresholds() {
         XCTAssertFalse(UserBubble.needsCollapse("A short prompt."))
         XCTAssertFalse(UserBubble.needsCollapse(String(repeating: "x", count: 400)))

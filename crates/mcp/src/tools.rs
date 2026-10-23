@@ -196,6 +196,17 @@ fn catalog() -> Vec<ToolDef> {
             })),
         },
         ToolDef {
+            name: "rename_chat",
+            description: "Set a chat's sidebar title, for example after its task changed. It replaces the generated title, and the engine won't retitle the chat afterwards.",
+            input_schema: {
+                let mut schema = chat_key_schema(json!({
+                    "title": { "type": "string", "minLength": 1, "maxLength": 200 }
+                }));
+                schema["required"] = json!(["chat", "title"]);
+                schema
+            },
+        },
+        ToolDef {
             name: "archive_chat",
             description: "Archive a chat (hide it from the active sidebar list); pass archived=false to restore. Use it to tidy up chats you created.",
             input_schema: chat_key_schema(json!({
@@ -312,6 +323,12 @@ struct WaitArgs {
 struct ArchiveArgs {
     chat: String,
     archived: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RenameArgs {
+    chat: String,
+    title: String,
 }
 
 #[derive(Deserialize)]
@@ -463,6 +480,7 @@ impl Tools {
             "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "dismiss_input" => self.dismiss_input(parse(args)?).await,
+            "rename_chat" => self.rename_chat(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             "show_image" => self.show_image(parse(args)?).await,
             "show_visual" => self.show_visual(parse(args)?).await,
@@ -750,6 +768,7 @@ impl Tools {
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 room_gen: None,
+                source_context_unavailable_at: None,
             };
             let sent = self
                 .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
@@ -807,6 +826,15 @@ impl Tools {
             anyhow::bail!(
                 "refusing to send a message to your own chat ({})",
                 short(&chat.id)
+            );
+        }
+        // Archived chats are out of the active collaboration set (#498). The
+        // engine refuses the delivery too; this answers before any send.
+        if chat.archived && self.from_chat() {
+            anyhow::bail!(
+                "no message was sent to chat {}: {}",
+                short(&chat.id),
+                harness_proto::peer_mail::ARCHIVED_REFUSAL
             );
         }
         let (spaces, sessions, harnesses) = tokio::try_join!(
@@ -874,6 +902,18 @@ impl Tools {
             .await_turn(&chat, None, false, self.wait_limit(args.timeout_secs), 0)
             .await?;
         Ok(json!({ "chatId": chat.id, "title": chat.title, "turn": turn }))
+    }
+
+    async fn rename_chat(&self, args: RenameArgs) -> anyhow::Result<Value> {
+        let title = args.title.trim();
+        if title.is_empty() {
+            anyhow::bail!("rename_chat needs a nonblank title");
+        }
+        let chat = self.harness.resolve_chat(&args.chat).await?;
+        self.harness
+            .mutate(json!({ "op": "renameChat", "chatId": chat.id, "title": title }))
+            .await?;
+        Ok(json!({ "chatId": chat.id, "previousTitle": chat.title, "title": title }))
     }
 
     async fn archive_chat(&self, args: ArchiveArgs) -> anyhow::Result<Value> {
@@ -1267,6 +1307,11 @@ mod tests {
                         "id": "chat-beta-2", "deviceId": "dev-local", "title": "Beta",
                         "archived": false, "spaceId": "space-1",
                         "createdAt": "2026-09-02T00:00:00Z"
+                    },
+                    {
+                        "id": "chat-gamma-3", "deviceId": "dev-local", "title": "Gamma",
+                        "archived": true, "spaceId": "space-1",
+                        "createdAt": "2026-08-30T00:00:00Z"
                     }
                 ])),
                 methods::WATCH_SESSIONS => stream(json!([])),
@@ -1473,6 +1518,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archived_chats_are_out_of_peer_discovery_and_refuse_peer_sends() {
+        let world = Arc::new(World::default());
+        let peer = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        let listed = peer.call("list_chats", json!({})).await.unwrap();
+        assert!(
+            listed["chats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|chat| chat["title"] != "Gamma"),
+            "{listed}"
+        );
+        for mode in ["auto", "run", "steer", "queue"] {
+            let err = peer
+                .call(
+                    "send_message",
+                    json!({ "chat": "Gamma", "text": "status?", "mode": mode }),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.contains("archived"), "{mode}: {err}");
+            assert!(err.contains("no message was sent"), "{mode}: {err}");
+        }
+        assert!(
+            world.writes.lock().unwrap().is_empty(),
+            "nothing was queued"
+        );
+
+        // A person driving the server from outside any chat may still reprompt
+        // (and so restore) it.
+        let person = tools(world.clone(), Origin::default());
+        person
+            .call(
+                "send_message",
+                json!({ "chat": "Gamma", "text": "pick this back up" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(world.writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn peer_updates_do_not_pile_up_behind_a_pending_message() {
         let world = Arc::new(World::default());
         world.queued.lock().unwrap().push(json!({
@@ -1581,6 +1674,38 @@ mod tests {
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");
+    }
+
+    #[tokio::test]
+    async fn rename_chat_retitles_an_existing_chat() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let renamed = tools
+            .call(
+                "rename_chat",
+                json!({ "chat": "alpha", "title": "  Release checklist  " }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed["chatId"], "chat-alpha-1");
+        assert_eq!(renamed["title"], "Release checklist");
+        {
+            let writes = world.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].1["op"], "renameChat");
+            assert_eq!(writes[0].1["chatId"], "chat-alpha-1");
+            assert_eq!(writes[0].1["title"], "Release checklist");
+        }
+        let err = tools
+            .call("rename_chat", json!({ "chat": "alpha", "title": "   " }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("nonblank title"), "{err}");
+        assert_eq!(
+            world.writes.lock().unwrap().len(),
+            1,
+            "a blank title writes nothing"
+        );
     }
 
     #[tokio::test]

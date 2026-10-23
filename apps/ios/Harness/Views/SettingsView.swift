@@ -62,6 +62,24 @@ struct SettingsView: View {
                 }
                 .harnessListRow()
 
+                // The Codegraff account a computer is signed in with: its cloud
+                // sandboxes and GitHub CI runners, as the desktop's Settings shows them.
+                Section("Codegraff") {
+                    NavigationLink {
+                        CloudSandboxesView()
+                    } label: {
+                        Text("Cloud sandboxes")
+                    }
+                    .accessibilityIdentifier("settings-cloud-sandboxes")
+                    NavigationLink {
+                        GithubCIView()
+                    } label: {
+                        Text("GitHub CI")
+                    }
+                    .accessibilityIdentifier("settings-github-ci")
+                }
+                .harnessListRow()
+
                 // iPad already shows the list beside the open session; a phone can too, when there is room.
                 if UIDevice.current.userInterfaceIdiom == .phone {
                     Section {

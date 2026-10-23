@@ -28,6 +28,8 @@ pub struct LinkRanges {
     pub id: SharedString,
     pub child: AnyElement,
     pub layout: TextLayout,
+    /// Selection belongs to this rendered text, not every transcript/window.
+    pub selection_key: Option<std::sync::Arc<str>>,
     pub links: Vec<(Range<usize>, LinkTarget)>,
     pub ui: Option<LinkUi>,
 }
@@ -115,8 +117,15 @@ impl Element for LinkRanges {
                 state.dismissed.set(false);
             }
             state.focused = focused;
+            // Pointer focus must not mount a second disclosure between mouse
+            // down and up: window-edge snapping can put it over the hit target.
+            let disclosure_focus = focused.filter(|_| window.last_input_was_keyboard());
             state.bounds = bounds;
             state.tooltip_bounds.set(None);
+            #[cfg(test)]
+            tests::TOOLTIP_BOUNDS.with(|bounds| {
+                *bounds.borrow_mut() = Some(state.tooltip_bounds.clone());
+            });
             #[cfg(all(test, any(target_os = "linux", windows)))]
             rendered_tests::TOOLTIP_BOUNDS.with(|bounds| {
                 *bounds.borrow_mut() = Some(state.tooltip_bounds.clone());
@@ -144,6 +153,7 @@ impl Element for LinkRanges {
                     let destination = target.original.clone();
                     let tooltip_bounds = state.tooltip_bounds.clone();
                     let click_ui = self.ui.clone();
+                    let selection_key = self.selection_key.clone();
                     let menu_focus_pending = state.menu_focus_pending.clone();
                     let pointer_focus_pending = menu_focus_pending.clone();
                     let keyboard_dismissed = state.dismissed.clone();
@@ -151,15 +161,19 @@ impl Element for LinkRanges {
                     let hit = div()
                         .id(format!("link-{index}-{part}-{}", state.epoch.get()))
                         // Removing the builder cancels both visible tooltips
-                        // and GPUI's delayed show task while the menu owns input.
-                        .when(state.menu.borrow().is_none(), |hit| {
-                            hit.hoverable_tooltip(move |_, cx| {
-                                let url = destination.clone();
-                                let bounds = tooltip_bounds.clone();
-                                cx.new(|_| super::link_destination::Destination(url, bounds))
-                                    .into()
-                            })
-                        })
+                        // and GPUI's delayed show task while the menu or the
+                        // keyboard disclosure owns input.
+                        .when(
+                            state.menu.borrow().is_none() && disclosure_focus != Some(index),
+                            |hit| {
+                                hit.hoverable_tooltip(move |_, cx| {
+                                    let url = destination.clone();
+                                    let bounds = tooltip_bounds.clone();
+                                    cx.new(|_| super::link_destination::Destination(url, bounds))
+                                        .into()
+                                })
+                            },
+                        )
                         .w(rect.size.width)
                         .h(rect.size.height)
                         .cursor_pointer()
@@ -172,7 +186,9 @@ impl Element for LinkRanges {
                         .on_click(move |event, window, cx| {
                             if click_is_activation(event)
                                 && (matches!(event, ClickEvent::Keyboard(_))
-                                    || super::selection::selected_text().is_none())
+                                    || selection_key.as_ref().is_none_or(|key| {
+                                        super::selection::wash_range(key).is_none()
+                                    }))
                             {
                                 activate_link(
                                     click_target.clone(),
@@ -227,32 +243,35 @@ impl Element for LinkRanges {
                 }
             }
             if state.menu.borrow().is_none() && !state.dismissed.get() {
-                if let Some(index) = focused {
-                    if let Some(rect) =
-                        range_rects(&self.layout, &self.links[index].0, 0., 0.).first()
-                    {
-                        let card = super::link_destination::destination_card(
+                if let Some(index) = disclosure_focus {
+                    let source = range_rects(&self.layout, &self.links[index].0, 0., 0.)
+                        .into_iter()
+                        .reduce(|bounds, rect| bounds.union(&rect));
+                    if let Some((card, position, anchor)) = source.and_then(|source| {
+                        super::link_destination::focused_destination_card(
                             &state.targets[index].original,
                             state.tooltip_bounds.clone(),
+                            source,
                             window,
                             cx,
-                        );
+                        )
+                    }) {
                         let dismissed = state.dismissed.clone();
-                        let epoch = state.epoch.clone();
                         // This disclosure is not a menu: menu_at consumes every
                         // outside press, preventing other controls from receiving it.
                         let mut popup = gpui::deferred(
                             gpui::anchored()
-                                .position(rect.bottom_left())
-                                .anchor(gpui::Anchor::TopLeft)
+                                .position(position)
+                                .anchor(anchor)
                                 .snap_to_window_with_margin(px(8.))
                                 .child(
                                     div()
                                         .id("focused-link-destination")
                                         .occlude()
                                         .on_mouse_down_out(move |_, window, _| {
+                                            // Keep the link's pending press alive until
+                                            // mouse-up; dismissal must not change its ID.
                                             dismissed.set(true);
-                                            epoch.set(epoch.get().wrapping_add(1));
                                             window.refresh();
                                         })
                                         .child(card),
@@ -351,6 +370,7 @@ impl Element for LinkRanges {
                             format!("{}-link-{index}-action-{action_ix}", self.id),
                         )
                         .id(label)
+                        .when(cfg!(test), |row| row.debug_selector(move || label.into()))
                         .child(icons::icon(icon).size(px(16.)).text_color(theme.text_muted))
                         .child(label)
                         .track_focus(&state.menu_focus[action_ix])
@@ -478,6 +498,9 @@ fn click_is_activation(event: &ClickEvent) -> bool {
 mod tests {
     use super::*;
     use gpui::{MouseClickEvent, MouseDownEvent, MouseUpEvent, TestAppContext, point};
+    thread_local! {
+        pub(super) static TOOLTIP_BOUNDS: RefCell<Option<Rc<Cell<Option<Bounds<Pixels>>>>>> = RefCell::default();
+    }
     #[test]
     fn selection_drags_and_secondary_clicks_do_not_navigate() {
         let mut event = MouseClickEvent {
@@ -497,6 +520,512 @@ mod tests {
         event.down.button = MouseButton::Left;
         event.down.click_count = 2;
         assert!(!click_is_activation(&ClickEvent::Mouse(event)));
+    }
+    struct BottomLink {
+        layout: TextLayout,
+        activations: Rc<Cell<usize>>,
+    }
+    impl gpui::Render for BottomLink {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            let text = gpui::StyledText::new("Docs");
+            self.layout = text.layout().clone();
+            let activations = self.activations.clone();
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .justify_end()
+                .child(LinkRanges {
+                    id: "bottom-link".into(),
+                    child: text.into_any_element(),
+                    layout: self.layout.clone(),
+                    selection_key: None,
+                    links: vec![(0..4, LinkTarget::new("Docs", "https://example.com/docs"))],
+                    ui: Some(LinkUi {
+                        source_session: None,
+                        handler: Rc::new(move |_, _, _| {
+                            activations.set(activations.get() + 1);
+                            LinkOutcome::Rejected
+                        }),
+                    }),
+                })
+        }
+    }
+    #[gpui::test]
+    fn pointer_focus_at_window_bottom_does_not_block_link_click(cx: &mut TestAppContext) {
+        let _selection = super::super::selection::test_state_lock();
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let activations = Rc::new(Cell::new(0));
+        let window = cx.open_window(gpui::size(px(400.), px(240.)), |_, _| BottomLink {
+            layout: TextLayout::default(),
+            activations: activations.clone(),
+        });
+        let view = window.root(cx).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+            let position = range_rects(&view.read(cx).layout, &(0..4), 0., 0.)[0].center();
+            for expected in 1..=2 {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                // A frame between down and up used to mount a focused
+                // disclosure, snapped over the link at the window edge.
+                window.refresh();
+                let _ = window.draw(cx);
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                assert_eq!(activations.get(), expected);
+                window.refresh();
+                let _ = window.draw(cx);
+            }
+        })
+        .unwrap();
+    }
+    fn pointer_click(position: Point<Pixels>, window: &mut Window, cx: &mut App) {
+        window.dispatch_event(
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.refresh();
+        let _ = window.draw(cx);
+        window.dispatch_event(
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+    }
+    fn key(key: &str, window: &mut Window, cx: &mut App) {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse(key).unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).unwrap(),
+            }),
+            cx,
+        );
+        window.refresh();
+        let _ = window.draw(cx);
+    }
+    #[gpui::test]
+    fn settled_selection_from_unmounted_text_does_not_block_plain_link(cx: &mut TestAppContext) {
+        let _selection = super::super::selection::test_state_lock();
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let activations = Rc::new(Cell::new(0));
+        let window = cx.open_window(gpui::size(px(400.), px(240.)), |_, _| BottomLink {
+            layout: TextLayout::default(),
+            activations: activations.clone(),
+        });
+        let view = window.root(cx).unwrap();
+        super::super::selection::begin_with_span("unmounted-text", "selected", 0..8);
+        super::super::selection::end_active_drag();
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+            let position = range_rects(&view.read(cx).layout, &(0..4), 0., 0.)[0].center();
+            pointer_click(position, window, cx);
+        })
+        .unwrap();
+        super::super::selection::clear_if_owner("unmounted-text");
+        assert_eq!(activations.get(), 1);
+    }
+    #[gpui::test]
+    fn keyboard_disclosure_does_not_cover_pointer_activation(cx: &mut TestAppContext) {
+        let _selection = super::super::selection::test_state_lock();
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let activations = Rc::new(Cell::new(0));
+        let window = cx.open_window(gpui::size(px(400.), px(240.)), |_, _| BottomLink {
+            layout: TextLayout::default(),
+            activations: activations.clone(),
+        });
+        let view = window.root(cx).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+            window.focus_next(cx);
+            key("enter", window, cx);
+            assert_eq!(activations.get(), 1);
+            let position = range_rects(&view.read(cx).layout, &(0..4), 0., 0.)[0].center();
+            let tooltip =
+                TOOLTIP_BOUNDS.with(|bounds| bounds.borrow().as_ref().unwrap().get().unwrap());
+            assert!(
+                !tooltip.contains(&position),
+                "keyboard disclosure must not cover its source"
+            );
+            // The pointer need not move after a keyboard action. The existing
+            // disclosure hitbox must not swallow the first mouse-down.
+            pointer_click(position, window, cx);
+            assert_eq!(activations.get(), 2);
+        })
+        .unwrap();
+    }
+    struct SelectableLink(Rc<Cell<usize>>);
+    impl gpui::Render for SelectableLink {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let mut opts = super::super::render::RenderOptions::settled("gesture-link".into());
+            let activations = self.0.clone();
+            opts.link = Some(LinkUi {
+                source_session: None,
+                handler: Rc::new(move |_, _, _| {
+                    activations.set(activations.get() + 1);
+                    LinkOutcome::Rejected
+                }),
+            });
+            div()
+                .w(px(320.))
+                .child(super::super::render::selection_frame_reset())
+                .child(super::super::render::render_tree(
+                    &super::super::parser::parse_full("[Documentation](https://example.com/docs)"),
+                    &opts,
+                    &Theme::of(cx).clone(),
+                    window,
+                    &|_| None,
+                ))
+        }
+    }
+    fn pointer_gesture(
+        start: Point<Pixels>,
+        end: Point<Pixels>,
+        count: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.dispatch_event(
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: start,
+                click_count: count,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.refresh();
+        let _ = window.draw(cx);
+        window.dispatch_event(
+            gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                position: end,
+                pressed_button: Some(MouseButton::Left),
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.refresh();
+        let _ = window.draw(cx);
+        window.dispatch_event(
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: end,
+                click_count: count,
+                ..Default::default()
+            }),
+            cx,
+        );
+    }
+    #[gpui::test]
+    fn markdown_selection_distinguishes_clicks_jitter_and_selection_gestures(
+        cx: &mut TestAppContext,
+    ) {
+        let _selection = super::super::selection::test_state_lock();
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let activations = Rc::new(Cell::new(0));
+        let window = cx.open_window(gpui::size(px(400.), px(240.)), |_, _| {
+            SelectableLink(activations.clone())
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+            let (_, layout, _) = super::super::render::selection_test_snapshot("gesture-link:0");
+            let rect = range_rects(&layout, &(0..13), 0., 0.)[0];
+            let start = point(rect.left() + px(0.1), rect.center().y);
+            pointer_gesture(start, start + point(px(1.), px(0.)), 1, window, cx);
+            assert!(super::super::selection::selected_text().is_none());
+            assert_eq!(
+                activations.get(),
+                1,
+                "unselected pointer jitter remains a click"
+            );
+            // Find a two-pixel gesture crossing a real shaped-character boundary.
+            let (start, end) = (1..f32::from(rect.size.width) as usize - 2)
+                .find_map(|x| {
+                    let start = point(rect.left() + px(x as f32), rect.center().y);
+                    let end = start + point(px(2.), px(0.));
+                    (layout.index_for_position(start) != layout.index_for_position(end))
+                        .then_some((start, end))
+                })
+                .expect("link has selectable character boundaries");
+            pointer_gesture(start, end, 1, window, cx);
+            assert!(super::super::selection::selected_text().is_some());
+            assert_eq!(
+                activations.get(),
+                1,
+                "even short text-selection gestures must not navigate"
+            );
+            key("enter", window, cx);
+            assert_eq!(
+                activations.get(),
+                2,
+                "keyboard activation ignores selected text"
+            );
+            pointer_gesture(rect.center(), rect.center(), 2, window, cx);
+            assert_eq!(
+                activations.get(),
+                2,
+                "double-click selects rather than navigates"
+            );
+            pointer_gesture(start, rect.center(), 1, window, cx);
+            assert_eq!(activations.get(), 2, "selection drags must not navigate");
+            pointer_click(rect.center(), window, cx);
+            assert_eq!(
+                activations.get(),
+                3,
+                "a fresh click clears settled selection"
+            );
+        })
+        .unwrap();
+        super::super::selection::clear_if_owner("gesture-link:0");
+    }
+    #[gpui::test]
+    fn visible_hover_and_dismissed_context_menu_do_not_block_link(cx: &mut TestAppContext) {
+        let _selection = super::super::selection::test_state_lock();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let activations = Rc::new(Cell::new(0));
+        let window = cx.open_window(gpui::size(px(400.), px(240.)), |_, _| BottomLink {
+            layout: TextLayout::default(),
+            activations: activations.clone(),
+        });
+        let view = window.root(cx).unwrap();
+        let source = cx
+            .update_window(window.into(), |_, window, cx| {
+                let _ = window.draw(cx);
+                let source = range_rects(&view.read(cx).layout, &(0..4), 0., 0.)[0];
+                let position = source.bottom_left() + point(px(2.), px(-2.));
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                window.refresh();
+                let _ = window.draw(cx);
+                source
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(650));
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+            let tooltip = TOOLTIP_BOUNDS.with(|bounds| {
+                bounds
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .get()
+                    .expect("hover disclosure is visible")
+            });
+            let left = source.left().max(tooltip.left());
+            let right = source.right().min(tooltip.right());
+            let top = source.top().max(tooltip.top());
+            let bottom = source.bottom().min(tooltip.bottom());
+            assert!(
+                left < right && top < bottom,
+                "hover card overlaps the source"
+            );
+            let position = point((left + right) / 2., (top + bottom) / 2.);
+            window.dispatch_event(
+                gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.refresh();
+            let _ = window.draw(cx);
+            pointer_click(position, window, cx);
+            assert_eq!(
+                activations.get(),
+                1,
+                "a hover card over the source is not a click blocker"
+            );
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Right,
+                    position: source.center(),
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.refresh();
+            let _ = window.draw(cx);
+            assert!(
+                TOOLTIP_BOUNDS.with(|bounds| bounds.borrow().as_ref().unwrap().get().is_none())
+            );
+            key("escape", window, cx);
+            pointer_click(source.center(), window, cx);
+            assert_eq!(
+                activations.get(),
+                2,
+                "menu dismissal must restore link activation"
+            );
+        })
+        .unwrap();
+    }
+    #[gpui::test]
+    fn pointer_context_menu_actions_reach_the_activation_handler(cx: &mut TestAppContext) {
+        struct MenuLink {
+            seen: Rc<RefCell<Vec<LinkActivation>>>,
+            top: f32,
+        }
+        impl gpui::Render for MenuLink {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                let seen = self.seen.clone();
+                div().size_full().child(
+                    div()
+                        .absolute()
+                        .top(px(self.top))
+                        .left(px(20.))
+                        .w(px(350.))
+                        .debug_selector(|| "context-menu-source".into())
+                        .child(
+                            super::super::render::autolinked_text(
+                                "menu-source".into(),
+                                "https://github.com/justrach/harness/issues/447".into(),
+                                Some(LinkUi {
+                                    source_session: Some("owner".into()),
+                                    handler: Rc::new(move |activation, _, _| {
+                                        seen.borrow_mut().push(activation.clone());
+                                        LinkOutcome::Rejected
+                                    }),
+                                }),
+                                &Theme::dark(),
+                            )
+                            .expect("fixture URL is linked"),
+                        ),
+                )
+            }
+        }
+        let _selection = super::super::selection::test_state_lock();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (view, cx) = cx.add_window_view(|_, _| MenuLink {
+            seen: seen.clone(),
+            top: 20.,
+        });
+        cx.simulate_resize(gpui::size(px(400.), px(300.)));
+        for top in [20., 240.] {
+            view.update(cx, |view, cx| {
+                view.top = top;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("context-menu-source").unwrap();
+            let source = bounds.origin + point(px(6.), px(13.));
+            for (label, action) in [
+                ("Open in Harness", LinkAction::Internal),
+                ("Open in external browser", LinkAction::External),
+                ("Copy link address", LinkAction::Copy),
+            ] {
+                cx.simulate_event(gpui::MouseMoveEvent {
+                    position: source,
+                    ..Default::default()
+                });
+                cx.run_until_parked();
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(650));
+                cx.run_until_parked();
+                cx.simulate_event(MouseDownEvent {
+                    button: MouseButton::Right,
+                    position: source,
+                    click_count: 1,
+                    ..Default::default()
+                });
+                cx.simulate_event(MouseUpEvent {
+                    button: MouseButton::Right,
+                    position: source,
+                    click_count: 1,
+                    ..Default::default()
+                });
+                cx.run_until_parked();
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(200));
+                cx.run_until_parked();
+                let row = cx
+                    .debug_bounds(label)
+                    .expect("context-menu action is rendered");
+                let before = seen.borrow().len();
+                cx.simulate_click(row.center(), gpui::Modifiers::default());
+                cx.run_until_parked();
+                if action == LinkAction::Copy {
+                    cx.update(|_, cx| {
+                        assert_eq!(
+                            cx.read_from_clipboard().unwrap().text().as_deref(),
+                            Some("https://github.com/justrach/harness/issues/447")
+                        )
+                    });
+                } else {
+                    let seen = seen.borrow();
+                    assert_eq!(
+                        seen.len(),
+                        before + 1,
+                        "pointer click on {label} at y={top} must deliver an activation"
+                    );
+                    assert_eq!(seen.last().unwrap().action, action);
+                    assert_eq!(
+                        seen.last().unwrap().source_session.as_deref(),
+                        Some("owner")
+                    );
+                }
+            }
+        }
     }
     #[gpui::test]
     fn all_actions_keep_the_destination(cx: &mut TestAppContext) {
@@ -621,6 +1150,7 @@ mod rendered_tests {
                 .unwrap();
             cx.update_window(window.into(), |_, window, cx| {
                 draw_has_tooltip(window, cx);
+                key(window, "tab", cx);
                 window.focus_next(cx);
                 assert!(
                     draw_has_tooltip(window, cx),
@@ -711,6 +1241,11 @@ mod rendered_tests {
                     }),
                     cx,
                 );
+                assert!(
+                    !draw_has_tooltip(window, cx),
+                    "pointer focus must not mount a keyboard disclosure"
+                );
+                key(window, "tab", cx);
                 assert!(draw_has_tooltip(window, cx));
                 let position = gpui::point(px(425.), px(125.));
                 window.dispatch_event(
@@ -814,6 +1349,7 @@ mod rendered_tests {
                         }
                         cx.update_window(window.into(), |_, window, cx| {
                             if keyboard {
+                                key(window, "tab", cx);
                                 window.focus_next(cx);
                                 draw_has_tooltip(window, cx);
                                 key(window, "shift-f10", cx);
@@ -897,6 +1433,7 @@ mod rendered_tests {
             cx.update_window(window.into(), |_, window, cx| {
                 window.refresh();
                 let _ = window.draw(cx);
+                key(window, "tab", cx);
                 window.focus_next(cx);
                 window.refresh();
                 let _ = window.draw(cx);

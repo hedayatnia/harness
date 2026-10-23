@@ -24,8 +24,8 @@ use harness_engine::doc_host::{
 use harness_engine::{EngineCore, HarnessRegistry};
 use harness_adapters::{Harness, HarnessError, RunControls};
 use harness_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SessionStatus,
+    SteeringMode, UserInputQuestion,
 };
 
 const CHAT: &str = "chat-queue";
@@ -35,6 +35,8 @@ const CHAT: &str = "chat-queue";
 struct HeldHarness {
     steering: SteeringMode,
     finish: tokio::sync::broadcast::Sender<()>,
+    /// End the running turn as a failure instead of a completion.
+    fail: tokio::sync::broadcast::Sender<TurnFailure>,
     prompts: Arc<Mutex<Vec<String>>>,
     requests: Mutex<Vec<RunRequest>>,
     /// Park the first turn on a question instead of just hanging, so the chat
@@ -53,11 +55,13 @@ impl HeldHarness {
 
     fn build(steering: SteeringMode, asks: bool) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
         let (finish, _) = tokio::sync::broadcast::channel(16);
+        let (fail, _) = tokio::sync::broadcast::channel(16);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(Self {
                 steering,
                 finish,
+                fail,
                 prompts: prompts.clone(),
                 requests: Mutex::new(Vec::new()),
                 asks,
@@ -92,6 +96,10 @@ impl Harness for HeldHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        // Subscribe before the prompt is observable, so a test that reacts to
+        // it cannot signal a turn that is not listening yet.
+        let mut finish = self.finish.subscribe();
+        let mut fail = self.fail.subscribe();
         self.prompts.lock().unwrap().push(request.prompt.clone());
         self.requests.lock().unwrap().push(request.clone());
         let answer = self.asks.then(|| {
@@ -107,7 +115,6 @@ impl Harness for HeldHarness {
                 multi_select: false,
             }])
         });
-        let mut finish = self.finish.subscribe();
         let mut steering = controls.steering;
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
             harness: HarnessId::Mock,
@@ -127,6 +134,19 @@ impl Harness for HeldHarness {
                             error: None,
                             session_id: Some("sess-queue".into()),
                         });
+                    }
+                    Ok(failure) = fail.recv() => {
+                        return match failure {
+                            TurnFailure::Done => Ok(AgentEvent::Done {
+                                status: DoneStatus::Errored,
+                                result: None,
+                                error: Some("network error (gave up after 6 attempts)".into()),
+                                session_id: Some("sess-queue".into()),
+                            }),
+                            TurnFailure::Stream => Err(HarnessError::Protocol(
+                                "network error (gave up after 6 attempts)".into(),
+                            )),
+                        };
                     }
                     steer = steering.recv() => {
                         if steer.is_none() {
@@ -150,6 +170,14 @@ impl Harness for HeldHarness {
             })
             .boxed())
     }
+}
+
+/// How [`HeldHarness`] fails a turn: the adapter reporting `Done(Errored)`,
+/// or its event stream itself breaking.
+#[derive(Clone, Copy, Debug)]
+enum TurnFailure {
+    Done,
+    Stream,
 }
 
 async fn wait_for<F>(mut predicate: F, what: &str)
@@ -414,8 +442,14 @@ async fn restart_restores_the_queue_frozen_until_an_explicit_send() {
     // that task time to prove the restored row stays frozen.
     assert_eq!(queue_texts(&after), vec!["after restart"]);
     tokio::time::sleep(Duration::from_millis(250)).await;
+    // The turn the quit cut short is resumed on its own (#482); the queued
+    // follow-up is not: it stays frozen until an explicit send.
     assert!(
-        after_prompts.lock().unwrap().is_empty(),
+        !after_prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == "after restart"),
         "startup must not dispatch a recovered queue"
     );
     assert_eq!(queue_texts(&after), vec!["after restart"]);
@@ -1626,4 +1660,161 @@ async fn queue_completion_markers_distinguish_normal_turns_from_interrupts() {
         .await;
         core.shutdown().await;
     }
+}
+
+fn queue_rows(core: &EngineCore) -> Vec<(String, String, Vec<String>)> {
+    core.doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .read_queue()
+        .unwrap()
+        .into_iter()
+        .map(|item| (item.id, item.text, item.attachments))
+        .collect()
+}
+
+fn session_status(core: &EngineCore) -> Option<SessionStatus> {
+    core.sessions.session_status(CHAT).map(|session| session.status)
+}
+
+/// An errored turn is not a turn boundary (#466): losing the network mid-turn
+/// must not cascade every queued follow-up through the same outage. The rows
+/// stay exactly as queued until an explicit send; a retry that fails again
+/// stays paused, and one that completes resumes normal delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_errored_turn_pauses_the_queue_until_an_explicit_send() {
+    for failure in [TurnFailure::Done, TurnFailure::Stream] {
+        let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+        core.doc_host
+            .queue_message(CHAT, "opening", Vec::new())
+            .unwrap();
+        wait_for(|| prompts.lock().unwrap().len() == 1, "opening turn").await;
+        let second = core
+            .doc_host
+            .queue_message(CHAT, "second", Vec::new())
+            .unwrap();
+        let third = core
+            .doc_host
+            .queue_message(CHAT, "third", vec!["photo.png".into()])
+            .unwrap();
+        let fourth = core
+            .doc_host
+            .queue_message(CHAT, "fourth", Vec::new())
+            .unwrap();
+        let queued = queue_rows(&core);
+
+        harness.fail.send(failure).unwrap();
+        wait_for(
+            || session_status(&core) == Some(SessionStatus::Errored),
+            "the opening turn to error",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            queue_rows(&core),
+            queued,
+            "{failure:?}: rows keep their ids, order, text and attachments"
+        );
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "{failure:?}: no follow-up may start after an errored turn"
+        );
+        assert!(!user_messages(&core).iter().any(|text| text == "second"));
+
+        // Incidental wakes: a queue edit and a status-driven re-drain.
+        core.doc_host
+            .update_queued_message(CHAT, &fourth, "fourth edited")
+            .unwrap();
+        let handle = core.doc_host.open(CHAT).unwrap();
+        core.doc_host.drain_queue(&handle).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(queue_texts(&core), vec!["second", "third", "fourth edited"]);
+        assert_eq!(prompts.lock().unwrap().len(), 1);
+
+        assert!(core.doc_host.send_queued_now(CHAT, &second).await.unwrap());
+        wait_for(|| prompts.lock().unwrap().len() == 2, "explicit retry").await;
+        assert_eq!(
+            user_message_id(&core, "second").as_deref(),
+            Some(second.as_str())
+        );
+        harness.fail.send(failure).unwrap();
+        wait_for(
+            || session_status(&core) == Some(SessionStatus::Errored),
+            "the retry to error",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(queue_texts(&core), vec!["third", "fourth edited"]);
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            2,
+            "{failure:?}: a failed retry stays paused"
+        );
+
+        assert!(core.doc_host.send_queued_now(CHAT, &third).await.unwrap());
+        wait_for(|| prompts.lock().unwrap().len() == 3, "attachment row retry").await;
+        assert!(prompts.lock().unwrap()[2].starts_with("third"));
+        harness.finish.send(()).unwrap();
+        wait_for(
+            || prompts.lock().unwrap().iter().any(|p| p == "fourth edited"),
+            "a completed retry to resume delivery",
+        )
+        .await;
+        assert!(queue_texts(&core).is_empty());
+        let _ = harness.finish.send(());
+        core.shutdown().await;
+    }
+}
+
+/// Send now can fail before any run starts. Restoring the row must leave the
+/// queue paused even if it was flowing, or the restore itself wakes a drain
+/// that retries the row without another user action (#466).
+///
+/// Single-threaded on purpose: nothing else runs between the failed send and
+/// the test removing the failure's cause, so only a drain that was wrongly
+/// left free can deliver the row afterwards.
+#[tokio::test]
+async fn a_failed_explicit_send_pauses_a_flowing_queue() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .unwrap();
+    wait_for(|| prompts.lock().unwrap().len() == 1, "opening turn").await;
+    let retry = core
+        .doc_host
+        .queue_message(CHAT, "retry me", Vec::new())
+        .unwrap();
+    core.doc_host
+        .queue_message(CHAT, "after", Vec::new())
+        .unwrap();
+
+    // Route the explicit send to a harness this engine does not have.
+    let mut config = harness_proto::ChatConfig {
+        harness: HarnessId::Codex,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+    };
+    core.workspace.set_chat_config(CHAT, &config).unwrap();
+    assert!(core.doc_host.send_queued_now(CHAT, &retry).await.is_err());
+    config.harness = HarnessId::Mock;
+    core.workspace.set_chat_config(CHAT, &config).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(queue_texts(&core), vec!["retry me", "after"]);
+    assert_eq!(*prompts.lock().unwrap(), vec!["opening"]);
+
+    assert!(core.doc_host.send_queued_now(CHAT, &retry).await.unwrap());
+    wait_for(|| prompts.lock().unwrap().len() == 2, "explicit retry").await;
+    harness.finish.send(()).unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "after"),
+        "a successful retry to resume delivery",
+    )
+    .await;
+    let _ = harness.finish.send(());
+    core.shutdown().await;
 }

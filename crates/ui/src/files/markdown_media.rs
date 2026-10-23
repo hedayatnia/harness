@@ -2,6 +2,21 @@
 use crate::markdown::parser::{Block, BlockTree, InlineRun};
 
 pub(super) fn image_sources(tree: &BlockTree) -> Vec<String> {
+    let mut out = Vec::new();
+    for top in &tree.blocks {
+        collect_images(&top.block, &mut out);
+    }
+    out
+}
+
+/// Image sources in one block, in order, without duplicates.
+pub(crate) fn block_image_sources(block: &Block) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_images(block, &mut out);
+    out
+}
+
+fn collect_images(b: &Block, out: &mut Vec<String>) {
     fn runs(runs: &[InlineRun], out: &mut Vec<String>) {
         for run in runs {
             if let Some(image) = &run.style.image {
@@ -11,23 +26,16 @@ pub(super) fn image_sources(tree: &BlockTree) -> Vec<String> {
             }
         }
     }
-    fn block(b: &Block, out: &mut Vec<String>) {
-        match b {
-            Block::Paragraph { runs: r } | Block::Heading { runs: r, .. } => runs(r, out),
-            Block::BlockQuote { children } => children.iter().for_each(|b| block(b, out)),
-            Block::List { items, .. } => items.iter().flatten().for_each(|b| block(b, out)),
-            Block::Table { header, rows, .. } => header
-                .iter()
-                .chain(rows.iter().flatten())
-                .for_each(|r| runs(r, out)),
-            _ => {}
-        }
+    match b {
+        Block::Paragraph { runs: r } | Block::Heading { runs: r, .. } => runs(r, out),
+        Block::BlockQuote { children } => children.iter().for_each(|b| collect_images(b, out)),
+        Block::List { items, .. } => items.iter().flatten().for_each(|b| collect_images(b, out)),
+        Block::Table { header, rows, .. } => header
+            .iter()
+            .chain(rows.iter().flatten())
+            .for_each(|r| runs(r, out)),
+        _ => {}
     }
-    let mut out = Vec::new();
-    for top in &tree.blocks {
-        block(&top.block, &mut out);
-    }
-    out
 }
 
 pub(super) fn diagram_sources(tree: &BlockTree) -> Vec<String> {

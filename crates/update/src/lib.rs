@@ -378,12 +378,32 @@ fn detect_install_from_for_os(exe: &Path, home: Option<&Path>, os: &str) -> Inst
         if ancestor.extension().is_some_and(|ext| ext == "app")
             && exe.starts_with(ancestor.join("Contents").join("MacOS"))
         {
+            // A dev bundle (scripts/run-macos-dev.sh) never takes a release
+            // update: installing one would replace the local build and its
+            // isolated data dir and IPC port (#452).
+            if is_dev_bundle(ancestor) {
+                return InstallKind::Unmanaged;
+            }
             return InstallKind::MacApp {
                 bundle: ancestor.to_path_buf(),
             };
         }
     }
     InstallKind::Unmanaged
+}
+
+/// Whether `bundle`'s `CFBundleIdentifier` is a dev build's
+/// (`harness.codegraff.app.dev`, from `dist/macos/Info-dev.plist`).
+fn is_dev_bundle(bundle: &Path) -> bool {
+    plist::Value::from_file(bundle.join("Contents").join("Info.plist"))
+        .ok()
+        .and_then(|info| {
+            info.as_dictionary()?
+                .get("CFBundleIdentifier")?
+                .as_string()
+                .map(|id| id.ends_with(".dev"))
+        })
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,6 +1299,33 @@ mod tests {
             ),
             InstallKind::MacApp {
                 bundle: PathBuf::from("/Applications/Harness.app")
+            }
+        );
+        // A dev bundle never takes a release update.
+        let dev = tempfile::tempdir().unwrap();
+        let contents = dev.path().join("Harness.app").join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        let info = |id: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                 <key>CFBundleIdentifier</key><string>{id}</string></dict></plist>"
+            )
+        };
+        let dev_exe = contents.join("MacOS").join("harness");
+        std::fs::write(
+            contents.join("Info.plist"),
+            info("harness.codegraff.app.dev"),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_install_from_for_os(&dev_exe, Some(Path::new("/Users/u")), "macos"),
+            InstallKind::Unmanaged
+        );
+        std::fs::write(contents.join("Info.plist"), info("harness.codegraff.app")).unwrap();
+        assert_eq!(
+            detect_install_from_for_os(&dev_exe, Some(Path::new("/Users/u")), "macos"),
+            InstallKind::MacApp {
+                bundle: dev.path().join("Harness.app")
             }
         );
         // A path merely containing `.app` without the bundle layout is not a bundle.

@@ -376,9 +376,15 @@ async fn queued_run_command_executes_end_to_end() {
         Some((SessionCommandStatus::Applied, None))
     );
 
-    // Journal replay: the full script in order, terminal Done last.
+    // Journal replay: the full script in order, terminal Done last, with the two
+    // consecutive text deltas journaled as one row (#341).
+    let journaled = mock_script().len() - 1;
     let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
-    assert_eq!(replay.len(), mock_script().len());
+    assert_eq!(replay.len(), journaled);
+    assert!(matches!(
+        &replay[1].event,
+        AgentEvent::TextDelta { text } if text == "Hello"
+    ));
     assert!(matches!(
         replay.last().map(|j| &j.event),
         Some(AgentEvent::Done {
@@ -387,7 +393,7 @@ async fn queued_run_command_executes_end_to_end() {
         })
     ));
     let seqs: Vec<u64> = replay.iter().map(|j| j.seq).collect();
-    assert_eq!(seqs, (1..=mock_script().len() as u64).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=journaled as u64).collect::<Vec<_>>());
 
     // The live broadcast delivered the same events.
     let mut broadcast_count = 0usize;
@@ -395,7 +401,7 @@ async fn queued_run_command_executes_end_to_end() {
         assert!(event.seq >= 1);
         broadcast_count += 1;
     }
-    assert_eq!(broadcast_count, mock_script().len());
+    assert_eq!(broadcast_count, journaled);
 
     // Final session status: Idle.
     assert_eq!(
@@ -2654,7 +2660,8 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
         handle.doc().context_usage(),
         Some(harness_proto::ContextUsage {
             tokens: Some(0),
-            window: Some(200000)
+            window: Some(200000),
+            savings: None,
         })
     );
     assert_eq!(

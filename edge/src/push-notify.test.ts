@@ -58,6 +58,12 @@ describe("notificationFor (desktop parity)", () => {
     expect(notificationFor({ ...session("idle", null), deleted: true }, session("idle", "t"), NOW)).toBeNull();
   });
 
+  it("a peer-only completion is consumed silently; human work still notifies", () => {
+    const peerOnly: Row = { ...session("idle", "t2"), fields: { ...session("idle", "t2").fields, lastCompletedPeerOnly: true } };
+    expect(notificationFor(session("working", "t1"), peerOnly, NOW)).toBeNull();
+    expect(notificationFor(peerOnly, session("idle", "t3"), NOW)).toBe("done");
+  });
+
   it("a question on a dead (stale) session is not news", () => {
     expect(notificationFor(session("working", null), session("awaitingInput", null, NOW - 60_000), NOW)).toBeNull();
   });

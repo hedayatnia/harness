@@ -633,7 +633,10 @@ impl MacTextSystemState {
                 ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
                 glyphs.push(ShapedGlyph {
                     id: GlyphId(glyph_id as u32),
-                    position: point(position.x as f32, position.y as f32).map(px),
+                    // Core Text's y grows upward; glyph positions here grow
+                    // downward (DirectWrite and cosmic-text agree). Unflipped,
+                    // a mark the font raises over a capital (X̄, Â) sank into it.
+                    position: point(position.x as f32, -position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
                     is_emoji,
                 });
@@ -820,6 +823,40 @@ mod tests {
         assert_ne!(larger.0, first.0, "another size has to be another font");
         assert_eq!(shape(16.), first, "a size laid out again after another");
         assert_eq!(shape(24.), larger);
+    }
+
+    /// Core Text reports mark offsets with y growing upward, and glyph
+    /// positions here grow downward. A mark the font raises over a capital
+    /// has to come out above where it sits on a lowercase letter, not sunk
+    /// into the capital (X̄ rendered as a plain X).
+    #[test]
+    fn marks_raised_over_capitals_stay_above_them() {
+        let fonts = MacTextSystem::new();
+        fonts
+            .add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!(
+                "../../../../../crates/ui/assets/fonts/Geist.ttf"
+            ))])
+            .unwrap();
+        let font_id = fonts.font_id(&font("Geist")).unwrap();
+        let mark_y = |line: &str| {
+            let layout = fonts.layout_line(
+                line,
+                px(16.),
+                &[FontRun {
+                    font_id,
+                    len: line.len(),
+                }],
+            );
+            let glyphs: Vec<_> = layout.runs.iter().flat_map(|run| &run.glyphs).collect();
+            assert_eq!(glyphs.len(), 2, "{line:?} is a letter and its mark");
+            glyphs[1].position.y
+        };
+        let capital = mark_y("X\u{304}");
+        let lowercase = mark_y("x\u{304}");
+        assert!(
+            capital < lowercase,
+            "the macron over X ({capital:?}) must sit higher than over x ({lowercase:?})"
+        );
     }
 
     #[test]

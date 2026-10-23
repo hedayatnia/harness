@@ -37,6 +37,19 @@ New peer envelopes carry a relay depth: a chain stops after four deliveries;
 a new human request resets it. Legacy peer headers count as the first delivery.
 These are coordination safeguards, not authentication of text supplied by users.
 
+Archived chats are out of the active collaboration set. `list_chats` leaves
+them out unless `include_archived` is set, and a `send_message` from a chat to
+an archived chat fails with an archived error: nothing is sent and the chat
+stays archived. The engine enforces the same rule for every peer delivery (a
+`send_message` envelope or a room delivery), both when the message is accepted
+and again when it would start a turn, so mail queued before the archive waits
+in the queue until a person restores the chat. Room wakes for an archived chat
+are dropped. A person's own prompt still restores the chat (#345, #498).
+
+A turn fed only by peer mail completes without a completion sound, banner or
+phone notification: its `Session.lastCompletedPeerOnly` is set. A person's
+prompt or steer anywhere in the turn makes it an ordinary completion (#499).
+
 ### Parent links
 
 A chat created through `create_chat` records the creating chat as its parent:

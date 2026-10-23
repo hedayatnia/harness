@@ -16,6 +16,14 @@ Mermaid diagrams use the same fence frame, header metrics, border, background an
 
 Source fences use the same interaction model as chat code blocks: long lines have an independent horizontal scroll plane and a hover scrollbar, Copy changes to a transient `Copied` confirmation, and the Fit content control wraps lines to the available width. The Fit content choice is the same device-level persisted setting used by chat, so changing it in either surface updates both; horizontal offsets remain local to each fence.
 
+## Math notation
+
+The shared chat/preview parser recognizes `$…$` and `\(…\)` inline math, plus `$$…$$` and `\[…\]` display math. Formulas currently render as readable Unicode text, not two-dimensional equation layout: for example, `\frac{a+b}{n}` becomes `(a+b)/n`, not a stacked fraction.
+
+Single-dollar delimiters must have non-whitespace content immediately inside both ends. A closing dollar cannot be followed by a number, including a leading decimal such as `.50`. This preserves ordinary prices such as `$5 and $10`, `$5–$10`, and `$.50–$.75` while recognizing `$x^2$` and `$\sigma/\sqrt m$`. A numeric amount followed only by opening brackets/whitespace is treated as a price, so `$5 ($x^2$)` keeps the price and the equation separate; complete expressions such as `$5 (x)$` still render as math. Single-dollar spans cannot cross source lines, literal code/HTML/link regions (including reference-link definitions), or content-reference directives. Escape literal dollars as `\$`; separate adjacent inline formulas with whitespace, or use backslash delimiters to avoid ambiguous dollar runs.
+
+Unclosed or oversized formulas stay literal during streaming. Conversion depth is bounded; excessively nested formulas retain their LaTeX rather than risking a stack overflow. No TeX commands execute code or load resources.
+
 ## Mermaid engine decision
 
 The embedded engine is `mermaid-rs-renderer` **0.3.1**, MIT licensed, with default CLI/PNG features disabled. Its interface is isolated in `markdown/mermaid.rs`. Generated SVG is consumed by GPUI's existing SVG renderer.

@@ -278,6 +278,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         space_id: None,
         last_seen_at: None,
         room_gen: None,
+        source_context_unavailable_at: None,
     }
 }
 
@@ -297,6 +298,7 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
 fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
         last_completed_turn: None,
+        last_completed_peer_only: false,
         chat_id: chat_id.into(),
         device_id: device_id.into(),
         status,

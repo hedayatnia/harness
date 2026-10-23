@@ -39,6 +39,7 @@
 pub(crate) mod catalog;
 pub mod dictation;
 mod normalize;
+mod npm_repair;
 mod subagents;
 pub mod voice_host;
 
@@ -676,6 +677,14 @@ impl CodexHarness {
             ));
         }
         let exe = self.resolve_executable()?;
+        // A global npm Codex missing its native binary fails every start;
+        // repair it once before the first run. Never for an explicit binary
+        // (`with_executable`, `CODEX_EXECUTABLE`): that one is the caller's.
+        if self.executable.is_none()
+            && std::env::var_os("CODEX_EXECUTABLE").is_none_or(|p| p.is_empty())
+        {
+            npm_repair::ensure_starts(&exe).await;
+        }
         // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
         // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
         // Parity with the Claude adapter, which auto-approves every

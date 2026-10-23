@@ -11,9 +11,19 @@
 //! sandbox gets a unique `deviceName`, remembered in `cloud-sandboxes.json` in the data
 //! directory and joined onto the list.
 //!
+//! Sandboxes created or woken here keep running: the gateway renews their window
+//! (`autoStopMinutes` long) on its own, billed per second from the account's credit, until the
+//! user turns them off (`/stop`, a pause) or a renewal fails (`renewError`), after which the
+//! sandbox pauses at the end of its current window with its state kept.
+//!
 //! Every build offers them to an account signed in with Codegraff; the gateway decides what the
 //! account may do (credit, reservations) and its errors are shown as they come.
 //! [`cloud_sandboxes_enabled`] can still turn the feature off.
+//!
+//! Sizes: `GET /v1/sandboxes/personal-sizes` lists what a personal sandbox can be (vCPU, memory,
+//! disk, hourly price). The list carries them so every view can offer a size and show a rate, and
+//! a create asks for the chosen size's `cpu`/`memory`/`disk`. Gateways without sizes answer 404:
+//! the list then has none and a create sends the sizeless body it always did.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -27,8 +37,11 @@ use super::{CodegraffAuth, http, urlencode};
 
 const FLEET: &str = "fleet";
 const SANDBOX_NAME: &str = "Harness cloud";
-/// The gateway pauses a persistent sandbox this long after its last activity.
+/// The length of each running window. A keep-running sandbox has its window renewed before it
+/// ends; any other sandbox pauses when it ends.
 const AUTO_STOP_MINUTES: u32 = 30;
+/// The window a wake asks for (the same length as a fresh sandbox's).
+const WAKE_LEASE_SECONDS: u32 = AUTO_STOP_MINUTES * 60;
 const QUICK: Duration = Duration::from_secs(20);
 /// Creating or waking a sandbox boots a machine.
 const BOOT: Duration = Duration::from_secs(90);
@@ -53,6 +66,37 @@ pub struct CodegraffSandbox {
     pub harness: bool,
     /// The name its device registers under (remembered at create time).
     pub device_name: Option<String>,
+    /// The gateway renews its window until it is turned off. `None` from gateways that don't
+    /// know the setting (treated as off).
+    pub keep_running: Option<bool>,
+    /// Why the last renewal failed (`insufficient_credit`, `key_budget`, `fleet_unavailable`,
+    /// or another word); the sandbox pauses when its current window ends.
+    pub renew_error: Option<String>,
+    /// Its machine, when the gateway says (older gateways don't).
+    pub cpu: Option<f64>,
+    #[serde(rename = "memoryGiB")]
+    pub memory_gib: Option<f64>,
+    #[serde(rename = "diskGiB")]
+    pub disk_gib: Option<f64>,
+    /// What it costs per hour while running, in micro-USD. From the view, else from the
+    /// personal size with the same vCPU and memory.
+    pub price_per_hour_micro_usd: Option<i64>,
+}
+
+/// One size a personal sandbox can be (`GET /v1/sandboxes/personal-sizes`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PersonalSize {
+    /// `standard`, `large`, …
+    pub id: String,
+    pub cpu: u32,
+    #[serde(rename = "memoryGiB")]
+    pub memory_gib: u32,
+    #[serde(rename = "diskGiB")]
+    pub disk_gib: u32,
+    pub price_per_hour_micro_usd: Option<i64>,
+    /// The size a create uses unless another is picked.
+    pub default: bool,
 }
 
 /// `enabled: false` means this build doesn't offer cloud sandboxes (the UI hides the card).
@@ -61,6 +105,8 @@ pub struct CodegraffSandbox {
 pub struct CodegraffSandboxes {
     pub enabled: bool,
     pub sandboxes: Vec<CodegraffSandbox>,
+    /// The sizes a new sandbox can be; empty when the gateway doesn't offer sizes.
+    pub sizes: Vec<PersonalSize>,
 }
 
 /// On unless `HARNESS_CLOUD_SANDBOXES=0` (or `false`) turns cloud sandboxes off.
@@ -84,7 +130,14 @@ fn parse_sandbox(value: &Value) -> CodegraffSandbox {
         provider: text("/provider").unwrap_or_default(),
         name: text("/name"),
         state: normalise_state(text("/state").as_deref()),
-        tier: text("/tier"),
+        // Daytona has no tier in its list response; retain the temporary intent via its labels.
+        tier: text("/tier").or_else(|| {
+            (value
+                .pointer("/labels/harness-purpose")
+                .and_then(Value::as_str)
+                == Some("temporary"))
+            .then(|| "ephemeral".to_string())
+        }),
         expires_at: value
             .get("expiresAt")
             .or_else(|| value.get("expires_at"))
@@ -95,7 +148,105 @@ fn parse_sandbox(value: &Value) -> CodegraffSandbox {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         device_name: None,
+        keep_running: value.get("keepRunning").and_then(Value::as_bool),
+        renew_error: text("/renewError").filter(|e| !e.trim().is_empty()),
+        cpu: number(value, "cpu").filter(|n| *n > 0.0),
+        memory_gib: number(value, "memoryGiB")
+            .or_else(|| number(value, "memory"))
+            .filter(|n| *n > 0.0),
+        disk_gib: number(value, "diskGiB")
+            .or_else(|| number(value, "disk"))
+            .filter(|n| *n > 0.0),
+        price_per_hour_micro_usd: number(value, "pricePerHourMicroUsd")
+            .filter(|n| *n >= 0.0)
+            .map(|n| n.round() as i64),
     }
+}
+
+fn number(value: &Value, key: &str) -> Option<f64> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite())
+}
+
+/// The gateway's `{sizes: [...]}`. Rows without an id or a machine are dropped; when none is
+/// marked default, the first is.
+fn parse_sizes(value: &Value) -> Vec<PersonalSize> {
+    let whole = |row: &Value, key: &str| {
+        number(row, key)
+            .filter(|n| *n > 0.0 && *n < f64::from(u32::MAX))
+            .map(|n| n.round() as u32)
+    };
+    let mut sizes: Vec<PersonalSize> = value
+        .get("sizes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            Some(PersonalSize {
+                id: id.to_owned(),
+                cpu: whole(row, "cpu")?,
+                memory_gib: whole(row, "memoryGiB")?,
+                disk_gib: whole(row, "diskGiB").unwrap_or(0),
+                price_per_hour_micro_usd: number(row, "pricePerHourMicroUsd")
+                    .filter(|n| *n >= 0.0)
+                    .map(|n| n.round() as i64),
+                default: row.get("default").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect();
+    if !sizes.is_empty() && !sizes.iter().any(|s| s.default) {
+        sizes[0].default = true;
+    }
+    sizes
+}
+
+/// The size a create asks for: the one named, else the default.
+fn chosen_size<'a>(sizes: &'a [PersonalSize], wanted: Option<&str>) -> Option<&'a PersonalSize> {
+    wanted
+        .and_then(|id| sizes.iter().find(|s| s.id == id))
+        .or_else(|| sizes.iter().find(|s| s.default))
+}
+
+/// A view without a price borrows the price of the size with the same vCPU and memory.
+fn fill_price(sandbox: &mut CodegraffSandbox, sizes: &[PersonalSize]) {
+    if sandbox.price_per_hour_micro_usd.is_some()
+        || sandbox.provider == "daytona"
+        || sandbox.tier.as_deref() == Some("ephemeral")
+    {
+        return;
+    }
+    let (Some(cpu), Some(memory)) = (sandbox.cpu, sandbox.memory_gib) else {
+        return;
+    };
+    sandbox.price_per_hour_micro_usd = sizes
+        .iter()
+        .find(|s| f64::from(s.cpu) == cpu && f64::from(s.memory_gib) == memory)
+        .and_then(|s| s.price_per_hour_micro_usd);
+}
+
+/// The create body: today's, plus the chosen size's machine when the gateway offers sizes.
+fn create_body(size: Option<&PersonalSize>) -> Value {
+    let mut body = json!({
+        "provider": FLEET,
+        "persistent": true,
+        "name": SANDBOX_NAME,
+        "autoStopMinutes": AUTO_STOP_MINUTES,
+        "keepRunning": true,
+    });
+    if let Some(size) = size {
+        body["cpu"] = json!(size.cpu);
+        body["memory"] = json!(size.memory_gib);
+        if size.disk_gib > 0 {
+            body["disk"] = json!(size.disk_gib);
+        }
+    }
+    body
 }
 
 /// The fleet's own words (`started`, `destroyed`) in the words the rest of the app uses.
@@ -142,11 +293,11 @@ fn parse_list(value: &Value) -> Vec<CodegraffSandbox> {
 }
 
 /// A gateway call that did not succeed.
-struct Failure {
+pub(super) struct Failure {
     /// 0 when nothing was sent (not signed in, bad gateway URL, no network).
-    status: u16,
-    body: Option<Value>,
-    message: Option<String>,
+    pub(super) status: u16,
+    pub(super) body: Option<Value>,
+    pub(super) message: Option<String>,
 }
 
 impl Failure {
@@ -158,13 +309,13 @@ impl Failure {
         }
     }
 
-    fn error_type(&self) -> Option<&str> {
+    pub(super) fn error_type(&self) -> Option<&str> {
         self.body.as_ref()?.pointer("/error/type")?.as_str()
     }
 
     /// The gateway's own `error.message` as a sentence, else `fallback`. A few error types
     /// get app wording because the gateway's text is written for developers.
-    fn sentence(&self, fallback: &str) -> String {
+    pub(super) fn sentence(&self, fallback: &str) -> String {
         let known = match self.error_type() {
             Some("insufficient_credits") => {
                 Some("Your Codegraff credit is used up. Add credit and try again.")
@@ -204,7 +355,7 @@ impl Failure {
 }
 
 impl CodegraffAuth {
-    async fn sandbox_call(
+    pub(super) async fn sandbox_call(
         &self,
         method: Method,
         path: &str,
@@ -279,20 +430,40 @@ impl CodegraffAuth {
         if !cloud_sandboxes_enabled() {
             return Ok(Some(CodegraffSandboxes::default()));
         }
-        let value = self
-            .sandbox_call(Method::GET, "/v1/sandboxes", None, QUICK)
-            .await
-            .map_err(|f| f.sentence("CodeGraff sandboxes are unavailable"))?;
+        let (value, sizes) = tokio::join!(
+            self.sandbox_call(Method::GET, "/v1/sandboxes", None, QUICK),
+            self.personal_sizes()
+        );
+        let value = value.map_err(|f| f.sentence("CodeGraff sandboxes are unavailable"))?;
         let names = self.device_names();
         let mut sandboxes = parse_list(&value);
         for sandbox in &mut sandboxes {
             sandbox.device_name = names.get(&sandbox.id).cloned();
             sandbox.harness = sandbox.harness || sandbox.device_name.is_some();
+            fill_price(sandbox, &sizes);
         }
         Ok(Some(CodegraffSandboxes {
             enabled: true,
             sandboxes,
+            sizes,
         }))
+    }
+
+    /// The sizes a personal sandbox can be. Empty when the gateway doesn't offer sizes (404) or
+    /// can't say right now: callers then behave as before sizes existed.
+    async fn personal_sizes(&self) -> Vec<PersonalSize> {
+        match self
+            .sandbox_call(Method::GET, "/v1/sandboxes/personal-sizes", None, QUICK)
+            .await
+        {
+            Ok(value) => parse_sizes(&value),
+            Err(failure) => {
+                if failure.status != 404 {
+                    tracing::debug!(status = failure.status, "cloud sandbox sizes unavailable");
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// Set Harness up in a running sandbox (idempotent; see the module docs). One retry,
@@ -312,18 +483,40 @@ impl CodegraffAuth {
         }
     }
 
-    /// Create the account's Harness cloud sandbox and set Harness up in it. If the machine
-    /// exists but Harness could not start, it stays in the list: Start retries the setup.
-    pub async fn create_sandbox(&self) -> Result<CodegraffSandbox, String> {
+    /// A short-lived API/tool sandbox. Let the gateway choose the fleet or Daytona fallback;
+    /// unlike a personal cloud machine, this must not attach Harness or renew its lease.
+    pub async fn create_temporary_sandbox(&self) -> Result<CodegraffSandbox, String> {
         if !cloud_sandboxes_enabled() {
             return Err("Cloud sandboxes are not available in this build.".into());
         }
         let body = json!({
-            "provider": FLEET,
-            "persistent": true,
-            "name": SANDBOX_NAME,
+            "provider": "auto",
+            "ephemeral": true,
+            "name": "Temporary sandbox",
             "autoStopMinutes": AUTO_STOP_MINUTES,
+            "labels": { "harness-purpose": "temporary" },
         });
+        let created = self
+            .sandbox_call(Method::POST, "/v1/sandboxes", Some(body), BOOT)
+            .await
+            .map_err(|f| f.sentence("CodeGraff couldn't create the temporary sandbox"))?;
+        let sandbox = parse_sandbox(&created);
+        if sandbox.id.is_empty() {
+            return Err("CodeGraff created a sandbox but didn't say which one.".into());
+        }
+        Ok(sandbox)
+    }
+
+    /// Create the account's Harness cloud sandbox, `size` (a personal size id) or the default
+    /// one, and set Harness up in it. If the machine exists but Harness could not start, it stays
+    /// in the list: Start retries the setup.
+    pub async fn create_sandbox(&self, size: Option<&str>) -> Result<CodegraffSandbox, String> {
+        if !cloud_sandboxes_enabled() {
+            return Err("Cloud sandboxes are not available in this build.".into());
+        }
+        let sizes = self.personal_sizes().await;
+        let chosen = chosen_size(&sizes, size);
+        let body = create_body(chosen);
         let created = self
             .sandbox_call(Method::POST, "/v1/sandboxes", Some(body), BOOT)
             .await
@@ -331,6 +524,18 @@ impl CodegraffAuth {
         let mut sandbox = parse_sandbox(&created);
         if sandbox.id.is_empty() {
             return Err("CodeGraff created a sandbox but didn't say which one.".into());
+        }
+        if let Some(chosen) = chosen {
+            sandbox.cpu.get_or_insert(f64::from(chosen.cpu));
+            sandbox
+                .memory_gib
+                .get_or_insert(f64::from(chosen.memory_gib));
+            if chosen.disk_gib > 0 {
+                sandbox.disk_gib.get_or_insert(f64::from(chosen.disk_gib));
+            }
+            if sandbox.price_per_hour_micro_usd.is_none() {
+                sandbox.price_per_hour_micro_usd = chosen.price_per_hour_micro_usd;
+            }
         }
         // Remembered before the setup call, so a failed setup retries under the same name.
         let device_name = device_name_for(&sandbox.id);
@@ -350,16 +555,23 @@ impl CodegraffAuth {
     }
 
     /// Start a sandbox that isn't running (or set Harness up again in a running one): `/start`
-    /// when needed, then `/harness` under the name remembered at create time.
+    /// when needed, kept running like a fresh one, then `/harness` under the name remembered
+    /// at create time.
     pub async fn start_sandbox(&self, id: &str) -> Result<(), String> {
         let current = self
             .sandbox_call(Method::GET, &Self::sandbox_path(id, ""), None, QUICK)
             .await
             .map_err(|f| f.sentence("CodeGraff couldn't read the sandbox"))?;
         if parse_sandbox(&current).state != "running" {
-            self.sandbox_call(Method::POST, &Self::sandbox_path(id, "/start"), None, BOOT)
-                .await
-                .map_err(|f| f.sentence("CodeGraff couldn't start the sandbox"))?;
+            let body = json!({ "leaseSeconds": WAKE_LEASE_SECONDS, "keepRunning": true });
+            self.sandbox_call(
+                Method::POST,
+                &Self::sandbox_path(id, "/start"),
+                Some(body),
+                BOOT,
+            )
+            .await
+            .map_err(|f| f.sentence("CodeGraff couldn't start the sandbox"))?;
         }
         let mut names = self.device_names();
         let device_name = names
@@ -377,12 +589,45 @@ impl CodegraffAuth {
         Ok(())
     }
 
-    /// Pause (fleet: memory and processes are kept).
+    /// Pause (fleet: memory and processes are kept). Billing for the machine stops.
     pub async fn stop_sandbox(&self, id: &str) -> Result<(), String> {
         self.sandbox_call(Method::POST, &Self::sandbox_path(id, "/stop"), None, QUICK)
             .await
             .map(drop)
             .map_err(|f| f.sentence("CodeGraff couldn't stop the sandbox"))
+    }
+
+    /// Turn window renewal on or off for a running sandbox. Off, it pauses when its current
+    /// window ends. Answers the sandbox as the gateway now sees it.
+    pub async fn set_sandbox_keep_running(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<CodegraffSandbox, String> {
+        let value = self
+            .sandbox_call(
+                Method::POST,
+                &Self::sandbox_path(id, "/keep-running"),
+                Some(json!({ "enabled": enabled })),
+                QUICK,
+            )
+            .await
+            .map_err(|f| {
+                f.sentence("CodeGraff couldn't change whether the sandbox keeps running")
+            })?;
+        // The gateway answers the bare view (like `/start` and `/stop`); a `{sandbox}`
+        // wrapper is read too.
+        let view = match value.get("sandbox") {
+            Some(inner) if inner.is_object() && value.get("id").is_none() => inner,
+            _ => &value,
+        };
+        let mut sandbox = parse_sandbox(view);
+        if sandbox.id.is_empty() {
+            sandbox.id = id.to_owned();
+        }
+        sandbox.device_name = self.device_names().get(id).cloned();
+        sandbox.harness = sandbox.harness || sandbox.device_name.is_some();
+        Ok(sandbox)
     }
 
     pub async fn delete_sandbox(&self, id: &str) -> Result<(), String> {
@@ -405,7 +650,7 @@ impl CodegraffAuth {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -505,7 +750,7 @@ mod tests {
 
     /// A fake gateway. Each request takes the first matching route not yet used; when every
     /// match is used, the last one repeats. Every request is recorded in full.
-    async fn fake(
+    pub(in super::super) async fn fake(
         routes: Vec<(&'static str, u16, &'static str)>,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -549,7 +794,7 @@ mod tests {
         (base, seen)
     }
 
-    fn signed_in(dir: &Path, gateway: String) -> Arc<CodegraffAuth> {
+    pub(in super::super) fn signed_in(dir: &Path, gateway: String) -> Arc<CodegraffAuth> {
         let key_file = dir.join("home").join(KEY_FILE);
         write_private(&key_file, br#"{"api_key":"cg_sk_test"}"#).unwrap();
         Arc::new(CodegraffAuth::new(dir, Some(key_file), gateway))
@@ -575,6 +820,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn temporary_create_allows_fallback_without_sizes_or_harness_setup() {
+        for (provider, reply) in [
+            (
+                "fleet",
+                r#"{"id":"temp_1","provider":"fleet","state":"started","tier":"ephemeral","cpu":2,"memoryGiB":4}"#,
+            ),
+            (
+                "daytona",
+                r#"{"id":"temp_1","provider":"daytona","state":"started","cpu":2,"memory":4,"disk":10,"labels":{"harness-purpose":"temporary"}}"#,
+            ),
+        ] {
+            let (gateway, seen) = fake(vec![("POST /v1/sandboxes ", 201, reply)]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let auth = signed_in(dir.path(), gateway);
+            enable();
+            let sandbox = auth.create_temporary_sandbox().await.unwrap();
+            assert_eq!(sandbox.provider, provider);
+            assert_eq!(sandbox.tier.as_deref(), Some("ephemeral"));
+            assert_eq!(sandbox.memory_gib, Some(4.0));
+            assert!(!sandbox.harness);
+            assert!(auth.device_names().is_empty());
+            assert_eq!(
+                recorded(&seen),
+                expand(&vector()["plans"]["createTemporary"], "", "")
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_lists_keep_the_provider_and_never_borrow_personal_prices() {
+        let list = parse_list(&json!([
+            {"id":"f","provider":"fleet","state":"started","tier":"ephemeral","cpu":2,"memoryGiB":4},
+            {"id":"d","provider":"daytona","state":"started","cpu":2,"memory":4,
+             "labels":{"harness-purpose":"temporary"}}
+        ]));
+        let sizes = parse_sizes(&serde_json::from_str(SIZES).unwrap());
+        for mut sandbox in list {
+            assert_eq!(sandbox.tier.as_deref(), Some("ephemeral"));
+            fill_price(&mut sandbox, &sizes);
+            assert_eq!(sandbox.price_per_hour_micro_usd, None);
+        }
+    }
+
+    #[tokio::test]
     async fn create_makes_a_fleet_sandbox_then_sets_harness_up_under_a_unique_name() {
         let (gateway, seen) = fake(vec![
             (
@@ -592,22 +881,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = signed_in(dir.path(), gateway);
         enable();
-        let made = auth.create_sandbox().await.unwrap();
+        let made = auth.create_sandbox(None).await.unwrap();
         assert_eq!(made.state, "running");
         assert_eq!(made.device_name.as_deref(), Some("Harness cloud ab12"));
         assert!(made.harness);
-        let sent = seen.lock().unwrap().clone();
+        let mut sent = seen.lock().unwrap().clone();
+        assert!(
+            sent.remove(0)
+                .starts_with("GET /v1/sandboxes/personal-sizes "),
+            "the sizes are read first"
+        );
         assert!(sent[0].contains("Bearer cg_sk_test"));
         for needle in [
             r#""provider":"fleet""#,
             r#""persistent":true"#,
             r#""autoStopMinutes":30"#,
+            r#""keepRunning":true"#,
         ] {
             assert!(sent[0].contains(needle), "{needle} in {}", sent[0]);
         }
         assert!(
             !sent[0].contains(r#""harness""#),
             "the create call must not ask for the old flag"
+        );
+        assert!(
+            !sent[0].contains(r#""cpu""#) && !sent[0].contains(r#""memory""#),
+            "a gateway without sizes gets today's body"
         );
         assert!(sent[1].contains(r#""deviceName":"Harness cloud ab12""#));
         assert!(
@@ -640,7 +939,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = signed_in(dir.path(), gateway);
         enable();
-        let error = auth.create_sandbox().await.unwrap_err();
+        let error = auth.create_sandbox(None).await.unwrap_err();
         assert!(
             error.contains("was created") && error.contains("Use Start"),
             "{error}"
@@ -712,6 +1011,92 @@ mod tests {
             ]
         );
         assert!(seen.lock().unwrap()[2].contains(r#""deviceName":"Harness cloud 0001""#));
+        let start = &recorded(&seen)[1];
+        assert_eq!(
+            start.1,
+            Some(json!({"leaseSeconds": 1800, "keepRunning": true})),
+            "a wake keeps the sandbox running like a fresh one"
+        );
+    }
+
+    #[test]
+    fn views_carry_keep_running_and_renew_errors_and_older_gateways_omit_them() {
+        let kept = parse_sandbox(&json!({
+            "id": "cnd_1", "state": "started", "keepRunning": true, "renewError": null
+        }));
+        assert_eq!(kept.keep_running, Some(true));
+        assert_eq!(kept.renew_error, None);
+        let failing = parse_sandbox(&json!({
+            "id": "cnd_1", "state": "started", "keepRunning": false,
+            "renewError": "insufficient_credit"
+        }));
+        assert_eq!(failing.keep_running, Some(false));
+        assert_eq!(failing.renew_error.as_deref(), Some("insufficient_credit"));
+        let old = parse_sandbox(&json!({"id": "cnd_1", "state": "started"}));
+        assert_eq!((old.keep_running, old.renew_error), (None, None));
+        let blank = parse_sandbox(&json!({"id": "cnd_1", "renewError": " "}));
+        assert_eq!(blank.renew_error, None);
+    }
+
+    #[tokio::test]
+    async fn keep_running_posts_the_flag_and_answers_the_sandbox() {
+        let (gateway, seen) = fake(vec![(
+            "POST /v1/sandboxes/cnd_1/keep-running ",
+            200,
+            r#"{"id":"cnd_1","provider":"fleet","state":"started","keepRunning":false,"renewError":null}"#,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        let mut names = BTreeMap::new();
+        names.insert("cnd_1".to_string(), "Harness cloud 0001".to_string());
+        auth.save_device_names(&names);
+        let sandbox = auth.set_sandbox_keep_running("cnd_1", false).await.unwrap();
+        assert_eq!(sandbox.keep_running, Some(false));
+        assert_eq!(sandbox.state, "running");
+        assert_eq!(sandbox.device_name.as_deref(), Some("Harness cloud 0001"));
+        assert_eq!(
+            recorded(&seen),
+            [(
+                "POST /v1/sandboxes/cnd_1/keep-running".to_string(),
+                Some(json!({"enabled": false}))
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_running_also_reads_a_wrapped_view() {
+        let (gateway, _) = fake(vec![(
+            "POST /v1/sandboxes/cnd_1/keep-running ",
+            200,
+            r#"{"sandbox":{"id":"cnd_1","state":"started","keepRunning":true}}"#,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        let sandbox = auth.set_sandbox_keep_running("cnd_1", true).await.unwrap();
+        assert_eq!(sandbox.keep_running, Some(true));
+        assert_eq!(sandbox.state, "running");
+    }
+
+    #[tokio::test]
+    async fn a_refused_keep_running_says_why() {
+        let (gateway, _) = fake(vec![(
+            "POST /v1/sandboxes/cnd_1/keep-running ",
+            402,
+            r#"{"error":{"type":"insufficient_credits","message":"x"}}"#,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        let error = auth
+            .set_sandbox_keep_running("cnd_1", true)
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("Your Codegraff credit is used up"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -810,6 +1195,222 @@ mod tests {
         );
     }
 
+    const SIZES: &str = r#"{"sizes":[
+        {"id":"standard","cpu":2,"memoryGiB":4,"diskGiB":40,"pricePerHourMicroUsd":100000,"default":true},
+        {"id":"large","cpu":4,"memoryGiB":8,"diskGiB":40,"pricePerHourMicroUsd":200000}
+    ]}"#;
+
+    #[test]
+    fn sizes_parse_tolerantly_and_always_have_a_default() {
+        let sizes = parse_sizes(&serde_json::from_str(SIZES).unwrap());
+        assert_eq!(sizes.len(), 2);
+        assert_eq!(
+            sizes[0],
+            PersonalSize {
+                id: "standard".into(),
+                cpu: 2,
+                memory_gib: 4,
+                disk_gib: 40,
+                price_per_hour_micro_usd: Some(100_000),
+                default: true,
+            }
+        );
+        assert!(!sizes[1].default);
+        let loose = parse_sizes(&json!({"sizes": [
+            {"id": "", "cpu": 2, "memoryGiB": 4},
+            {"id": "tiny", "cpu": "two", "memoryGiB": 1},
+            {"id": "big", "cpu": 8.0, "memoryGiB": 16, "pricePerHourMicroUsd": 400000.4},
+            {"id": "huge", "cpu": 16, "memoryGiB": 32}
+        ]}));
+        let ids: Vec<_> = loose.iter().map(|s| (s.id.as_str(), s.default)).collect();
+        assert_eq!(
+            ids,
+            [("big", true), ("huge", false)],
+            "first is the default"
+        );
+        assert_eq!(loose[0].price_per_hour_micro_usd, Some(400_000));
+        assert_eq!(loose[1].price_per_hour_micro_usd, None);
+        assert!(parse_sizes(&json!({"error": "nope"})).is_empty());
+        assert!(parse_sizes(&json!([])).is_empty());
+    }
+
+    #[test]
+    fn the_create_body_adds_the_chosen_machine_and_keeps_todays_fields() {
+        let sizes = parse_sizes(&serde_json::from_str(SIZES).unwrap());
+        assert_eq!(chosen_size(&sizes, None).unwrap().id, "standard");
+        assert_eq!(chosen_size(&sizes, Some("large")).unwrap().id, "large");
+        assert_eq!(
+            chosen_size(&sizes, Some("gone")).unwrap().id,
+            "standard",
+            "an unknown size falls back to the default"
+        );
+        assert_eq!(chosen_size(&[], Some("large")), None);
+        assert_eq!(
+            create_body(chosen_size(&sizes, Some("large"))),
+            json!({
+                "provider": "fleet", "persistent": true, "name": "Harness cloud",
+                "autoStopMinutes": 30, "keepRunning": true,
+                "cpu": 4, "memory": 8, "disk": 40
+            })
+        );
+        assert_eq!(
+            create_body(None),
+            json!({
+                "provider": "fleet", "persistent": true, "name": "Harness cloud",
+                "autoStopMinutes": 30, "keepRunning": true
+            })
+        );
+    }
+
+    #[test]
+    fn views_carry_the_machine_and_price_and_older_gateways_omit_them() {
+        let sized = parse_sandbox(&json!({
+            "id": "cnd_1", "state": "started", "cpu": 2, "memoryGiB": 4, "diskGiB": 40,
+            "pricePerHourMicroUsd": 100000
+        }));
+        assert_eq!(sized.cpu, Some(2.0));
+        assert_eq!(sized.memory_gib, Some(4.0));
+        assert_eq!(sized.disk_gib, Some(40.0));
+        assert_eq!(sized.price_per_hour_micro_usd, Some(100_000));
+        let old = parse_sandbox(&json!({"id": "cnd_1", "state": "started"}));
+        assert_eq!(
+            (
+                old.cpu,
+                old.memory_gib,
+                old.disk_gib,
+                old.price_per_hour_micro_usd
+            ),
+            (None, None, None, None)
+        );
+        let odd = parse_sandbox(&json!({"id": "cnd_1", "cpu": "2", "pricePerHourMicroUsd": -1}));
+        assert_eq!((odd.cpu, odd.price_per_hour_micro_usd), (None, None));
+
+        // A view without a price borrows its size's.
+        let sizes = parse_sizes(&serde_json::from_str(SIZES).unwrap());
+        let mut unpriced = parse_sandbox(&json!({"id": "x", "cpu": 4, "memoryGiB": 8}));
+        fill_price(&mut unpriced, &sizes);
+        assert_eq!(unpriced.price_per_hour_micro_usd, Some(200_000));
+        let mut odd_size = parse_sandbox(&json!({"id": "x", "cpu": 3, "memoryGiB": 8}));
+        fill_price(&mut odd_size, &sizes);
+        assert_eq!(odd_size.price_per_hour_micro_usd, None);
+    }
+
+    #[tokio::test]
+    async fn create_with_a_size_sends_its_machine() {
+        let (gateway, seen) = fake(vec![
+            ("GET /v1/sandboxes/personal-sizes ", 200, SIZES),
+            (
+                "POST /v1/sandboxes ",
+                201,
+                r#"{"id":"cnd_ab12cd","provider":"fleet","state":"started"}"#,
+            ),
+            ("POST /v1/sandboxes/cnd_ab12cd/harness ", 200, r#"{}"#),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        enable();
+        let made = auth.create_sandbox(Some("large")).await.unwrap();
+        assert_eq!(made.cpu, Some(4.0));
+        assert_eq!(made.memory_gib, Some(8.0));
+        assert_eq!(
+            made.price_per_hour_micro_usd,
+            Some(200_000),
+            "the size's price until the list says otherwise"
+        );
+        let calls = recorded(&seen);
+        assert_eq!(calls[0].0, "GET /v1/sandboxes/personal-sizes");
+        assert_eq!(calls[1].0, "POST /v1/sandboxes");
+        let body = calls[1].1.as_ref().unwrap();
+        assert_eq!(
+            (&body["cpu"], &body["memory"], &body["disk"]),
+            (&json!(4), &json!(8), &json!(40))
+        );
+        assert_eq!(body["keepRunning"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn create_without_a_size_takes_the_default() {
+        let (gateway, seen) = fake(vec![
+            ("GET /v1/sandboxes/personal-sizes ", 200, SIZES),
+            (
+                "POST /v1/sandboxes ",
+                201,
+                r#"{"id":"cnd_ab12cd","state":"started"}"#,
+            ),
+            ("POST /v1/sandboxes/cnd_ab12cd/harness ", 200, r#"{}"#),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        enable();
+        auth.create_sandbox(None).await.unwrap();
+        let body = recorded(&seen)[1].1.clone().unwrap();
+        assert_eq!((&body["cpu"], &body["memory"]), (&json!(2), &json!(4)));
+    }
+
+    #[tokio::test]
+    async fn create_falls_back_to_todays_body_when_sizes_404() {
+        let (gateway, seen) = fake(vec![
+            (
+                "GET /v1/sandboxes/personal-sizes ",
+                404,
+                r#"{"error":{"type":"not_found"}}"#,
+            ),
+            (
+                "POST /v1/sandboxes ",
+                201,
+                r#"{"id":"cnd_ab12cd","state":"started"}"#,
+            ),
+            ("POST /v1/sandboxes/cnd_ab12cd/harness ", 200, r#"{}"#),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        enable();
+        let made = auth.create_sandbox(Some("large")).await.unwrap();
+        assert_eq!(made.cpu, None);
+        assert_eq!(made.price_per_hour_micro_usd, None);
+        assert_eq!(
+            recorded(&seen)[1].1,
+            Some(create_body(None)),
+            "no machine fields for a gateway that doesn't know sizes"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_list_carries_the_sizes_and_prices_rows_or_has_none_on_old_gateways() {
+        let (gateway, _) = fake(vec![
+            (
+                "GET /v1/sandboxes ",
+                200,
+                r#"{"sandboxes":[{"id":"cnd_1","provider":"fleet","state":"started","cpu":2,"memoryGiB":4}]}"#,
+            ),
+            ("GET /v1/sandboxes/personal-sizes ", 200, SIZES),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        enable();
+        let list = auth.sandboxes().await.unwrap().unwrap();
+        assert_eq!(list.sizes.len(), 2);
+        assert_eq!(list.sandboxes[0].price_per_hour_micro_usd, Some(100_000));
+
+        let (gateway, _) = fake(vec![(
+            "GET /v1/sandboxes ",
+            200,
+            r#"{"sandboxes":[{"id":"cnd_1","provider":"fleet","state":"started"}]}"#,
+        )])
+        .await;
+        let auth = signed_in(dir.path(), gateway);
+        let list = auth.sandboxes().await.unwrap().unwrap();
+        assert!(list.enabled);
+        assert!(list.sizes.is_empty(), "personal-sizes 404s");
+        assert_eq!(list.sandboxes.len(), 1);
+        let wire = serde_json::to_value(&list).unwrap();
+        assert_eq!(wire["sizes"], json!([]));
+    }
+
     // ---- the shared contract: apps/parity/vectors/cloud-sandbox.json -------------------------
 
     fn vector() -> Value {
@@ -874,7 +1475,9 @@ mod tests {
     }
 
     /// `METHOD path` and the JSON body of every request the fake gateway saw.
-    fn recorded(seen: &Arc<Mutex<Vec<String>>>) -> Vec<(String, Option<Value>)> {
+    pub(in super::super) fn recorded(
+        seen: &Arc<Mutex<Vec<String>>>,
+    ) -> Vec<(String, Option<Value>)> {
         seen.lock()
             .unwrap()
             .iter()
@@ -939,11 +1542,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = signed_in(dir.path(), gateway);
         enable();
-        auth.create_sandbox().await.unwrap();
+        auth.create_sandbox(None).await.unwrap();
         assert_eq!(
             recorded(&seen),
             expand(&plans["create"], id, name),
             "create"
+        );
+
+        let (gateway, seen) = fake(vec![
+            (
+                "GET /v1/sandboxes/personal-sizes ",
+                200,
+                Box::leak(vector["personalSizes"].to_string().into_boxed_str()),
+            ),
+            (
+                "POST /v1/sandboxes ",
+                201,
+                r#"{"id":"cnd_ab12cd34ef56","provider":"fleet","state":"started"}"#,
+            ),
+            ("POST /v1/sandboxes/cnd_ab12cd34ef56/harness ", 200, r#"{}"#),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        auth.create_sandbox(Some("large")).await.unwrap();
+        assert_eq!(
+            recorded(&seen),
+            expand(&plans["createLarge"], id, name),
+            "create with a size"
         );
 
         for (label, state) in [
@@ -979,6 +1605,20 @@ mod tests {
         let mut expected = expand(&plans["stop"], id, name);
         expected.extend(expand(&plans["delete"], id, name));
         assert_eq!(recorded(&seen), expected, "stop then delete");
+
+        let (gateway, seen) = fake(vec![(
+            "POST /v1/sandboxes/cnd_ab12cd34ef56/keep-running ",
+            200,
+            r#"{"id":"cnd_ab12cd34ef56","state":"started"}"#,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        auth.set_sandbox_keep_running(id, true).await.unwrap();
+        auth.set_sandbox_keep_running(id, false).await.unwrap();
+        let mut expected = expand(&plans["keepRunningOn"], id, name);
+        expected.extend(expand(&plans["keepRunningOff"], id, name));
+        assert_eq!(recorded(&seen), expected, "keep running on then off");
 
         for never in plans["neverCalled"].as_array().unwrap() {
             let never = never.as_str().unwrap();

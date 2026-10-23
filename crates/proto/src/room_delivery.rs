@@ -76,6 +76,14 @@ pub fn format(origin: &RoomOrigin, body: &str) -> String {
     text
 }
 
+/// Whether `text` opens with a well-formed delivery tag (an agent-room post
+/// queued into this chat).
+pub fn is_delivery(text: &str) -> bool {
+    text.strip_prefix(OPEN)
+        .and_then(|rest| rest.split_once(CLOSE))
+        .is_some_and(|(tag, _)| serde_json::from_str::<RoomOrigin>(tag).is_ok())
+}
+
 /// `text` without a leading tag line, for showing a delivery to a person:
 /// the framed header already says where it came from.
 pub fn strip(text: &str) -> &str {

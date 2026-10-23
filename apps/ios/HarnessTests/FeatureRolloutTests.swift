@@ -16,9 +16,12 @@ final class FeatureRolloutTests: XCTestCase {
         XCTAssertEqual(FeatureRollout.seed(defaults), FeatureRollout.seed(defaults), "the seed is made once")
     }
 
-    func testInstallsSplitRoughlyInHalf() {
-        let on = (0..<10_000).filter { FeatureRollout.isOn(.stackedSplitDrag, seed: "seed-\($0)") }.count
-        XCTAssertTrue((4_700...5_300).contains(on), "\(on) of 10000 installs were on")
+    func testInstallsAreOnInTheFeaturesShare() {
+        for feature in RolloutFeature.allCases {
+            let on = (0..<10_000).filter { FeatureRollout.isOn(feature, seed: "seed-\($0)") }.count
+            let expected = feature.percentOn * 100
+            XCTAssertTrue((expected - 300...expected + 300).contains(on), "\(on) of 10000 installs were on")
+        }
     }
 
     func testALaunchArgumentPinsTheHalf() {

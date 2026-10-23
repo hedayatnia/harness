@@ -12,16 +12,10 @@ struct NowStrip: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Text("Now")
-                    .font(Theme.sans(13, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                Text(summary)
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textMuted)
-                    .monospacedDigit()
-            }
-            .padding(.horizontal, 16)
+            Text("Now")
+                .font(Theme.sans(13, weight: .semibold))
+                .foregroundStyle(Theme.text)
+                .padding(.horizontal, 16)
             ScrollView(.horizontal) {
                 LazyHStack(spacing: 10) {
                     ForEach(chats) { chat in
@@ -40,21 +34,12 @@ struct NowStrip: View {
         .accessibilityIdentifier("now-strip")
     }
 
-    private var summary: String {
-        let needsYou = chats.filter { HomeStatusFilter.attention.matches(model.indicator(for: $0)) }.count
-        let running = chats.filter { HomeStatusFilter.running.matches(model.indicator(for: $0)) }.count
-        var parts: [String] = []
-        if needsYou > 0 { parts.append("\(needsYou) need you") }
-        if running > 0 { parts.append("\(running) running") }
-        return parts.joined(separator: " · ")
-    }
-
     /// The sessions the strip shows: running or waiting, in call order.
     @MainActor
     static func active(in chats: [Chat], model: AppModel) -> [Chat] {
         Array(sortActive(chats).filter {
             let indicator = model.indicator(for: $0)
-            return HomeStatusFilter.attention.matches(indicator) || HomeStatusFilter.running.matches(indicator)
+            return indicator != .idle
         }.prefix(8))
     }
 }
@@ -65,7 +50,9 @@ private struct NowCard: View {
     let indicator: ChatIndicator
     let onTap: () -> Void
 
-    private var waiting: Bool { HomeStatusFilter.attention.matches(indicator) }
+    private var waiting: Bool {
+        indicator == .awaitingInput || indicator == .errored || indicator == .completed
+    }
 
     var body: some View {
         Button(action: onTap) {

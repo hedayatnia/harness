@@ -517,6 +517,7 @@ fn chat_row(session: &ExternalSession, chat_id: &str, msgs: &[Msg], device_id: &
         branch: None,
         checkout_id: None,
         source_context: None,
+        source_context_unavailable_at: None,
         // Imported conversations continue in graff, on graff's configured
         // provider: Claude/Codex sessions keep no native resume id (the
         // source agent is never re-launched); the first graff turn is seeded

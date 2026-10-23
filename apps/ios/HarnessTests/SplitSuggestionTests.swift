@@ -38,8 +38,15 @@ final class SplitSuggestionTests: XCTestCase {
     }
 
     func testNeverOffersWithNoRoomBecauseThereWouldBeNothingToTurnOn() {
-        XCTAssertFalse(juggling().shouldOffer(context(size: portrait), now: now))
-        XCTAssertFalse(juggling().shouldOffer(context(size: CGSize(width: 599, height: 900)), now: now))
+        XCTAssertFalse(juggling().shouldOffer(context(size: CGSize(width: 599, height: 599)), now: now))
+    }
+
+    /// Portrait used to have no offer at all, so a phone held upright never learned the split was there.
+    func testAWideWindowIsOfferedAutoAndAPortraitPhoneStacked() {
+        XCTAssertTrue(juggling().shouldOffer(context(size: portrait), now: now))
+        XCTAssertEqual(SplitSuggestion.offeredMode(for: landscape), .auto)
+        XCTAssertEqual(SplitSuggestion.offeredMode(for: portrait), .stacked)
+        XCTAssertNil(SplitSuggestion.offeredMode(for: CGSize(width: 599, height: 599)))
     }
 
     func testNeverOffersWhenTheSplitIsAlreadyOnOrOnAnotherKindOfDevice() {

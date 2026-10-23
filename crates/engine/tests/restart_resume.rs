@@ -979,3 +979,364 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
     }
     core.shutdown().await;
 }
+
+/// A persistent harness whose FIRST run plays `script` and then stays open
+/// (as a live agent process would) until the run is interrupted. Later runs
+/// complete at once, like `RecordingHarness`.
+struct ScriptedHarness {
+    requests: RequestLog,
+    session_id: String,
+    script: Mutex<Option<Vec<AgentEvent>>>,
+}
+
+#[async_trait]
+impl Harness for ScriptedHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Scripted"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn deterministic_turn_end(&self) -> bool {
+        true
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.requests
+            .lock()
+            .expect("request log")
+            .push(request.clone());
+        let started = AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: request.cwd.clone(),
+            session_id: self.session_id.clone(),
+            assistant_message_id: "a-1".into(),
+        };
+        let done = |status| AgentEvent::Done {
+            status,
+            result: None,
+            error: None,
+            session_id: None,
+        };
+        match self.script.lock().expect("script").take() {
+            Some(script) => {
+                let token = controls.interrupt.clone();
+                let events = std::iter::once(started).chain(script).map(Ok);
+                Ok(futures::stream::iter(events)
+                    .chain(futures::stream::once(async move {
+                        let _keep_steering_open = &controls;
+                        token.cancelled().await;
+                        Ok(done(DoneStatus::Interrupted))
+                    }))
+                    .boxed())
+            }
+            None => Ok(futures::stream::iter(vec![
+                Ok(started),
+                Ok(AgentEvent::TextDelta {
+                    text: format!("ack: {}", request.prompt),
+                }),
+                Ok(done(DoneStatus::Completed)),
+            ])
+            .boxed()),
+        }
+    }
+}
+
+fn scripted(requests: &RequestLog, script: Vec<AgentEvent>) -> ScriptedHarness {
+    ScriptedHarness {
+        requests: requests.clone(),
+        session_id: "hs-before-quit".into(),
+        script: Mutex::new(Some(script)),
+    }
+}
+
+fn assemble_with(dir: &std::path::Path, harness: impl Harness + 'static) -> EngineCore {
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(harness));
+    EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles")
+}
+
+fn session_status(core: &EngineCore) -> Option<harness_proto::SessionStatus> {
+    core.sessions.session_status(CHAT).map(|s| s.status)
+}
+
+/// Quit mid-something, relaunch over the same data dir, and return what the
+/// relaunched engine dispatched on its own.
+async fn quit_and_relaunch(
+    script: Vec<AgentEvent>,
+    quit_when: harness_proto::SessionStatus,
+) -> Vec<RunRequest> {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-quit").unwrap();
+    // The chat's project row (`pre_title`) is `/tmp`: the run happens there,
+    // as a real chat runs in its project folder, so resume (keyed by cwd)
+    // finds its session.
+    let cwd = "/tmp";
+
+    let first: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble_with(&dir, scripted(&first, script));
+    pre_title(&core);
+    queue_run(&core, "long task", cwd, "msg-user-1");
+    wait_for(
+        || session_status(&core) == Some(quit_when),
+        "the state to quit in",
+    )
+    .await;
+    core.shutdown().await;
+    drop(core);
+
+    let second: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble_with(
+        &dir,
+        ScriptedHarness {
+            requests: second.clone(),
+            session_id: "hs-after-quit".into(),
+            script: Mutex::new(None),
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let dispatched = second
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| !r.prompt.is_empty())
+        .cloned()
+        .collect();
+    core.shutdown().await;
+    dispatched
+}
+
+/// #482: quitting (or updating) while a turn runs used to settle it as
+/// interrupted for good. The next boot re-sends it on the same session.
+#[tokio::test]
+async fn a_quit_mid_turn_resumes_the_turn_on_the_next_boot() {
+    let dispatched = quit_and_relaunch(
+        vec![AgentEvent::TextDelta {
+            text: "working on it…".into(),
+        }],
+        harness_proto::SessionStatus::Working,
+    )
+    .await;
+    let resumed = dispatched
+        .iter()
+        .find(|r| r.prompt == "long task")
+        .unwrap_or_else(|| panic!("the cut-short turn was not resumed: {dispatched:?}"));
+    assert_eq!(resumed.resume.as_deref(), Some("hs-before-quit"));
+}
+
+/// #517: a parked session whose agent had background work running lost that
+/// work with the quit, silently. The next boot tells the agent, on the same
+/// session, so it can start it again.
+#[tokio::test]
+async fn a_quit_with_background_work_running_tells_the_agent_on_the_next_boot() {
+    let dispatched = quit_and_relaunch(
+        vec![
+            AgentEvent::BackgroundTask {
+                id: "watch-ci".into(),
+                running: true,
+            },
+            AgentEvent::TextDelta {
+                text: "Watching CI in the background.".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        ],
+        harness_proto::SessionStatus::Idle,
+    )
+    .await;
+    let note = dispatched
+        .iter()
+        .find(|r| r.prompt.contains("background work"))
+        .unwrap_or_else(|| panic!("the agent was not told about its stopped work: {dispatched:?}"));
+    assert!(note.prompt.contains("Harness restarted"), "{}", note.prompt);
+    assert_eq!(note.resume.as_deref(), Some("hs-before-quit"));
+}
+
+/// Nothing running, nothing to resume: a quit while parked idle stays quiet.
+#[tokio::test]
+async fn a_quit_while_idle_with_nothing_running_resumes_nothing() {
+    let dispatched = quit_and_relaunch(
+        vec![
+            AgentEvent::TextDelta {
+                text: "All done.".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        ],
+        harness_proto::SessionStatus::Idle,
+    )
+    .await;
+    assert!(
+        dispatched.is_empty(),
+        "resumed with nothing cut short: {dispatched:?}"
+    );
+}
+
+/// Reports each session's cwd with symlinks resolved, as Claude Code does: a
+/// session started in `/tmp/x` on macOS reports `/private/tmp/x`.
+struct ResolvesCwd<H>(H);
+
+#[async_trait]
+impl<H: Harness> Harness for ResolvesCwd<H> {
+    fn id(&self) -> HarnessId {
+        self.0.id()
+    }
+    fn display_name(&self) -> &str {
+        self.0.display_name()
+    }
+    fn supports_steering(&self) -> bool {
+        self.0.supports_steering()
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        self.0.steering_mode()
+    }
+    fn deterministic_turn_end(&self) -> bool {
+        self.0.deterministic_turn_end()
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        self.0.reasoning_levels()
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        self.0.models().await
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let resolved = std::fs::canonicalize(&request.cwd)
+            .expect("run cwd exists")
+            .to_string_lossy()
+            .to_string();
+        let stream = self.0.run(request, controls).await?;
+        Ok(stream
+            .map(move |event| match event {
+                Ok(AgentEvent::SessionStarted {
+                    harness,
+                    model,
+                    tools,
+                    session_id,
+                    assistant_message_id,
+                    ..
+                }) => Ok(AgentEvent::SessionStarted {
+                    harness,
+                    model,
+                    tools,
+                    cwd: resolved.clone(),
+                    session_id,
+                    assistant_message_id,
+                }),
+                other => other,
+            })
+            .boxed())
+    }
+}
+
+/// A chat whose folder is opened through a symlink: the agent records the
+/// session under the folder's real path, which differs from the chat's path as
+/// a string. Quitting mid-turn must still resume that session on the next
+/// boot, not start a new one without the conversation.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_quit_mid_turn_resumes_the_session_of_a_chat_opened_through_a_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-quit").unwrap();
+    let real = tmp.path().join("real-project");
+    let link = tmp.path().join("linked-project");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let link = link.to_string_lossy().to_string();
+
+    let first: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble_with(
+        &dir,
+        ResolvesCwd(scripted(
+            &first,
+            vec![AgentEvent::TextDelta {
+                text: "working on it…".into(),
+            }],
+        )),
+    );
+    core.workspace
+        .create_space("space-linked", &core.device_id, &link, None, false)
+        .expect("create space row");
+    core.workspace
+        .create_chat(CHAT, Some("space-linked"), None, None, None)
+        .expect("create chat row");
+    core.workspace
+        .rename_chat(CHAT, "Pre-titled")
+        .expect("rename chat");
+    queue_run(&core, "long task", &link, "msg-user-1");
+    wait_for(
+        || session_status(&core) == Some(harness_proto::SessionStatus::Working),
+        "the turn to start",
+    )
+    .await;
+    core.shutdown().await;
+    drop(core);
+
+    let second: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble_with(
+        &dir,
+        ResolvesCwd(ScriptedHarness {
+            requests: second.clone(),
+            session_id: "hs-after-quit".into(),
+            script: Mutex::new(None),
+        }),
+    );
+    wait_for(
+        || {
+            second
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.prompt == "long task")
+        },
+        "the cut-short turn to be resumed",
+    )
+    .await;
+    let resumed = second
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.prompt == "long task")
+        .cloned()
+        .unwrap();
+    assert_eq!(resumed.cwd, link);
+    assert_eq!(
+        resumed.resume.as_deref(),
+        Some("hs-before-quit"),
+        "the resumed turn must continue the session it was cut short in"
+    );
+    core.shutdown().await;
+}

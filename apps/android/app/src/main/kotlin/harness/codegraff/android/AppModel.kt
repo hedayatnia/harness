@@ -50,6 +50,10 @@ import harness.codegraff.android.model.HarnessCatalog
 import harness.codegraff.android.model.HarnessInfo
 import harness.codegraff.android.model.HostNotice
 import harness.codegraff.android.model.ModelInfo
+import harness.codegraff.android.model.DeviceCatalog
+import harness.codegraff.android.model.DeviceCatalogCache
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import harness.codegraff.android.model.RepoRef
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -655,31 +659,45 @@ class AppModel(
 
     // MARK: requests to a computer (the device relay). The demo serves its canned data.
 
-    private val harnessCache = HashMap<String, List<HarnessInfo>>()
-    private val modelCache = HashMap<String, List<ModelInfo>>()
+    private val harnessCache = DeviceCatalogCache<String, HarnessInfo>()
+    private val modelCache = DeviceCatalogCache<Pair<String, String>, ModelInfo>()
+    private val refCache = DeviceCatalogCache<Pair<String, String>, RepoRef>()
 
     /** A computer's folders; null when it cannot be reached. */
     suspend fun listFolders(deviceId: String, path: String?): FolderListing? {
         val live = live ?: return DemoDataset.listFolders(deviceId, path)
-        return runCatching { live.core.listFolders(deviceId, path) }.getOrNull()?.toModel()
+        val result = try {
+            live.core.listFolders(deviceId, path).toModel()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+        currentCoroutineContext().ensureActive()
+        return result
     }
 
-    /** The project's branches (git projects only); empty when the computer cannot be reached. */
-    suspend fun listRefs(space: Space): List<RepoRef> {
-        if (!space.gitDetected) return emptyList()
-        val live = live ?: return DemoDataset.listRefs(space.path)
-        return runCatching { live.core.listRefs(space.deviceId, space.path) }.getOrNull().orEmpty().map { it.toModel() }
+    fun cachedRefs(space: Space): DeviceCatalog<RepoRef> = if (live == null) {
+        DeviceCatalog(DemoDataset.listRefs(space.path), isLive = true)
+    } else refCache.cached(space.deviceId to space.path)
+
+    /** Empty success and an unreachable computer are different states, including for branch pickers. */
+    suspend fun listRefs(space: Space): DeviceCatalog<RepoRef> {
+        if (!space.gitDetected) return DeviceCatalog(emptyList(), isLive = true)
+        val live = live ?: return cachedRefs(space)
+        return refCache.load(space.deviceId to space.path) {
+            live.core.listRefs(space.deviceId, space.path).map { it.toModel() }
+        }
     }
 
-    /**
-     * The agents a computer offers: its live catalog, else the last one it sent this session, else the static pair
-     * (AppModel.listHarnesses).
-     */
-    suspend fun listHarnesses(deviceId: String): List<HarnessInfo> {
-        val live = live ?: return HarnessCatalog.harnesses
-        val fetched = runCatching { live.core.listHarnesses(deviceId) }.getOrNull()?.map { it.toModel() }
-        if (!fetched.isNullOrEmpty()) harnessCache[deviceId] = fetched
-        return harnessCache[deviceId] ?: HarnessCatalog.harnesses
+    fun cachedHarnesses(deviceId: String): DeviceCatalog<HarnessInfo> = if (live == null) {
+        DeviceCatalog(HarnessCatalog.harnesses, isLive = true)
+    } else harnessCache.cached(deviceId)
+
+    /** Only this computer's metadata is runnable; static catalogs are confined to the demo. */
+    suspend fun listHarnesses(deviceId: String): DeviceCatalog<HarnessInfo> {
+        val live = live ?: return cachedHarnesses(deviceId)
+        return harnessCache.load(deviceId) { live.core.listHarnesses(deviceId).map { it.toModel() } }
     }
 
     /** Where graff compacts on one computer (Settings > Graff compaction); null is graff's default. The demo keeps it. */
@@ -693,13 +711,14 @@ class AppModel(
         return live.core.setGraffCompactAt(deviceId, pct?.toUByte())?.toInt()
     }
 
-    /** The models an agent offers on the computer that runs the session, with the same fallbacks. */
-    suspend fun listModels(deviceId: String, harness: String): List<ModelInfo> {
-        val live = live ?: return HarnessCatalog.models(harness)
-        val key = "$deviceId|$harness"
-        val fetched = runCatching { live.core.listModels(deviceId, harness) }.getOrNull()?.map { it.toModel() }
-        if (!fetched.isNullOrEmpty()) modelCache[key] = fetched
-        return modelCache[key] ?: HarnessCatalog.models(harness)
+    fun cachedModels(deviceId: String, harness: String): DeviceCatalog<ModelInfo> = if (live == null) {
+        DeviceCatalog(HarnessCatalog.models(harness), isLive = true)
+    } else modelCache.cached(deviceId to harness)
+
+    /** The models offered by this agent on this execution device, never a different host's defaults. */
+    suspend fun listModels(deviceId: String, harness: String): DeviceCatalog<ModelInfo> {
+        val live = live ?: return cachedModels(deviceId, harness)
+        return modelCache.load(deviceId to harness) { live.core.listModels(deviceId, harness).map { it.toModel() } }
     }
 
     // MARK: live sync. Started last, so every flow the collectors write to already exists.

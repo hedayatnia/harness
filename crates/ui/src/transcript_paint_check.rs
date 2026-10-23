@@ -76,6 +76,9 @@ impl ViewportSample {
 #[derive(Debug, Default)]
 pub struct ViewportFlicker {
     samples: VecDeque<ViewportSample>,
+    /// The last two frames' rows as `(index, top, height)`, so a report can
+    /// say what moved between them, not only that something did.
+    frames: VecDeque<Vec<(usize, f32, f32)>>,
     last_report: Option<Instant>,
 }
 
@@ -97,6 +100,62 @@ impl ViewportFlicker {
                 .enumerate()
                 .all(|(ix, s)| *s == self.samples[ix % 2])
     }
+
+    /// Keep this frame's rows for [`Self::difference`]. Cheap: one entry per
+    /// painted row, two frames kept.
+    pub fn remember(&mut self, painted: &[(usize, Bounds<Pixels>)]) {
+        if self.frames.len() == 2 {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(
+            painted
+                .iter()
+                .map(|(ix, b)| (*ix, f32::from(b.top()), f32::from(b.size.height)))
+                .collect(),
+        );
+    }
+
+    /// What differs between the last two remembered frames: where each
+    /// started, then the rows whose height changed or that only one frame
+    /// painted (at most [`Self::DIFFERENCE_ROWS`] of them).
+    pub fn difference(&self) -> String {
+        let (Some(a), Some(b)) = (self.frames.front(), self.frames.back()) else {
+            return String::new();
+        };
+        let start = |frame: &[(usize, f32, f32)]| {
+            frame.first().map_or("nothing".to_string(), |(ix, top, _)| {
+                format!("row {ix} at {top:.2}")
+            })
+        };
+        let mut changes = Vec::new();
+        for (ix, _, height) in a {
+            match b.iter().find(|(other, ..)| other == ix) {
+                Some((_, _, other)) if (height - other).abs() > SEAM_TOLERANCE_PX => {
+                    changes.push(format!("row {ix} {height:.2}->{other:.2}px"));
+                }
+                None => changes.push(format!("row {ix} only in A")),
+                _ => {}
+            }
+        }
+        for (ix, ..) in b {
+            if !a.iter().any(|(other, ..)| other == ix) {
+                changes.push(format!("row {ix} only in B"));
+            }
+        }
+        changes.truncate(Self::DIFFERENCE_ROWS);
+        format!(
+            "A starts {}, B starts {}; {}",
+            start(a),
+            start(b),
+            if changes.is_empty() {
+                "same rows and heights".to_string()
+            } else {
+                changes.join(", ")
+            }
+        )
+    }
+
+    const DIFFERENCE_ROWS: usize = 8;
 
     /// Whether a warning may be logged now (rate limit, one per transcript).
     pub fn should_report(&mut self, now: Instant) -> bool {
@@ -121,6 +180,23 @@ mod tests {
             ix,
             Bounds::new(point(px(0.0), px(top)), size(px(100.0), px(height))),
         )
+    }
+
+    #[test]
+    fn difference_names_what_moved_between_frames() {
+        let mut flicker = ViewportFlicker::default();
+        flicker.remember(&[row(4, -9.3, 34.0), row(5, 24.7, 66.0), row(6, 90.7, 20.0)]);
+        flicker.remember(&[row(4, -10.3, 34.0), row(5, 23.7, 67.0), row(6, 90.7, 20.0)]);
+        assert_eq!(
+            flicker.difference(),
+            "A starts row 4 at -9.30, B starts row 4 at -10.30; row 5 66.00->67.00px"
+        );
+        flicker.remember(&[row(3, -40.0, 40.0), row(4, 0.0, 34.0)]);
+        assert_eq!(
+            flicker.difference(),
+            "A starts row 4 at -10.30, B starts row 3 at -40.00; \
+             row 5 only in A, row 6 only in A, row 3 only in B"
+        );
     }
 
     #[test]

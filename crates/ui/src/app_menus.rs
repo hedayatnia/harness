@@ -182,13 +182,10 @@ fn close_tab_in_with_archive(
             // The right pane's active surface (the tab the user just opened),
             // then the focused split pane or chat tab, Ghostty-style, then
             // the chat itself, back to a new session.
-            let _ = shell.close_active_surface(window, cx)
-                || if archive {
-                    shell.close_focused_chat_pane(window, cx)
-                } else {
-                    shell.close_focused_chat_pane_without_archiving(window, cx)
-                }
-                || shell.close_chat_to_new_session(cx);
+            if shell.close_active_surface(window, cx) {
+                return;
+            }
+            shell.close_chat_view_with_archive(archive, window, cx);
         })
         .ok();
 }
@@ -325,6 +322,7 @@ pub fn app_menus() -> Vec<Menu> {
             MenuItem::action("Zoom", Zoom),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Reopen Closed Tab", shell::ReopenClosedChatTab),
             MenuItem::action("Close Window", CloseWindow),
         ]));
     }

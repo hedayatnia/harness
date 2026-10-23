@@ -30,9 +30,11 @@ final class PerformanceUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Performance"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["nav.open"].waitForExistence(timeout: 5), "opening a session was not measured")
         XCTAssertTrue(app.staticTexts["startup.firstFrame"].exists, "startup was not measured")
-        // The list is longer than the screen: the report buttons sit at the bottom.
-        app.swipeUp()
-        XCTAssertTrue(app.buttons["Copy report"].waitForExistence(timeout: 5))
+        // The list is several screens long (resources, file writes, a cadence section per activity): the
+        // report buttons sit at the bottom, and the lazy list only builds them once they scroll near.
+        let copy = app.buttons["Copy report"]
+        for _ in 0..<10 where !copy.exists { app.swipeUp() }
+        XCTAssertTrue(copy.waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["Reset"].exists)
     }
 }

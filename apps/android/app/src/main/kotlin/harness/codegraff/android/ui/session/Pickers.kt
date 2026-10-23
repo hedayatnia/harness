@@ -55,32 +55,60 @@ fun ModelPickerSheet(
     lockedHarness: Boolean,
     harnesses: List<HarnessInfo>,
     catalogs: Map<String, List<ModelInfo>>,
+    loading: Boolean = false,
+    confirmedHarnesses: Boolean = false,
+    confirmedCatalogs: Set<String> = emptySet(),
+    onRetry: () -> Unit = {},
     onPick: (harness: String, model: ModelInfo, reasoning: String?) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val p = Theme.palette
-    fun models(h: String) = catalogs[h] ?: HarnessCatalog.models(h)
-    val sections = if (lockedHarness) listOf(HarnessInfo(harness, HarnessCatalog.label(harness)))
-    else harnesses.ifEmpty { HarnessCatalog.harnesses }
+    fun models(h: String) = if (confirmedHarnesses && harnesses.none { it.id == h }) emptyList() else catalogs[h].orEmpty()
+    val sections = if (lockedHarness) listOf(HarnessInfo(harness, HarnessCatalog.label(harness))) else harnesses
     // Accordion state: which harness sections show their models. Seeded with the current harness.
-    var open by rememberSaveable { mutableStateOf(setOf(harness)) }
+    var open by rememberSaveable(harness) { mutableStateOf(setOf(harness)) }
     HarnessSheet("Select model", onDismiss) {
         SheetBody {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 SheetLabel("Model")
+                if (modelId.isNotBlank() && HarnessCatalog.resolveExisting(modelId, models(harness)) == null) {
+                    Text("Selected: $modelId", style = sans(13f), color = p.textMuted, modifier = Modifier.padding(vertical = 8.dp))
+                }
+                if (sections.isEmpty()) {
+                    Text(
+                        when {
+                            loading -> "Loading agents from the device…"
+                            confirmedHarnesses -> "No agents available on this device."
+                            else -> "Agent metadata is unavailable. Connect to the device and retry."
+                        },
+                        style = sans(13f), color = p.textFaint, modifier = Modifier.padding(vertical = 16.dp),
+                    )
+                }
                 sections.forEach { h ->
                     if (sections.size > 1) SectionHeader(h, open = h.id in open, count = models(h.id).size) {
                         open = if (h.id in open) open - h.id else open + h.id
                     }
                     if (sections.size == 1 || h.id in open) {
+                        if (models(h.id).isEmpty()) {
+                            Text(
+                                when {
+                                    confirmedHarnesses && harnesses.none { it.id == h.id } -> "${h.label} is not available on this device."
+                                    h.id in confirmedCatalogs -> "No models available for ${h.label}."
+                                    loading -> "Loading models from the device…"
+                                    else -> "Model metadata is unavailable. Connect to the device and retry."
+                                },
+                                style = sans(13f), color = p.textFaint, modifier = Modifier.padding(vertical = 16.dp),
+                            )
+                        }
                         models(h.id).forEach { m ->
-                            PickRow(m.label, selected = harness == h.id && m.id == modelId, subtitle = m.description) {
+                            PickRow(m.label, selected = harness == h.id && m.id == HarnessCatalog.resolveExisting(modelId, models(h.id))?.id, subtitle = m.description) {
                                 val keep = reasoning?.takeIf { it in m.reasoningLevels }
                                 onPick(h.id, m, keep ?: HarnessCatalog.defaultReasoning(m))
                             }
                         }
                     }
                 }
+                if (!loading) PickRow("Refresh from device", selected = false) { onRetry() }
             }
         }
     }
@@ -142,17 +170,25 @@ fun ModelOptionPickerSheet(option: ModelOptionInfo, choiceId: String, onPick: (S
 
 /** Base-ref selector (the desktop footer's branch popover): branch rows with current-checkout / worktree markers. */
 @Composable
-fun RefPickerSheet(refs: List<RepoRef>, selected: String?, onPick: (RepoRef) -> Unit, onDismiss: () -> Unit) {
+fun RefPickerSheet(
+    refs: List<RepoRef>, selected: String?, loading: Boolean, confirmed: Boolean,
+    onRetry: () -> Unit, onPick: (RepoRef) -> Unit, onDismiss: () -> Unit,
+) {
     HarnessSheet("Select ref", onDismiss) {
         SheetBody {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 SheetLabel("Ref")
                 if (refs.isEmpty()) {
                     Text(
-                        "Loading refs from the device…", style = sans(13f), color = Theme.palette.textFaint,
+                        when {
+                            loading -> "Loading refs from the device…"
+                            confirmed -> "No refs available in this project."
+                            else -> "Refs unavailable. Connect to the device and retry."
+                        }, style = sans(13f), color = Theme.palette.textFaint,
                         modifier = Modifier.fillMaxWidth().padding(vertical = 28.dp),
                     )
                 }
+                if (!loading) PickRow("Refresh from device", selected = false) { onRetry() }
                 refs.forEach { ref ->
                     PickRow(
                         ref.name, selected = ref.name == selected,

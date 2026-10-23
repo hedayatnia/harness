@@ -21,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 /// Shortened reaper window (production: 30 minutes).
 const IDLE: Duration = Duration::from_millis(800);
+/// Shortened background-task hold cap (production: 3 hours).
+const HOLD_MAX: Duration = Duration::from_secs(4);
 const SPAWN: &str = "spawn-bg";
 
 /// A steerable harness that parks after each Done and streams whatever the
@@ -90,7 +92,13 @@ impl Run {
     async fn start(chat: &'static str) -> Self {
         // SAFETY: every test in this binary sets the same value before any
         // session starts; nothing reads it concurrently with a different one.
-        unsafe { std::env::set_var("HARNESS_SESSION_IDLE_MS", IDLE.as_millis().to_string()) };
+        unsafe {
+            std::env::set_var("HARNESS_SESSION_IDLE_MS", IDLE.as_millis().to_string());
+            std::env::set_var(
+                "HARNESS_BACKGROUND_HOLD_MAX_MS",
+                HOLD_MAX.as_millis().to_string(),
+            );
+        }
         let dir = tempfile::tempdir().unwrap();
         let (feed, rx) = mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::Mutex::new(None));
@@ -275,6 +283,66 @@ async fn subagent_that_ended_with_its_spawn_does_not_hold_off_the_reaper() {
     assert!(
         run.wait_reaped(IDLE * 4).await,
         "a finished foreground subagent kept the parked session alive"
+    );
+    run.core.shutdown().await;
+}
+
+fn background(id: &str, running: bool) -> AgentEvent {
+    AgentEvent::BackgroundTask {
+        id: id.into(),
+        running,
+    }
+}
+
+/// #517: a background shell command (or monitor) keeps no subagent feed, so
+/// the reaper never saw it and stopped the agent under it, killing the work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parked_session_is_not_reaped_while_a_background_task_runs() {
+    let run = Run::start("bg-task-parent").await;
+    run.send(started(&run));
+    run.send(background("watch-ci", true));
+    run.send(text("Watching CI in the background."));
+    run.send(done());
+
+    let parked = Instant::now();
+    while parked.elapsed() < IDLE * 3 {
+        tokio::time::sleep(IDLE / 4).await;
+        assert!(
+            !run.reaped(),
+            "reaped {:?} after the park with a background task still running",
+            parked.elapsed()
+        );
+    }
+
+    // The task settles: the window restarts from there, then the session is
+    // reaped as usual.
+    run.send(background("watch-ci", false));
+    assert!(
+        !run.wait_reaped(IDLE / 2).await,
+        "reaped as soon as the task settled; the window must restart from it"
+    );
+    assert!(
+        run.wait_reaped(IDLE * 3).await,
+        "a parked session with every background task settled was never reaped"
+    );
+    run.core.shutdown().await;
+}
+
+/// A task whose settle never arrives stops holding the session after the
+/// hold cap (`HARNESS_BACKGROUND_HOLD_MAX_MS`), checked on the 15 s heartbeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_background_task_that_never_settles_stops_holding_after_the_cap() {
+    let run = Run::start("bg-task-lost").await;
+    run.send(started(&run));
+    run.send(background("lost", true));
+    run.send(done());
+    assert!(
+        !run.wait_reaped(IDLE * 3).await,
+        "reaped inside the hold cap with the task still open"
+    );
+    assert!(
+        run.wait_reaped(Duration::from_secs(25)).await,
+        "a task that never settled held the session past the cap"
     );
     run.core.shutdown().await;
 }

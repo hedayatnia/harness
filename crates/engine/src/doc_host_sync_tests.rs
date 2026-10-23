@@ -236,6 +236,53 @@ async fn new_wake_during_stalled_backfill_does_not_block_other_admissions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn woken_client_keeps_listening_for_the_row_its_wake_announced() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Checkpoint).await;
+    relay.release.send_replace(true);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    for id in ["early", "expired"] {
+        store.initialize_chat_outbox(id, &[]).unwrap();
+        store.schedule_sync_job(id, "wake").unwrap();
+    }
+    let host = host(store.clone(), &relay);
+    // The wake's read completes before the sender's row has landed.
+    until(|| store.sync_work_counts().unwrap() == (0, 0)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let woken = |id: &str| lock(&host.inner.handles).get(id).cloned().unwrap();
+    for id in ["early", "expired"] {
+        assert!(
+            lock(&woken(id).chat2)
+                .as_ref()
+                .is_some_and(|c| c.caught_up())
+        );
+        assert!(
+            woken(id).sync_started.load(Ordering::Acquire),
+            "{id} went idle on catch-up"
+        );
+    }
+    woken("expired")
+        .sync_linger_until
+        .store(now_ms() - 1, Ordering::Release);
+    until(|| !woken("expired").sync_started.load(Ordering::Acquire)).await;
+    assert!(woken("early").sync_started.load(Ordering::Acquire));
+    // Another chat taking a free slot leaves the linger alone (#412)...
+    let viewer = host.open("viewer").unwrap();
+    until(|| viewer.sync_started.load(Ordering::Acquire)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(woken("early").sync_started.load(Ordering::Acquire));
+    // ...while chats that need its slot end it.
+    let crowd: Vec<_> = (0..ACTIVE_SYNC_CAP)
+        .map(|n| host.open(&format!("crowd-{n:02}")).unwrap())
+        .collect();
+    until(|| !woken("early").sync_started.load(Ordering::Acquire)).await;
+    assert_eq!(lock(&relay.joins_by_chat).get("early"), Some(&1));
+    drop(crowd);
+    host.shutdown_workers().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_connection_closes_while_caller_keeps_document() {
     let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Checkpoint).await;
@@ -893,6 +940,10 @@ async fn interactive_handoff_prefers_an_unprotected_slot_over_a_view() {
         host.enqueue_wakeup(&format!("phase-{n}")).unwrap();
     }
     until(|| relay.joins.load(Ordering::SeqCst) == 3).await;
+    // No row follows these wakes: don't wait out their linger.
+    for h in lock(&host.inner.handles).values() {
+        h.sync_linger_until.store(0, Ordering::Release);
+    }
     until(|| host.sync_resources()["retainedBy"]["connections"] == 0).await;
     let mut handles = Vec::new();
     let mut views = Vec::new();
@@ -1193,5 +1244,257 @@ async fn cold_jobs_get_a_real_timed_turn_without_any_writer_ending() {
     .expect("cold work starved behind active writers");
     assert_eq!(lock(&relay.joins_by_chat).len(), ACTIVE_SYNC_CAP + 8);
     assert_eq!(writers.len(), ACTIVE_SYNC_CAP);
+    host.shutdown_workers().await;
+}
+
+/// A chat2 room that keeps its rows: backfill serves them, pushes append and
+/// broadcast, and the test can land another device's row at a chosen moment.
+struct Room {
+    url: String,
+    rows: Arc<Mutex<HashMap<String, Vec<Vec<u8>>>>>,
+    live: Arc<Mutex<HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Room {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Room {
+    /// Another device's batch reaches the room: append it and relay it to
+    /// every socket currently joined to that chat.
+    fn land(&self, chat: &str, bytes: Vec<u8>) {
+        let seq = {
+            let mut rows = lock(&self.rows);
+            let log = rows.entry(chat.to_owned()).or_default();
+            log.push(bytes.clone());
+            log.len() as u64
+        };
+        let frame = encode(
+            frame_type::ROW,
+            &serde_json::json!({"seq": seq, "device": "phone", "batchId": format!("phone-{seq}")}),
+            &bytes,
+        );
+        for peer in lock(&self.live).entry(chat.to_owned()).or_default().iter() {
+            let _ = peer.send(frame.clone());
+        }
+    }
+}
+
+async fn room() -> Room {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let rows = Arc::new(Mutex::new(HashMap::<String, Vec<Vec<u8>>>::new()));
+    let live = Arc::new(Mutex::new(HashMap::<
+        String,
+        Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    >::new()));
+    let (served_rows, served_live) = (rows.clone(), live.clone());
+    let task = tokio::spawn(async move {
+        let mut peers = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut stream, _) = accepted.unwrap();
+                    let rows = served_rows.clone();
+                    let live = served_live.clone();
+                    peers.spawn(async move {
+                        let mut buffer = [0; 8192];
+                        let (headers, length) = loop {
+                            let n = stream.peek(&mut buffer).await.unwrap_or(0);
+                            if n == 0 { return }
+                            if let Some(end) = buffer[..n].windows(4).position(|v| v == b"\r\n\r\n") {
+                                break (String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase(), end + 4);
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        };
+                        if !headers.contains("upgrade: websocket") {
+                            // Socket-only room: the HTTPS pull cannot stand in for it.
+                            stream.read_exact(&mut buffer[..length]).await.unwrap();
+                            let _ = stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return };
+                        let chat = headers.lines().next().unwrap().split('/').nth(2).unwrap().to_owned();
+                        let (tx, mut relayed) = tokio::sync::mpsc::unbounded_channel();
+                        lock(&live).entry(chat.clone()).or_default().push(tx);
+                        loop {
+                            let message = tokio::select! {
+                                message = ws.next() => match message {
+                                    Some(Ok(message)) => message,
+                                    _ => break,
+                                },
+                                Some(frame) = relayed.recv() => {
+                                    if ws.send(frame.into()).await.is_err() { break }
+                                    continue;
+                                }
+                            };
+                            if let tokio_tungstenite::tungstenite::Message::Text(text) = &message {
+                                if text == "ping" { let _ = ws.send("pong".into()).await; }
+                                continue;
+                            }
+                            let Some(frame) = decode(&message.into_data()) else { continue };
+                            let head = lock(&rows).get(&chat).map_or(0, |log| log.len() as u64);
+                            let replies = match frame.kind {
+                                frame_type::HELLO => vec![encode(frame_type::STATE, &serde_json::json!({
+                                    "headSeq": head, "seqFloor": 0, "checkpointSeq": 0,
+                                    "checkpointSize": 0, "rowCount": head, "rowBytes": 0,
+                                }), &[])],
+                                frame_type::ROWS_REQ => {
+                                    let after = frame.header["after"].as_u64().unwrap_or(0);
+                                    let log = lock(&rows).get(&chat).cloned().unwrap_or_default();
+                                    let mut out: Vec<_> = log.iter().enumerate().skip(after as usize).map(|(i, bytes)| encode(
+                                        frame_type::ROW,
+                                        &serde_json::json!({"seq": i as u64 + 1, "device": "?", "batchId": format!("row-{}", i + 1)}),
+                                        bytes,
+                                    )).collect();
+                                    out.push(encode(frame_type::ROWS_DONE, &serde_json::json!({"headSeq": log.len()}), &[]));
+                                    out
+                                }
+                                frame_type::PUSH => {
+                                    let seq = {
+                                        let mut rows = lock(&rows);
+                                        let log = rows.entry(chat.clone()).or_default();
+                                        log.push(frame.payload.clone());
+                                        log.len() as u64
+                                    };
+                                    vec![encode(frame_type::ACK, &serde_json::json!({"batchId": frame.header["batchId"], "seq": seq, "dup": false}), &[])]
+                                }
+                                frame_type::PROBE => vec![encode(frame_type::PROBE_OK, &serde_json::json!({"headSeq": head}), &[])],
+                                _ => continue,
+                            };
+                            for reply in replies {
+                                if ws.send(reply.into()).await.is_err() { return }
+                            }
+                        }
+                    });
+                }
+                _ = peers.join_next(), if !peers.is_empty() => {}
+            }
+        }
+    });
+    Room {
+        url,
+        rows,
+        live,
+        task,
+    }
+}
+
+fn phone_run(id: &str) -> SessionCommandEntry {
+    SessionCommandEntry {
+        id: id.into(),
+        payload: SessionCommandPayload::Run {
+            request: harness_proto::RunRequest {
+                prompt: "sent from the phone".into(),
+                harness: None,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: String::new(),
+                sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
+                attachments: Vec::new(),
+                resume: None,
+                worktree: None,
+            },
+            message_id: format!("m-{id}"),
+        },
+        issued_by: "phone".into(),
+        issued_at: now_ms(),
+        based_on: None,
+        expires_at: None,
+        status: SessionCommandStatus::Pending,
+        resolution: None,
+    }
+}
+
+/// #412: the phone's nudge reaches the host before the phone's command row
+/// reaches the room. The host wakes a chat it has never opened, catches up
+/// on a room with nothing to run yet, and must still be listening when the
+/// row lands, even while the user opens other chats on the desktop and slots
+/// are free. Otherwise the command waits until someone opens the chat there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn woken_chat_adopts_its_late_command_while_other_chats_take_free_slots() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let room = room().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    store.schedule_sync_job("from-phone", "wake").unwrap();
+    let host = DocHost::new(
+        store.clone(),
+        DocHostConfig {
+            device_id: "host".into(),
+            default_harness: HarnessId::Mock,
+            edge: Some(EdgeConfig::with_static_token(&room.url, "test")),
+        },
+    );
+    host.set_sessions(crate::sessions::SessionsEngine::new(
+        "host".into(),
+        Arc::new(crate::run_journal::RunJournal::open(dir.path().join("journals")).unwrap()),
+        Arc::new(crate::registry::HarnessRegistry::new()),
+    ));
+    let woken = || lock(&host.inner.handles).get("from-phone").cloned();
+    // The wake's read finds an empty room and retires the receipt.
+    until(|| {
+        woken().is_some_and(|h| lock(&h.chat2).as_ref().is_some_and(|c| c.caught_up()))
+            && store
+                .sync_job_version("from-phone", "wake")
+                .unwrap()
+                .is_none()
+    })
+    .await;
+    // Desktop navigation elsewhere, with nearly every slot still free.
+    let mut viewers = Vec::new();
+    for n in 0..3 {
+        let viewer = host.open(&format!("viewer-{n}")).unwrap();
+        viewers.push(viewer.watch_messages());
+        until(|| lock(&viewer.chat2).is_some()).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Only now does the phone's command row land.
+    let phone = SessionDoc::init("from-phone").unwrap();
+    phone.queue_command(&phone_run("late-command")).unwrap();
+    room.land(
+        "from-phone",
+        phone.doc().export(loro::ExportMode::all_updates()).unwrap(),
+    );
+    let adopted = tokio::time::timeout(Duration::from_secs(5), async {
+        while !store.is_processed("late-command").unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        adopted.is_ok(),
+        "the command row reached the room but the host had stopped listening: \
+         it waits for someone to open the chat on the desktop"
+    );
+    assert_eq!(woken().unwrap().last_focus.load(Ordering::Acquire), 0);
+    drop(viewers);
+    host.shutdown_workers().await;
+}
+
+/// A chat born on this host starts at cursor 0, a contiguous prefix by
+/// definition. Stamped unverified, every later admission of the same handle
+/// ran the legacy cursor repair and replayed the whole room again; that
+/// repair is what #412's log showed when the visit re-admitted the chat.
+#[tokio::test]
+async fn a_chat_born_on_the_host_starts_with_a_verified_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let host = DocHost::new(
+        store.clone(),
+        DocHostConfig {
+            device_id: "host".into(),
+            default_harness: HarnessId::Mock,
+            edge: None,
+        },
+    );
+    let born = host.open_local("born-here").unwrap();
+    assert!(store.snapshot_cursor_verified("born-here").unwrap());
+    assert!(born.persistence.as_ref().unwrap().initial_cursor_verified);
     host.shutdown_workers().await;
 }

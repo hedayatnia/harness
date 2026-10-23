@@ -198,6 +198,14 @@ pub fn file_reference(text: &str) -> Option<FileReference> {
 struct Replacement {
     source: Range<usize>,
     shown: Range<usize>,
+    kind: ReplacementKind,
+}
+
+enum ReplacementKind {
+    /// A content reference directive, handed on as its original text.
+    Reference,
+    /// A formula (`super::math`), handed on as a math event.
+    Math { latex: String, display: bool },
 }
 
 /// Opaque text tokens protect payloads from CommonMark punctuation. Unlike
@@ -262,10 +270,20 @@ impl Rewritten<'_> {
                     start..replacement.shown.start,
                 );
             }
-            emit(
-                Event::InlineHtml(self.source[replacement.source.clone()].to_owned().into()),
-                replacement.shown.clone(),
-            );
+            let event = match &replacement.kind {
+                ReplacementKind::Reference => {
+                    Event::InlineHtml(self.source[replacement.source.clone()].to_owned().into())
+                }
+                ReplacementKind::Math {
+                    latex,
+                    display: false,
+                } => Event::InlineMath(latex.clone().into()),
+                ReplacementKind::Math {
+                    latex,
+                    display: true,
+                } => Event::DisplayMath(latex.clone().into()),
+            };
+            emit(event, replacement.shown.clone());
             remaining = &remaining[at + self.placeholder.len()..];
             start = replacement.shown.end;
         }
@@ -276,32 +294,42 @@ impl Rewritten<'_> {
 }
 
 pub(crate) fn rewrite(source: &str) -> Option<Rewritten<'_>> {
-    if !source.contains(CITATION) && !source.contains(VISUALIZE) {
+    let references = source.contains(CITATION) || source.contains(VISUALIZE);
+    let math = source.contains("\\(") || source.contains("\\[") || source.contains('$');
+    if !references && !math {
         return None;
     }
     // Ask the same CommonMark parser which regions are literal. In particular,
     // an unclosed code fence must stay literal throughout streaming.
-    let protected: Vec<_> = Parser::new_ext(source, super::parser::options())
-        .into_offset_iter()
-        .filter_map(|(event, range)| match event {
-            Event::Code(_)
-            | Event::Html(_)
-            | Event::InlineHtml(_)
-            | Event::Start(
-                Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Link { .. } | Tag::Image { .. },
-            ) => Some(range),
-            _ => None,
-        })
+    let parser = Parser::new_ext(source, super::parser::options());
+    // Definitions emit no events. Protect their destinations and titles too:
+    // placeholders inserted there cannot be expanded from a Text event later.
+    let mut protected: Vec<_> = parser
+        .reference_definitions()
+        .iter()
+        .map(|(_, definition)| definition.span.clone())
         .collect();
+    protected.extend(
+        parser
+            .into_offset_iter()
+            .filter_map(|(event, range)| match event {
+                Event::Code(_)
+                | Event::Html(_)
+                | Event::InlineHtml(_)
+                | Event::Start(
+                    Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Link { .. } | Tag::Image { .. },
+                ) => Some(range),
+                _ => None,
+            }),
+    );
     let mut text = String::new();
     let mut placeholder = PLACEHOLDER.to_owned();
     while source.contains(&placeholder) {
         placeholder.push('\u{e001}');
     }
-    let mut replacements = Vec::new();
-    let mut copied = 0;
+    let mut spans = Vec::new();
     let mut at = 0;
-    while let Some(relative) = source[at..].find(['\u{e200}', ':']) {
+    while let Some(relative) = source[at..].find(['\u{e200}', ':']).filter(|_| references) {
         let start = at + relative;
         let visualize = source[start..].starts_with(VISUALIZE);
         let prefix = if visualize { VISUALIZE } else { CITATION };
@@ -362,18 +390,44 @@ pub(crate) fn rewrite(source: &str) -> Option<Rewritten<'_>> {
         {
             continue;
         }
-        text.push_str(&source[copied..start]);
+        spans.push((start..end, ReplacementKind::Reference));
+        at = end;
+    }
+    if math {
+        // A dollar in a directive payload must not consume an adjacent math
+        // opener before overlap resolution drops the directive's inner span.
+        protected.extend(spans.iter().map(|(range, _)| range.clone()));
+        for span in super::math::spans(source, &protected) {
+            spans.push((
+                span.range,
+                ReplacementKind::Math {
+                    latex: span.latex,
+                    display: span.display,
+                },
+            ));
+        }
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    // In source order; a span inside an earlier one (a directive quoted in a
+    // formula, say) stays part of it.
+    spans.sort_by_key(|(range, _)| range.start);
+    let mut replacements = Vec::new();
+    let mut copied = 0;
+    for (range, kind) in spans {
+        if range.start < copied {
+            continue;
+        }
+        text.push_str(&source[copied..range.start]);
         let shown_start = text.len();
         text.push_str(&placeholder);
         replacements.push(Replacement {
-            source: start..end,
+            source: range.clone(),
             shown: shown_start..text.len(),
+            kind,
         });
-        copied = end;
-        at = end;
-    }
-    if replacements.is_empty() {
-        return None;
+        copied = range.end;
     }
     text.push_str(&source[copied..]);
     Some(Rewritten {

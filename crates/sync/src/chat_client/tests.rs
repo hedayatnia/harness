@@ -56,9 +56,16 @@ struct RecordingSink {
     /// Global apply order across rows and checkpoints — the overlap test
     /// pins "checkpoint imports before any row that buffered during it".
     ops: Mutex<Vec<String>>,
+    /// Durable outbox handed to the client at construction (a relaunch
+    /// with unacked batches).
+    backlog: Mutex<Vec<(String, Vec<u8>)>>,
 }
 
 impl ChatDocSink for RecordingSink {
+    fn pending_updates(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        Ok(lock(&self.backlog).clone())
+    }
+
     fn cursor_is_verified(&self) -> bool {
         self.verified_cursor
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -2443,5 +2450,471 @@ async fn http_repairs_socket_gap_without_clearing_a_newer_gap() {
     assert!(client.catch_up_completed(ticket));
     assert!(client.delivery_live(), "HTTP alone must restore delivery");
     assert_eq!(client.stats().cursor, 4);
+    client.shutdown().await;
+}
+
+// ── #344: push quota exhaustion ─────────────────────────────────────────────
+
+/// One chat room modeled on `edge/src/chat-room.ts`: frames are handled in
+/// order, pushes are admitted against a fixed 60 s window, and replies are
+/// queued without blocking (a Durable Object's `ws.send` never waits). The
+/// client's socket pump hands each inbound frame to the actor within a 45 s
+/// lease or ends the session (`socket.rs`), so the forwarder does the same.
+struct QuotaRoom {
+    state: Arc<Mutex<QuotaRoomState>>,
+    /// Time to take one push off the wire (uplink + DO handling).
+    per_push: Duration,
+    quota: u32,
+    /// No `retryAfterMs` on refusals: the edge before #344.
+    legacy: bool,
+}
+
+#[derive(Default)]
+struct QuotaRoomState {
+    /// (device, batchId, bytes); seq = index + 1.
+    rows: Vec<(String, String, Vec<u8>)>,
+    window: Option<(tokio::time::Instant, u32)>,
+    sessions: u32,
+    rejected: u32,
+}
+
+impl QuotaRoom {
+    fn new(per_push: Duration, quota: u32, legacy: bool) -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::default(),
+            per_push,
+            quota,
+            legacy,
+        })
+    }
+
+    /// `Some(retryAfterMs)` when the push is refused. Refused pushes count
+    /// too, as in `admitQuota`.
+    fn admit(&self, state: &mut QuotaRoomState) -> Option<u64> {
+        const WINDOW: Duration = Duration::from_secs(60);
+        let now = tokio::time::Instant::now();
+        let (since, pushes) = match state.window {
+            Some((since, pushes)) if now.duration_since(since) < WINDOW => (since, pushes + 1),
+            _ => (now, 1),
+        };
+        state.window = Some((since, pushes));
+        (pushes > self.quota)
+            .then(|| (WINDOW - now.duration_since(since)).as_millis().max(1) as u64)
+    }
+}
+
+impl BinConnector for QuotaRoom {
+    fn connect(&self) -> BoxFuture<'static, Result<BinPipe, SyncError>> {
+        let (pipe, end) = pipe_pair();
+        lock(&self.state).sessions += 1;
+        let room = Arc::new(QuotaRoom {
+            state: self.state.clone(),
+            per_push: self.per_push,
+            quota: self.quota,
+            legacy: self.legacy,
+        });
+        tokio::spawn(room.serve(end));
+        Box::pin(async move { Ok(pipe) })
+    }
+}
+
+impl QuotaRoom {
+    async fn serve(self: Arc<Self>, end: ServerEnd) {
+        let ServerEnd { tx, mut rx } = end;
+        let (out, mut queued) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut forward = tokio::spawn(async move {
+            while let Some(frame) = queued.recv().await {
+                let delivered = tokio::time::timeout(Duration::from_secs(45), tx.send(frame));
+                if !matches!(delivered.await, Ok(Ok(()))) {
+                    return; // the pump's lease expired: the session is over
+                }
+            }
+        });
+        let mut device = String::new();
+        loop {
+            let bytes = tokio::select! {
+                bytes = rx.recv() => match bytes {
+                    Some(bytes) => bytes,
+                    None => return,
+                },
+                _ = &mut forward => return,
+            };
+            let frame = decode(&bytes).expect("client sent undecodable frame");
+            let reply = |kind, header: serde_json::Value, payload: &[u8]| {
+                let _ = out.send(encode(kind, &header, payload));
+            };
+            match frame.kind {
+                frame_type::HELLO => {
+                    device = frame.header["device"].as_str().unwrap_or("").to_string();
+                    let head = lock(&self.state).rows.len();
+                    reply(
+                        frame_type::STATE,
+                        serde_json::json!({"headSeq": head, "seqFloor": 0, "checkpointSeq": 0,
+                            "checkpointSize": 0, "rowCount": head, "rowBytes": 0}),
+                        &[],
+                    );
+                }
+                frame_type::ROWS_REQ => {
+                    let after = frame.header["after"].as_u64().unwrap_or(0) as usize;
+                    let exclude = frame.header["excludeOwn"] == true;
+                    let state = lock(&self.state);
+                    for (ix, (from, batch_id, bytes)) in state.rows.iter().enumerate().skip(after) {
+                        if exclude && *from == device {
+                            continue;
+                        }
+                        reply(
+                            frame_type::ROW,
+                            serde_json::json!({"seq": ix + 1, "device": from, "batchId": batch_id}),
+                            bytes,
+                        );
+                    }
+                    reply(
+                        frame_type::ROWS_DONE,
+                        serde_json::json!({"headSeq": state.rows.len()}),
+                        &[],
+                    );
+                }
+                frame_type::PUSH => {
+                    tokio::time::sleep(self.per_push).await;
+                    let batch_id = frame.header["batchId"].as_str().unwrap().to_string();
+                    let mut state = lock(&self.state);
+                    if let Some(retry_after_ms) = self.admit(&mut state) {
+                        state.rejected += 1;
+                        let mut header = serde_json::json!({"code": "quota",
+                            "message": "push quota exceeded", "batchId": batch_id});
+                        if !self.legacy {
+                            header["retryAfterMs"] = retry_after_ms.into();
+                        }
+                        reply(frame_type::ERROR, header, &[]);
+                        continue;
+                    }
+                    let existing = state.rows.iter().position(|(_, id, _)| *id == batch_id);
+                    let (seq, dup) = match existing {
+                        Some(ix) => (ix + 1, true),
+                        None => {
+                            state
+                                .rows
+                                .push((device.clone(), batch_id.clone(), frame.payload));
+                            (state.rows.len(), false)
+                        }
+                    };
+                    reply(
+                        frame_type::ACK,
+                        serde_json::json!({"batchId": batch_id, "seq": seq, "dup": dup}),
+                        &[],
+                    );
+                }
+                frame_type::PROBE => {
+                    let head = lock(&self.state).rows.len();
+                    reply(
+                        frame_type::PROBE_OK,
+                        serde_json::json!({"headSeq": head}),
+                        &[],
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// #344: a relaunch with an outbox far over the room's push quota (the
+/// runaway-turn journals held 20k+ rows). Replaying the whole outbox at once
+/// kept the actor inside its send loop while the room's replies (the backfill
+/// rows, then one ack or `quota` error per push) piled up unread. Once
+/// putting the outbox on the wire took longer than the pump's 45 s lease
+/// (3,000 rows at 20 ms here; 20k rows at ~2.3 ms), the session died before
+/// the catch-up, and the next one replayed the outbox again: the chat's rows
+/// never applied, and no `quota` error was ever read.
+#[tokio::test(start_paused = true)]
+async fn an_outbox_over_the_push_quota_does_not_stall_the_chats_rows() {
+    let _serial = PATH_AND_TIMING.lock().await;
+    const OUTBOX: usize = 3_000;
+    const QUOTA: u32 = 300;
+    // Today's edge (no retry hint) and the hinted one.
+    for legacy in [true, false] {
+        let room = QuotaRoom::new(Duration::from_millis(20), QUOTA, legacy);
+        lock(&room.state).rows = (1..=3)
+            .map(|i| ("dev-b".to_string(), format!("remote-{i}"), vec![i]))
+            .collect();
+        let sink = Arc::new(RecordingSink::default());
+        *lock(&sink.backlog) = (0..OUTBOX)
+            .map(|i| (format!("local-{i}"), (i as u32).to_le_bytes().to_vec()))
+            .collect();
+        let (fetch, _) = fetcher(b"");
+
+        let client = tokio::time::timeout(
+            Duration::from_secs(300),
+            ChatClient::connect_with_tuned(
+                room.clone(),
+                sink.clone(),
+                fetch,
+                "dev-a",
+                0,
+                ChatTuning::default(),
+            ),
+        )
+        .await
+        .expect("join hung")
+        .expect("the first session must catch up while the outbox is over quota");
+        let remote: Vec<_> = lock(&sink.rows)
+            .iter()
+            .map(|(bytes, _)| bytes.clone())
+            .take(3)
+            .collect();
+        assert_eq!(remote, vec![vec![1], vec![2], vec![3]], "rows still flow");
+        assert!(client.caught_up());
+
+        // The outbox drains at the room's pace, on the same session.
+        tokio::time::timeout(Duration::from_secs(3_600), async {
+            while client.stats().pending_pushes > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect("outbox did not drain");
+        let state = lock(&room.state);
+        assert_eq!(state.rows.len(), 3 + OUTBOX, "every batch landed once");
+        assert_eq!(state.sessions, 1, "no redial loop");
+        let windows = (OUTBOX as u32).div_ceil(QUOTA);
+        assert!(
+            state.rejected <= 40 * windows,
+            "refusals stay bounded by the push window: {} over {windows} windows",
+            state.rejected
+        );
+        drop(state);
+        client.shutdown().await;
+    }
+}
+
+/// #344: the room says when its window reopens; the client waits that long
+/// (bounded) instead of guessing 5 s.
+#[tokio::test(start_paused = true)]
+async fn quota_rejection_waits_out_the_rooms_retry_hint() {
+    let (pipe, mut end) = pipe_pair();
+    let (fetch, _) = fetcher(b"");
+    let server = tokio::spawn(async move {
+        serve_join(&mut end, empty_state_json(), &[], vec![], false).await;
+        let mut gaps = Vec::new();
+        for retry_after_ms in [20_000u64, 3_600_000] {
+            let push = expect_kind(&mut end, frame_type::PUSH).await;
+            let batch_id = push.header["batchId"].clone();
+            send(
+                &end,
+                frame_type::ERROR,
+                serde_json::json!({"code": "quota", "message": "push quota exceeded",
+                    "batchId": batch_id, "retryAfterMs": retry_after_ms}),
+                &[],
+            )
+            .await;
+            let rejected_at = tokio::time::Instant::now();
+            let retry = expect_kind(&mut end, frame_type::PUSH).await;
+            assert_eq!(retry.header["batchId"], batch_id, "same batch retried");
+            gaps.push(rejected_at.elapsed());
+            send(
+                &end,
+                frame_type::ACK,
+                serde_json::json!({"batchId": batch_id, "seq": gaps.len(), "dup": false}),
+                &[],
+            )
+            .await;
+        }
+        (gaps, end)
+    });
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        Arc::new(RecordingSink::default()),
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .unwrap();
+    client.enqueue_batch("first".into(), vec![1]);
+    let mut events = client.events();
+    while client.stats().pending_pushes > 0 {
+        let _ = events.recv().await;
+    }
+    client.enqueue_batch("second".into(), vec![2]);
+    let (gaps, _end) = server.await.unwrap();
+    assert!(
+        gaps[0] >= Duration::from_secs(20) && gaps[0] <= Duration::from_millis(22_500),
+        "hint honored: {:?}",
+        gaps[0]
+    );
+    assert!(
+        gaps[1] <= QUOTA_HINT_CAP + QUOTA_HINT_CAP / 8,
+        "an absurd hint is capped: {:?}",
+        gaps[1]
+    );
+    client.shutdown().await;
+}
+
+#[test]
+fn quota_rejections_back_off_to_the_window_with_jitter() {
+    // #344: a device over its quota re-pushed every 5 s for hours.
+    for (strikes, base) in [
+        (0, 5),
+        (1, 10),
+        (2, 20),
+        (3, 40),
+        (4, 60),
+        (5, 60),
+        (40, 60),
+    ] {
+        let base = Duration::from_secs(base);
+        for _ in 0..50 {
+            let delay = quota_retry_delay(strikes, None);
+            assert!(
+                delay >= base && delay <= base + base / 4,
+                "{strikes} strikes: {delay:?} outside {base:?}..={:?}",
+                base + base / 4
+            );
+        }
+    }
+}
+
+#[test]
+fn quota_retry_hints_are_honored_within_bounds() {
+    // The room's hint replaces the guess, whatever the strike count.
+    for (hint_ms, base_ms) in [
+        (0, 250),
+        (40, 250),
+        (12_500, 12_500),
+        (60_000, 60_000),
+        (3_600_000, 120_000),
+    ] {
+        let base = Duration::from_millis(base_ms);
+        let jitter = (base / 8).min(Duration::from_secs(2));
+        for strikes in [0, 7] {
+            let delay = quota_retry_delay(strikes, Some(Duration::from_millis(hint_ms)));
+            assert!(
+                delay >= base && delay <= base + jitter,
+                "hint {hint_ms} ms: {delay:?} outside {base:?}..={:?}",
+                base + jitter
+            );
+        }
+    }
+}
+
+#[test]
+fn http_quota_refusals_read_the_rooms_hint() {
+    let refusal = |header: Option<&str>, body: &[u8]| match quota_refusal(header, body) {
+        SyncError::RateLimited { retry_after_ms } => retry_after_ms,
+        other => panic!("not a quota refusal: {other}"),
+    };
+    let body = br#"{"error":"quota","retryAfterMs":41250}"#;
+    assert_eq!(refusal(Some("42"), body), Some(41_250), "body is precise");
+    assert_eq!(refusal(Some(" 42 "), b"not json"), Some(42_000));
+    assert_eq!(refusal(None, br#"{"error":"quota"}"#), None, "older edge");
+}
+
+/// #344 over HTTPS (sockets refused): a quota refusal holds pushes until the
+/// room's hint, but every sync cycle still pulls.
+#[tokio::test(start_paused = true)]
+async fn http_quota_refusal_holds_pushes_but_keeps_pulling() {
+    let _serial = PATH_AND_TIMING.lock().await;
+    #[derive(Default)]
+    struct QuotaHttp {
+        pushes: Mutex<Vec<(tokio::time::Instant, String)>>,
+        pulls: Mutex<Vec<tokio::time::Instant>>,
+        refuse_until: Mutex<Option<tokio::time::Instant>>,
+    }
+    impl ChatTransport for Arc<QuotaHttp> {
+        fn push(&self, id: String, _: Vec<u8>) -> BoxFuture<'static, Result<String, SyncError>> {
+            let this = self.clone();
+            Box::pin(async move {
+                let now = tokio::time::Instant::now();
+                lock(&this.pushes).push((now, id.clone()));
+                let mut refuse_until = lock(&this.refuse_until);
+                let until = *refuse_until.get_or_insert(now + Duration::from_secs(30));
+                if now < until {
+                    let body = serde_json::json!({"error": "quota",
+                        "retryAfterMs": (until - now).as_millis() as u64});
+                    return Err(quota_refusal(Some("30"), body.to_string().as_bytes()));
+                }
+                // Row 1 is the remote one; accepted pushes follow it.
+                let seq = 1 + lock(&this.pushes)
+                    .iter()
+                    .filter(|(at, _)| *at >= until)
+                    .count();
+                Ok(serde_json::json!({"batchId": id, "seq": seq, "dup": false}).to_string())
+            })
+        }
+        fn fetch_rows(&self, after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+            lock(&self.pulls).push(tokio::time::Instant::now());
+            Box::pin(async move {
+                let mut frames = vec![encode(
+                    frame_type::STATE,
+                    &serde_json::json!({"headSeq": 1, "seqFloor": 0, "checkpointSeq": 0,
+                        "checkpointSize": 0, "rowCount": 1, "rowBytes": 1}),
+                    &[],
+                )];
+                if after < 1 {
+                    frames.push(encode(
+                        frame_type::ROW,
+                        &serde_json::json!({"seq": 1, "device": "dev-b", "batchId": "remote"}),
+                        b"remote-row",
+                    ));
+                }
+                frames.push(encode(
+                    frame_type::ROWS_DONE,
+                    &serde_json::json!({"headSeq": 1}),
+                    &[],
+                ));
+                let mut body = Vec::new();
+                for frame in frames {
+                    body.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+                    body.extend(frame);
+                }
+                Ok(body)
+            })
+        }
+    }
+
+    let http = Arc::new(QuotaHttp::default());
+    let sink = Arc::new(RecordingSink::default());
+    *lock(&sink.backlog) = (0..100).map(|i| (format!("b{i}"), vec![i])).collect();
+    let (fetch, _) = fetcher(b"");
+    let started = tokio::time::Instant::now();
+    let client = ChatClient::connect_with_transport(
+        FlakyConnector::new(vec![]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+        Some(Arc::new(http.clone())),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    assert_eq!(
+        lock(&sink.rows).first().map(|(bytes, _)| bytes.clone()),
+        Some(b"remote-row".to_vec()),
+        "the refused cycle still pulled"
+    );
+    assert!(lock(&http.pulls).len() >= 3, "pulls keep coming");
+    assert_eq!(
+        lock(&http.pushes).len(),
+        1,
+        "one refusal, then no pushes inside the window"
+    );
+
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while client.stats().pending_pushes > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("outbox drained over HTTPS once the window reopened");
+    let pushes = lock(&http.pushes).clone();
+    assert!(
+        pushes[1].0 >= started + Duration::from_secs(30),
+        "waited out the hint"
+    );
+    assert_eq!(pushes.len(), 101, "no refused push after the first");
     client.shutdown().await;
 }

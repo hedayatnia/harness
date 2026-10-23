@@ -37,15 +37,10 @@ struct JuggledSessions {
     }
 
     func others(than chatId: String?) -> [Chat] { chats.filter { $0.id != chatId } }
-
-    func count(_ matches: (ChatIndicator) -> Bool, excluding chatId: String?) -> Int {
-        others(than: chatId).filter { matches(indicators[$0.id] ?? .idle) }.count
-    }
 }
 
 /// Floating glass pill: one status dot per juggled session, in order, with
-/// the open one ringed. Home adds "2 need you · 1 running"; the session
-/// screen keeps just the dots, sharing the bottom with the composer.
+/// the open one ringed, sharing the bottom with the composer.
 struct SessionSwitcherPill: View {
     @Environment(AppModel.self) private var model
     var current: String?
@@ -64,18 +59,10 @@ struct SessionSwitcherPill: View {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     showSheet = true
                 } label: {
-                    HStack(spacing: 10) {
-                        dots(juggled)
-                        if !compact, let summary = summary(juggled) {
-                            Text(summary)
-                                .font(Theme.sans(14, weight: .medium))
-                                .monospacedDigit()
-                                .foregroundStyle(Theme.text)
-                        }
-                    }
-                    .padding(.horizontal, compact ? 12 : 16)
-                    .frame(height: compact ? 36 : 44)
-                    .contentShape(Capsule())
+                    dots(juggled)
+                        .padding(.horizontal, compact ? 12 : 16)
+                        .frame(height: compact ? 36 : 44)
+                        .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .glassEffect(.regular.interactive(), in: Capsule())
@@ -117,7 +104,7 @@ struct SessionSwitcherPill: View {
 
     /// Running is a ring, needs you a filled dot, finished-and-read a quiet
     /// grey dot: shape carries the state, since some themes paint running
-    /// and needs-you in near-identical hues. Colors are the Home chips'.
+    /// and needs-you in near-identical hues.
     @ViewBuilder
     private func statusMark(_ indicator: ChatIndicator) -> some View {
         switch indicator {
@@ -127,18 +114,9 @@ struct SessionSwitcherPill: View {
         }
     }
 
-    private func summary(_ juggled: JuggledSessions) -> String? {
-        let needsYou = juggled.count(HomeStatusFilter.attention.matches, excluding: current)
-        let running = juggled.count(HomeStatusFilter.running.matches, excluding: current)
-        var parts: [String] = []
-        if needsYou > 0 { parts.append("\(needsYou) need you") }
-        if running > 0 { parts.append("\(running) running") }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
     private func accessibilityText(_ juggled: JuggledSessions) -> String {
         let others = juggled.others(than: current).count
-        return "\(others) other sessions" + (summary(juggled).map { ", \($0)" } ?? "")
+        return "\(others) other sessions"
     }
 }
 

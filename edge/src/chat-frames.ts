@@ -45,7 +45,9 @@ export const FRAME = {
   ack: 0x07,
   /** `{headSeq}` — probe answer. */
   probeOk: 0x0a,
-  /** `{code, message}` — recoverable rejection (socket stays open). */
+  /** `{code, message}` — recoverable rejection (socket stays open). Push
+   * rejections add `batchId`; `quota` adds `retryAfterMs`, the wait until
+   * this device's window in this chat reopens. */
   error: 0x0b
 } as const;
 

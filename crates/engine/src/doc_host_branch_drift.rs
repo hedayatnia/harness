@@ -53,6 +53,54 @@ pub(crate) fn detect(
     })
 }
 
+/// A shell command that renames a branch: `git branch -m|-M|--move`.
+fn is_branch_rename(command: &str) -> bool {
+    command.split(['&', ';', '|', '\n']).any(|step| {
+        let words: Vec<&str> = step.split_whitespace().collect();
+        words
+            .iter()
+            .position(|word| *word == "git")
+            .is_some_and(|git| {
+                words[git..]
+                    .iter()
+                    .position(|word| *word == "branch")
+                    .is_some_and(|branch| {
+                        words[git + branch..]
+                            .iter()
+                            .any(|word| matches!(*word, "-m" | "-M" | "--move"))
+                    })
+            })
+    })
+}
+
+/// Whether `reflog` (oldest first) since `since` (unix seconds) takes `HEAD`
+/// from `from` to `to` through branch renames alone. A checkout, or a rebase
+/// that returns to another branch, breaks the chain: a rename followed by a
+/// real switch is still a switch.
+fn renamed_through(reflog: &[(i64, String)], since: i64, from: &str, to: &str) -> bool {
+    let mut branch = from;
+    let mut renamed = false;
+    for (_, subject) in reflog.iter().filter(|(at, _)| *at >= since) {
+        if let Some(rename) = subject.strip_prefix("Branch: renamed refs/heads/") {
+            let Some((old, new)) = rename.split_once(" to refs/heads/") else {
+                return false;
+            };
+            if old != branch {
+                return false;
+            }
+            branch = new;
+            renamed = true;
+        } else if subject.starts_with("checkout:") {
+            return false;
+        } else if let Some((_, returned)) = subject.split_once("returning to refs/heads/")
+            && returned != branch
+        {
+            return false;
+        }
+    }
+    renamed && branch == to
+}
+
 /// A dispatch waiting on the user's answer. Also stored in the chat document
 /// under the question id, preserving attachments and configuration on restart.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -203,7 +251,7 @@ impl DocHost {
     /// Whether this dispatch would continue the chat on a checkout that
     /// drifted since its last turn. A turn already in flight is not
     /// re-checked: what arrives then is steered into the running turn.
-    pub(super) fn drift_since_last_turn(
+    pub(super) async fn drift_since_last_turn(
         &self,
         sessions: &SessionsEngine,
         chat_id: &str,
@@ -213,7 +261,69 @@ impl DocHost {
             return None;
         }
         let previous = self.workspace()?.chat(chat_id).ok()??.source_context?;
-        detect(&previous, current)
+        let drift = detect(&previous, current)?;
+        if !drift.checkout_replaced && self.own_turn_renamed(chat_id, &previous, &drift).await {
+            tracing::info!(
+                chat = %chat_id,
+                from = %drift.from_branch,
+                to = %drift.to_branch,
+                "branch renamed by the chat's own turn; continuing without asking"
+            );
+            return None;
+        }
+        Some(drift)
+    }
+
+    /// Whether the chat's own last turn renamed its branch (`git branch -m`
+    /// while preparing a PR, say) and nothing else moved it since (#453).
+    /// Both must hold: the chat ran a rename after its last accepted
+    /// context, and this checkout's `HEAD` reflog since then goes from the
+    /// old branch to the current one through renames alone. Anything less,
+    /// a switch, another chat's rename, a reflog we cannot read, still asks.
+    async fn own_turn_renamed(
+        &self,
+        chat_id: &str,
+        previous: &ConversationSourceContext,
+        drift: &Drift,
+    ) -> bool {
+        let since_ms = previous.observed_at.timestamp_millis();
+        let ran_rename = self
+            .open(chat_id)
+            .and_then(|handle| Ok(handle.doc.read_entries()?))
+            .is_ok_and(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.role == MessageRole::Assistant && entry.created_at >= since_ms
+                    })
+                    .flat_map(|entry| &entry.parts)
+                    .any(|part| {
+                        matches!(
+                            part,
+                            MessagePart::Tool {
+                                call: harness_proto::ToolCall::Exec { command },
+                                resolved: true,
+                                is_error: false,
+                                ..
+                            } if is_branch_rename(command)
+                        )
+                    })
+            });
+        if !ran_rename {
+            return false;
+        }
+        let Some(repos) = self.inner.repos.get() else {
+            return false;
+        };
+        let Ok(reflog) = repos.head_reflog(Path::new(&previous.cwd)).await else {
+            return false;
+        };
+        renamed_through(
+            &reflog,
+            previous.observed_at.timestamp(),
+            &drift.from_branch,
+            &drift.to_branch,
+        )
     }
 
     /// The queue must not release anything while a drift question waits.
@@ -664,6 +774,73 @@ mod tests {
                 checkout_replaced: true,
             })
         );
+    }
+
+    #[test]
+    fn only_rename_commands_count_as_renames() {
+        assert!(is_branch_rename("git branch -m feature/renamed"));
+        assert!(is_branch_rename(
+            "cd repo && git branch -M old new && git push"
+        ));
+        assert!(is_branch_rename("git -C /repo branch --move new"));
+        assert!(!is_branch_rename("git branch -d old"));
+        assert!(!is_branch_rename("git switch -c new"));
+        assert!(!is_branch_rename("git commit -m branch"));
+        assert!(!is_branch_rename("echo branch -m"));
+    }
+
+    #[test]
+    fn a_rename_chain_is_continuity_and_a_switch_is_not() {
+        let log = |subjects: &[&str]| -> Vec<(i64, String)> {
+            subjects
+                .iter()
+                .map(|subject| (100, subject.to_string()))
+                .collect()
+        };
+        let renamed = log(&[
+            "commit: work",
+            "Branch: renamed refs/heads/alpha to refs/heads/beta",
+            "commit: more",
+        ]);
+        assert!(renamed_through(&renamed, 100, "alpha", "beta"));
+        let chained = log(&[
+            "Branch: renamed refs/heads/alpha to refs/heads/beta",
+            "Branch: renamed refs/heads/beta to refs/heads/gamma",
+        ]);
+        assert!(renamed_through(&chained, 100, "alpha", "gamma"));
+        assert!(
+            !renamed_through(&renamed, 101, "alpha", "beta"),
+            "a rename before the chat's last turn is not this turn's"
+        );
+        assert!(
+            !renamed_through(&log(&["commit: work"]), 100, "alpha", "beta"),
+            "a switch to another branch at the same commit is not a rename"
+        );
+        assert!(!renamed_through(
+            &log(&[
+                "Branch: renamed refs/heads/alpha to refs/heads/beta",
+                "checkout: moving from beta to other",
+                "checkout: moving from other to beta",
+            ]),
+            100,
+            "alpha",
+            "beta"
+        ));
+        assert!(!renamed_through(
+            &log(&["Branch: renamed refs/heads/zeta to refs/heads/beta"]),
+            100,
+            "alpha",
+            "beta"
+        ));
+        assert!(!renamed_through(
+            &log(&[
+                "Branch: renamed refs/heads/alpha to refs/heads/beta",
+                "rebase (finish): returning to refs/heads/other",
+            ]),
+            100,
+            "alpha",
+            "other"
+        ));
     }
 
     #[test]

@@ -41,7 +41,7 @@ export const indicatorOf = (fields: Row["fields"], now: number): Indicator => {
  * - done: a new completed turn, reported while fresh.
  * A row appearing for the first time (or revived) only sets the baseline, so
  * re-seeds and first syncs never replay old events. Working → Idle without a
- * completion (interrupt, expiry) is silent.
+ * completion (interrupt, expiry) is silent, and so is a peer-only completion.
  */
 export const notificationFor = (before: Row | undefined, after: Row, now: number): Category | null => {
   if (before === undefined || before.deleted || after.deleted) return null;
@@ -51,7 +51,11 @@ export const notificationFor = (before: Row | undefined, after: Row, now: number
   if (next === "awaiting" && prev !== "awaiting") return "input";
   const turn = str(after.fields.lastCompletedTurn);
   const fresh = now - (num(after.fields.updatedAt) ?? 0) <= SESSION_STALE_MS;
-  if (fresh && turn !== undefined && turn !== str(before.fields.lastCompletedTurn)) return "done";
+  // A turn that answered only another agent's message is coordination, not a
+  // result the person asked for (lastCompletedPeerOnly): consumed silently.
+  if (fresh && turn !== undefined && turn !== str(before.fields.lastCompletedTurn)) {
+    return after.fields.lastCompletedPeerOnly === true ? null : "done";
+  }
   return null;
 };
 
