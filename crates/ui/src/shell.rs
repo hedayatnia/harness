@@ -13844,6 +13844,7 @@ mod tests {
             reasoning: None,
             model_options: serde_json::Map::new(),
             sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+            chat_mode: false,
         });
         let mut unconfigured = parent.clone();
         unconfigured.id = "unconfigured".into();

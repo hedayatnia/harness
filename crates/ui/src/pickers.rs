@@ -1194,6 +1194,14 @@ impl Pickers {
         self.state.read(cx).selected_chat.is_some() || self.chat_mode(cx)
     }
 
+    /// A chat is selected, whether or not its row and config have synced yet:
+    /// not a new-chat canvas, so nothing falls back to the remembered
+    /// defaults. Unlike [`Self::harness_locked`], a chat-mode draft is still
+    /// a new-chat canvas.
+    fn chat_selected(&self, cx: &App) -> bool {
+        self.state.read(cx).selected_chat.is_some()
+    }
+
     /// Whether the draft or the selected chat is a plain chat (chat mode).
     pub fn chat_mode(&self, cx: &App) -> bool {
         match self.state.read(cx).selected_chat_row() {
@@ -1267,7 +1275,7 @@ impl Pickers {
             return config.harness;
         }
         // A selected chat without synced config is not a new-chat canvas.
-        if self.harness_locked(cx) {
+        if self.chat_selected(cx) {
             return None;
         }
         // New-chat canvas: the remembered last-used harness (sticky defaults),
@@ -1314,7 +1322,7 @@ impl Pickers {
         if let Some(config) = self.creating_chat_config(cx) {
             return config.model.as_deref();
         }
-        if self.harness_locked(cx) {
+        if self.chat_selected(cx) {
             return None;
         }
         if self.config.chat_mode {
@@ -1343,7 +1351,7 @@ impl Pickers {
                 config.reasoning
             } else if let Some(config) = self.creating_chat_config(cx) {
                 config.reasoning
-            } else if self.harness_locked(cx) {
+            } else if self.chat_selected(cx) {
                 None
             } else {
                 // New chat: the remembered last-used level.
@@ -1409,7 +1417,7 @@ impl Pickers {
         if let Some(config) = self.creating_chat_config(cx) {
             return config.model_options.clone();
         }
-        if self.harness_locked(cx) {
+        if self.chat_selected(cx) {
             return Default::default();
         }
         let Some(harness) = self.effective_harness(cx) else {
@@ -6822,6 +6830,7 @@ mod tests {
                 reasoning: Some(ReasoningLevel::Medium),
                 sandbox: SandboxLevel::WorkspaceWrite,
                 model_options: Default::default(),
+                chat_mode: false,
             });
             cx.notify();
         });
