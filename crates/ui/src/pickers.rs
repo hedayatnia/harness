@@ -13,6 +13,8 @@
 
 #[path = "pickers/harness_tabs.rs"]
 mod harness_tabs;
+#[cfg(feature = "model-picker-preview")]
+mod model_preview;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -523,6 +525,8 @@ enum ModelRail {
 /// list's CONTENT (not its highlight/selection, which render per-row).
 #[derive(Clone, PartialEq, Eq)]
 struct ModelRowsKey {
+    #[cfg(feature = "model-picker-preview")]
+    preview_category: Option<model_preview::TaskKind>,
     query: String,
     rail: ModelRail,
     effective: Option<HarnessId>,
@@ -802,6 +806,8 @@ fn cloud_row(
 }
 
 pub struct Pickers {
+    #[cfg(feature = "model-picker-preview")]
+    preview: model_preview::Preview,
     state: Entity<AppState>,
     config: DraftConfig,
     /// Sticky last-used picks (harness `harness.composer.defaults:v1`): seeds the
@@ -962,6 +968,8 @@ impl Pickers {
         let state_observe = cx.observe(&state, |this: &mut Self, state, cx| {
             let selected = state.read(cx).selected_chat.clone();
             if selected != this.draft_owner {
+                #[cfg(feature = "model-picker-preview")]
+                this.preview.reset();
                 this.draft_owner = selected;
                 this.config.harness = None;
                 this.config.model = None;
@@ -982,6 +990,8 @@ impl Pickers {
             let space = state.read(cx).selected_space.clone();
             let device = state.read(cx).effective_device_id();
             if space != this.space_owner || device != this.device_owner {
+                #[cfg(feature = "model-picker-preview")]
+                this.preview.reset();
                 this.space_owner = space;
                 this.device_owner = device;
                 this.target_generation = this.target_generation.wrapping_add(1);
@@ -1039,6 +1049,8 @@ impl Pickers {
         let space_owner = state.read(cx).selected_space.clone();
         let device_owner = state.read(cx).effective_device_id();
         Self {
+            #[cfg(feature = "model-picker-preview")]
+            preview: model_preview::Preview::default(),
             state,
             space_owner,
             device_owner,
@@ -1500,9 +1512,17 @@ impl Pickers {
             cx.notify();
             return;
         }
+        #[cfg(feature = "model-picker-preview")]
+        if kind == PickerKind::HarnessModel && self.preview.enabled {
+            self.preview.reset();
+        }
         if kind == PickerKind::HarnessModel {
             self.open_model_width = self.model_trigger_bounds.map(|bounds| bounds.size.width);
             self.open_model_height = model_menu_height(self.setting_groups(cx).len());
+            #[cfg(feature = "model-picker-preview")]
+            if self.preview.enabled {
+                self.open_model_height = 480.0;
+            }
         }
         self.open.open(kind);
         self.focus_on_mount = true;
@@ -2015,6 +2035,16 @@ impl Pickers {
     }
 
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        #[cfg(feature = "model-picker-preview")]
+        if self.preview.enabled {
+            if !self.harness_locked(cx) {
+                self.preview.viewed = Some(harness);
+                self.preview.pending = None;
+                self.ensure_models(harness, false, cx);
+                self.preview_reset_rows(cx);
+            }
+            return;
+        }
         if self.harness_locked(cx) {
             return;
         }
@@ -2170,6 +2200,10 @@ impl Pickers {
             {
                 config.model_options =
                     offered_options(model, std::mem::take(&mut config.model_options));
+                #[cfg(feature = "model-picker-preview")]
+                if self.preview.enabled {
+                    config.reasoning = clamp_reasoning(config.reasoning, &model.reasoning_levels);
+                }
             }
         }
         self.state.update(cx, |state, cx| {
@@ -2196,6 +2230,13 @@ impl Pickers {
     /// The traits popover's reasoning ladder (model levels, falling back to
     /// the harness's advertised ladder) — shared by render and keyboard nav.
     fn trait_ladder(&self, cx: &App) -> Vec<ReasoningLevel> {
+        #[cfg(feature = "model-picker-preview")]
+        if self.preview.enabled {
+            return self
+                .selected_model(cx)
+                .map(|m| m.reasoning_levels.clone())
+                .unwrap_or_default();
+        }
         let Some(model) = self.selected_model(cx) else {
             return Vec::new();
         };
@@ -2245,7 +2286,13 @@ impl Pickers {
     /// Cached [`Self::visible_model_rows`]: selection/highlight changes and
     /// re-renders share one flattened list until an input actually changes.
     fn model_rows(&self, cx: &App) -> std::sync::Arc<Vec<ModelRowData>> {
+        #[cfg(feature = "model-picker-preview")]
+        if self.preview.enabled {
+            return self.preview_rows(cx);
+        }
         let key = ModelRowsKey {
+            #[cfg(feature = "model-picker-preview")]
+            preview_category: None,
             query: self.search.read(cx).text().trim().to_string(),
             rail: self.model_rail,
             effective: self.effective_harness(cx),
@@ -2359,6 +2406,11 @@ impl Pickers {
 
     /// Enter on the harness/model popover: pick the highlighted model.
     fn activate_model_row(&mut self, cx: &mut Context<Self>) {
+        #[cfg(feature = "model-picker-preview")]
+        if self.preview.enabled && self.preview.pending.is_some() {
+            self.preview_commit(cx);
+            return;
+        }
         if self.setting_menu.is_some() {
             self.activate_setting_choice(cx);
         } else if let Some(index) = self.active.checked_sub(self.model_rows_len(cx)) {
@@ -2374,6 +2426,11 @@ impl Pickers {
     /// search) switches the harness first, exactly like clicking its rail
     /// icon and then the model.
     fn activate_model_index(&mut self, ix: usize, cx: &mut Context<Self>) {
+        #[cfg(feature = "model-picker-preview")]
+        if self.preview.enabled {
+            self.preview_stage(ix, cx);
+            return;
+        }
         let Some(row) = self.model_rows(cx).get(ix).cloned() else {
             return;
         };
@@ -3227,6 +3284,10 @@ impl Pickers {
         // The frame stays mounted (and possibly focused) through the exit
         // animation — keys must not drive a dying popover.
         if !self.open.is_open() {
+            return;
+        }
+        #[cfg(feature = "model-picker-preview")]
+        if self.preview.enabled && self.preview_key(event, cx) {
             return;
         }
         if self.setting_menu.is_some() {
@@ -4692,6 +4753,10 @@ impl Pickers {
     /// Model picker with favorites and harness tabs above a scoped search.
     /// Existing chats show only their own harness tab and models.
     fn render_harness_model_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(feature = "model-picker-preview")]
+        if self.preview.enabled {
+            return self.render_model_preview(cx);
+        }
         let height = self.menu_geometry().height.min(self.open_model_height);
         let (list_height, tray_height) = model_menu_budgets(height, self.setting_groups(cx).len());
 
@@ -5208,6 +5273,10 @@ impl Pickers {
     }
 
     fn setting_groups(&self, cx: &App) -> Vec<SettingGroup> {
+        #[cfg(feature = "model-picker-preview")]
+        if self.preview.enabled {
+            return Vec::new();
+        }
         let mut groups = Vec::new();
         let levels = self.trait_ladder(cx);
         if !levels.is_empty() {
@@ -6324,6 +6393,16 @@ impl Render for Pickers {
         let chip_label_loading =
             !no_agents && model_label.is_empty() && (catalog_loading || models_loading);
         let harness_icon = self.model_chip_icon(&theme, cx);
+        #[cfg(feature = "model-picker-preview")]
+        let harness_icon = if self.preview.enabled {
+            self.selected_model(cx)
+                .and_then(model_maker)
+                .and_then(maker_icon)
+                .map(|icon| (icon, None))
+                .unwrap_or(harness_icon)
+        } else {
+            harness_icon
+        };
         let explicit_options = self.explicit_options(cx);
         let traits_set = traits_summary(
             self.selected_model(cx),
@@ -6352,7 +6431,22 @@ impl Render for Pickers {
                     PickerKind::HarnessModel,
                     // Compact single-harness pane (t3 ModelPickerContent
                     // shrunk to its tabbed layout).
-                    self.popover_frame_flush(304.0, content, cx),
+                    self.popover_frame_flush(
+                        {
+                            #[cfg(feature = "model-picker-preview")]
+                            if self.preview.enabled {
+                                640.0_f32.min(f32::from(window.viewport_size().width) - 24.0)
+                            } else {
+                                304.0
+                            }
+                            #[cfg(not(feature = "model-picker-preview"))]
+                            {
+                                304.0
+                            }
+                        },
+                        content,
+                        cx,
+                    ),
                 ))
             }
             None => None,
