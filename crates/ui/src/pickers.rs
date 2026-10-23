@@ -940,6 +940,8 @@ impl Pickers {
                         this.active = 0;
                     }
                     if this.open_kind() == Some(PickerKind::HarnessModel) {
+                        #[cfg(feature = "model-picker-preview")]
+                        this.preview.hide_detail();
                         this.setting_menu = None;
                         this.setting_bounds = None;
                         this.active = 0;
@@ -3279,7 +3281,7 @@ impl Pickers {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_setting_hover();
         // The frame stays mounted (and possibly focused) through the exit
         // animation — keys must not drive a dying popover.
@@ -3287,7 +3289,7 @@ impl Pickers {
             return;
         }
         #[cfg(feature = "model-picker-preview")]
-        if self.preview.enabled && self.preview_key(event, cx) {
+        if self.preview.enabled && self.preview_key(event, _window, cx) {
             return;
         }
         if self.setting_menu.is_some() {
@@ -4409,6 +4411,15 @@ impl Pickers {
                     {
                         return;
                     }
+                    #[cfg(feature = "model-picker-preview")]
+                    if this.preview.enabled
+                        && this
+                            .preview
+                            .detail_bounds
+                            .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        return;
+                    }
                     this.dismiss(cx);
                     if this.focus.contains_focused(window, cx) {
                         window.blur();
@@ -4431,9 +4442,16 @@ impl Pickers {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
+        let height = self.menu_geometry().height.min(self.open_model_height);
+        #[cfg(feature = "model-picker-preview")]
+        let height = if self.preview.enabled {
+            height.min(self.preview.preferred_height())
+        } else {
+            height
+        };
         popover::popover_card_flush(&theme)
             .w(px(width))
-            .h(px(self.menu_geometry().height.min(self.open_model_height)))
+            .h(px(height))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx)
@@ -4451,6 +4469,15 @@ impl Pickers {
                     if this.setting_menu.is_some()
                         && this
                             .setting_bounds
+                            .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        return;
+                    }
+                    #[cfg(feature = "model-picker-preview")]
+                    if this.preview.enabled
+                        && this
+                            .preview
+                            .detail_bounds
                             .is_some_and(|bounds| bounds.contains(&event.position))
                     {
                         return;
@@ -6299,6 +6326,10 @@ fn attach_overlay_end(
 impl Render for Pickers {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
+        #[cfg(feature = "model-picker-preview")]
+        if self.preview.enabled && self.preview.animating(cx.reduce_motion()) {
+            window.request_animation_frame();
+        }
         // A HARNESS_OPEN_PICKER popover never went through `toggle`, so claim
         // its keyboard focus here (re-claim until it sticks — the shell's
         // first-paint fallback focuses the composer after our first render).
@@ -6435,7 +6466,8 @@ impl Render for Pickers {
                         {
                             #[cfg(feature = "model-picker-preview")]
                             if self.preview.enabled {
-                                640.0_f32.min(f32::from(window.viewport_size().width) - 24.0)
+                                model_preview::PICKER_WIDTH
+                                    .min(f32::from(window.viewport_size().width) - 24.0)
                             } else {
                                 304.0
                             }
